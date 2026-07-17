@@ -1,0 +1,7 @@
+[package]
+name = "seisin-ring"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+seisin-core = { path = "../seisin-core" }
