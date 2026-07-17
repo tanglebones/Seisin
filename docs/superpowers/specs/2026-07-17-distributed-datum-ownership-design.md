@@ -184,6 +184,41 @@ compute) — so it collapses into the compute role entirely.
   specific already-transferred datum still happens lazily, on relay/forward
   failure — not as a reaction to the gossip signal.
 
+## Cache Invalidation on Ring Membership Change
+
+Ring membership changes (compute node add/remove) shift native ownership
+for roughly 1/n of keys, independent of any crash or collation transfer.
+This is a distinct failure mode from the ones covered above and needs its
+own rule: a node must never serve or build on a stale local cache entry
+left over from a previous era of owning a key, and must not let unused
+stale entries accumulate unboundedly.
+
+Example: node B joins, becomes native home for datum X (previously A).
+B loads X (cache miss from storage), commits a change to X (write-before-
+ack), then B leaves. Native ownership for X reverts — potentially back to
+A. If A still had a stale pre-B cache entry for X lying around and trusted
+it instead of reloading, B's committed write would be silently lost.
+
+Two separate rules address this:
+
+- **Correctness — regained native ownership is always a cache miss.**
+  Cache entries are tagged with the ring epoch they were loaded/validated
+  under. Native status is always re-derived against the *current* ring at
+  access time, never trusted from a stale local flag. If that check shows
+  a node has just (re)gained native ownership of a key via a membership
+  change, it is treated as a hard miss — reload from storage — regardless
+  of whatever might already be sitting in the local cache for that key.
+  This is what guarantees a departing node's write-before-ack'd changes
+  are actually picked up: storage is the only thing the two nodes are
+  guaranteed to agree on.
+- **Performance — bulk eviction must not require scanning the whole
+  cache.** The local cache is organized by the discrete hash-ring
+  bucket/vnode id, not just raw datum_id: `datum_id → vnode bucket` is
+  stable, while `vnode bucket → node` is what a membership change actually
+  reassigns. On a membership event, a node computes exactly which vnode
+  buckets it lost and evicts those cache partitions in bulk — O(#reassigned
+  buckets), not an O(cache size) walk re-hashing every entry.
+
 ## Execution Model & Wire Protocol
 
 - **Execution model**: OS thread per authority slot. A compute node runs a
@@ -215,6 +250,11 @@ Testing should exercise, at minimum:
 - The anti-degeneration (datum-return-home) rule under sustained
   multi-datum op load, confirming ownership doesn't collapse onto a single
   thread over time.
+- Node add/drop cycling: a node joins post-standup, takes native ownership
+  of some live keys, commits changes to one, then drops — confirming the
+  key's reverted native owner reloads from storage rather than serving a
+  stale pre-join cache entry, and that bulk cache eviction on membership
+  change stays cheap (not a full-cache scan) as node count grows.
 
 ## Open Questions / Future Work
 
