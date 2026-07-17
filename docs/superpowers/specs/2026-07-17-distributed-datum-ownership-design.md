@@ -1,0 +1,225 @@
+# Distributed Datum Ownership Architecture
+
+Date: 2026-07-17
+
+## Overview & Goals
+
+Seisin is a cluster of servers that collectively own a keyed dataset and
+serve client operations against it. The core idea under test (per the
+project README): allocate each unit of data (a "datum") to a single owning
+thread, and temporarily collate the datums involved in a multi-datum
+operation onto one thread so the operation can execute without distributed
+locking — then let ownership drift back to a natural home over time so no
+single thread ends up owning everything.
+
+This spec covers the v1 architecture: a real multi-node, multi-process
+system (deployed via containers) that validates this ownership/routing/
+collation model end-to-end. It intentionally excludes concerns unrelated to
+proving the core model out (see Non-Goals).
+
+## Non-Goals (v1)
+
+- Authentication, authorization, or transport encryption. The system runs on
+  a private network; if a connection is permitted by the network, the node
+  trusts it.
+- Storage replication / crash resilience for storage nodes (see "Storage
+  Tier" — a storage-node crash is fail-stop for the whole cluster in v1).
+  Double-write replication is a deferred future option.
+- Cross-machine ops tooling/observability beyond what's needed to validate
+  the protocol.
+- ACID/multi-datum distributed transactions. Correctness for multi-datum
+  operations comes from single-thread serialization after collation, not
+  from a distributed commit protocol.
+
+## Roles
+
+A server is configured with either or both of two roles:
+
+- **compute** — hosts owning threads. Each thread holds an in-memory working
+  copy (cache) of the datums it currently owns and executes ops against them
+  one at a time. Always accepts client connections (see below — there is no
+  separate "endpoint" role).
+- **storage** — durable source of truth for datum content, sharded across
+  storage nodes via a capacity-weighted consistent-hash ring.
+
+A node may run both roles. There is no separate client-facing "endpoint"
+role: since clients connect directly to whatever node they believe is the
+current owner (computed via hashing into the *compute* ring), every compute
+node is a potential direct hash target for some datum_id and must accept
+client connections regardless. An "endpoint" flag would either be redundant
+(compute nodes need it always) or unreachable (nothing to route to without
+compute) — so it collapses into the compute role entirely.
+
+## Data Model & Addressing
+
+- **datum_id**: a uuidv7 key identifying either:
+  - a **primary-key datum** — a single keyed record, or
+  - a **secondary-key (SK) datum** — a materialized index result, e.g.
+    `sk:user.name:cliff` → `[(d_id, a_idx), ...]`. SK datums are lazily
+    created on first query and invalidated (removed from both cache and
+    storage) when the underlying indexed data changes. Because index
+    contents can change concurrently, clients must treat SK results as
+    best-effort and revalidate on any 1+N fetch pattern.
+  - SK datums are **regular datums** in every respect — same ownership,
+    caching, collation, and storage rules as primary-key datums. No
+    special-casing anywhere in the ownership/routing machinery.
+- **authority_idx**: identifies the current owner (node, thread) of a
+  datum_id. It is a tagged value, not a bare hash bucket:
+  - **Native** — resolved by looking up `hash(datum_id)` in the *current*
+    compute consistent-hash ring → (node, thread). This is a live
+    function of ring state and drifts correctly as ring membership changes.
+  - **Foreign(node_id, thread_id)** — a direct pointer, stamped explicitly
+    when a datum is collated onto a non-native thread. Never recomputed via
+    hashing; this is what makes foreign-vs-native detection immune to ring
+    membership changes happening concurrently with collation (a rehash-and-
+    compare approach would be ambiguous under dynamic membership).
+  - authority_idx is **never persisted to storage** — storage only ever
+    knows datum content, never current ownership. On arrival back at its
+    native-home thread, a datum's authority_idx is reset to `Native`
+    (the `Foreign` pointer is simply discarded, not compared/reconciled).
+- **op_id**: a uuidv7 generated client-side (not centrally assigned), used
+  as the ordering token for wound-wait priority during collation contention.
+  Because it's client-generated, ordering is time-*ish* but subject to
+  clock drift across clients — sufficient to break livelock cycles, not a
+  linearizability guarantee.
+
+## Routing & Ownership Protocol
+
+- Clients hold a `(datum_id, authority_idx)` pair from whenever they last
+  learned it (creation, a prior response, etc.) and connect directly to
+  whatever node that resolves to. There is no client-facing routing tier
+  distinct from compute nodes.
+- When a node receives a request for a datum_id it doesn't currently own:
+  - If it's the native home and knows the datum is currently transferred
+    elsewhere, it relays to the (node, thread) it has on record.
+  - If it's not the native home either (client's authority_idx is doubly
+    stale, e.g. after a ring membership change), it forwards toward the
+    native home, which relays onward if needed.
+  - If it's the native home and has no transfer on record, it owns the
+    datum natively — normal path (cache, or load from storage on miss).
+- **Transfer bookkeeping** lives only at the native-home thread: "currently
+  owned elsewhere, at (node, thread) X." Non-native holders track nothing
+  beyond their own current holdings.
+- **Lazy crash/drain recovery, no heartbeats for ownership**: if a relay/
+  forward to X fails (connection refused/timeout), the native-home thread
+  immediately reclaims authority and reloads from storage on next access.
+  A clean node exit and a crash look identical from the ring's perspective
+  — on shutdown, a compute node just flushes any dirty state (already
+  guaranteed by write-before-ack) and exits; there is no active handoff
+  step.
+- **Livelock avoidance (wound-wait by op_id)**: when two ops' collation
+  requests contend for the same datum, the request carrying the lower
+  (older) op_id wins; the higher (newer) op backs off and retries. This
+  prevents a datum ping-ponging indefinitely between two competing
+  multi-datum ops.
+
+## Collation & Op Execution
+
+- Each owning thread has a single inbox/queue and executes exactly one op
+  at a time against the datums it currently holds (native + foreign).
+- **Op → thread assignment**: for a multi-datum op, pick the thread that
+  already owns the most of the involved datums (native or already-foreign),
+  minimizing the number of new foreign pulls needed.
+- **Collation**: for each datum not already on the chosen thread, the
+  thread requests a transfer (native home relays if the datum is currently
+  elsewhere). On arrival, the datum is tagged `Foreign(self.node_id,
+  self.thread_id)` — trivial to mint, since the collating thread always
+  knows its own address; no search for a pre-existing usable authority_idx
+  value is needed.
+- **Post-op placement**: immediately after the op completes, every foreign
+  datum used is sent back toward its native home — *unless* the thread's
+  very next queued op already needs that same foreign datum, in which case
+  it stays for that one hop. This is the anti-degeneration rule: without
+  it, ownership tends to collapse onto a single thread over time.
+- **Write-before-ack**: any datum mutated during the op is written through
+  to storage before the op's response is acknowledged to the client. This
+  is what makes lazy crash recovery safe — nothing acknowledged is ever
+  only-in-memory.
+
+## Storage Tier
+
+- Storage nodes form their own consistent-hash ring, entirely independent
+  of the compute ring's membership and keyspace mapping.
+- The ring is **capacity-weighted**: because datums vary in size and pure
+  hash-based placement would not yield even space usage, nodes with more
+  free space claim proportionally more virtual buckets. Placement/lookup
+  remains a pure function of `(datum_id, current ring + weights)` — no
+  separate directory service is introduced. Capacity reweighting is handled
+  by the same migration mechanism as membership changes, not a separate
+  system.
+- Storage never tracks current ownership/authority, only content — that
+  state lives entirely in compute-side memory (see authority_idx above).
+- On cache miss, a compute thread reads through to storage (hashing into
+  the storage ring); on write, it writes through before ack.
+- **No replication in v1.** A storage node crash is unrecoverable for the
+  data it held. This is a deliberate fail-stop choice: **the whole cluster
+  halts** (stops serving all client traffic) rather than risk serving from
+  a partially-lost dataset. This is a deliberate asymmetry with compute
+  nodes, whose crashes are fully recoverable via lazy reclaim.
+- **Adding a storage node** triggers migration onto it per the reweighted
+  ring, prioritizing datums currently involved in live ops first, so the
+  cluster can ideally stay available through the migration.
+- **Removing a storage node** must fully migrate its data off to other
+  nodes before it's allowed to leave the ring — unlike compute's "just
+  exit, lazy reclaim handles it," storage has no fallback if data
+  disappears mid-removal.
+- **Deferred to later (not v1)**: double-write replication (writing to two
+  storage nodes) for crash resilience, at 2x storage cost and slower
+  writes. The storage-node interface and placement scheme should stay open
+  to this without being built now.
+
+## Cluster Membership
+
+- Two independent membership pools: the **compute ring** and the
+  **storage ring**. A node advertises which role(s) it holds; role
+  membership changes only affect the corresponding ring(s).
+- Dynamic membership via gossip (SWIM-style): periodic ping/ping-req
+  between random peers, suspicion timeout, then confirmed-dead broadcast.
+  Chosen over static config despite v1's container-based deployment,
+  because migrating a static-membership system to dynamic later has
+  historically been a significant rewrite.
+- Membership-confirmed-dead is a separate signal from the lazy per-datum
+  reclaim path: gossip updates the relevant ring so *new* native-home
+  hashing routes around a dead node going forward, but reclaiming any
+  specific already-transferred datum still happens lazily, on relay/forward
+  failure — not as a reaction to the gossip signal.
+
+## Execution Model & Wire Protocol
+
+- **Execution model**: OS thread per authority slot. A compute node runs a
+  fixed pool of real OS threads, each with its own inbox, executing one op
+  at a time. This maps directly to "a thread owns a datum" and avoids the
+  complexity of an async runtime.
+- **Wire protocol**: a custom, minimal binary framing over raw TCP, used
+  for client↔compute traffic, node↔node relay/transfer traffic, and gossip.
+  No auth or encryption layer (see Non-Goals).
+
+## Deployment & v1 Scope
+
+- v1 target: a containerized multi-node deployment (e.g. docker-compose),
+  each container running a node process with compute and/or storage roles
+  enabled, communicating over a real network — validates the protocol over
+  actual sockets rather than in-process simulation.
+
+## Testing Strategy
+
+Testing should exercise, at minimum:
+- Ownership handoff correctness (native ↔ foreign transitions, relay
+  chains, reset-to-native on return).
+- Wound-wait livelock avoidance under deliberately contended multi-datum
+  ops.
+- Lazy reclaim after a node is killed (both compute and storage nodes),
+  and confirmation that a clean exit behaves identically to a crash from
+  the ring's perspective.
+- Ring rebalancing on node join/leave, and on storage capacity reweighting.
+- The anti-degeneration (datum-return-home) rule under sustained
+  multi-datum op load, confirming ownership doesn't collapse onto a single
+  thread over time.
+
+## Open Questions / Future Work
+
+- Storage replication (double-write) for crash resilience.
+- Whether/how to support internal-only compute nodes not directly
+  reachable by clients, if that's ever needed (would require rethinking the
+  "client hashes directly into the compute ring" assumption).
+- Prior art survey (planned as a follow-up to this design).
