@@ -123,6 +123,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "seisin-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "seisin-core",
+ "seisin-protocol",
+]
+
+[[package]]
+name = "seisin-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "seisin-core",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
