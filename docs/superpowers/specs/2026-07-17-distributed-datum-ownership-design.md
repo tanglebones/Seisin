@@ -256,10 +256,75 @@ Testing should exercise, at minimum:
   stale pre-join cache entry, and that bulk cache eviction on membership
   change stays cheap (not a full-cache scan) as node count grows.
 
+## Compute Ring Mechanics (added during Sub-project 2 design)
+
+The Routing & Ownership Protocol section above establishes *that* a native
+authority is resolved via consistent hashing through the compute ring;
+this section fixes the concrete mechanism, decided while designing
+Sub-project 2 (Compute Ring & Routing) rather than in the original pass.
+
+- **Thread count per node**: derived from the node's own available CPU
+  core count at startup, not manually configured. A node announces
+  `(NodeId, address, thread_count)` when it joins.
+- **Ring algorithm**: jump-consistent-hash (the project's own
+  `consistent_hash` crate, vendored — see `SUBMODULE.md`-independent
+  copy-in per its README) over a flat `slots: Vec<(NodeId, ThreadId)>`
+  array. `native(datum_id) = slots[hash(datum_id, slots.len())]`.
+  - **Join**: append the new node's thread-slots to the end of the array.
+  - **Leave**: for each of the departed node's slots, swap it with
+    whatever currently occupies the last index, then truncate by one —
+    applied one slot at a time in a fixed order (ascending index) so the
+    result is identical regardless of which node computes it. This is the
+    standard technique for handling arbitrary-node removal with a
+    jump-consistent-hash family algorithm while preserving its minimal-
+    remap guarantee; naively re-sorting live nodes by id and reassigning
+    contiguous indices from scratch was considered and rejected — it
+    converges correctly but reintroduces the same churn characteristics
+    as plain modulo hashing (up to O(n) keys reshuffled for one node
+    leaving), defeating the reason to use consistent hashing at all.
+  - Rendezvous (HRW) hashing was also considered — it sidesteps ordering
+    entirely by being a pure function of the live node *set* — but was
+    rejected in favor of keeping O(1) lookups via jump-consistent-hash,
+    given the ordering problem below has a clean fix.
+- **Ordering (why the swap-with-last mutation is safe to trust)**: SWIM
+  gossip (Cluster Membership section above) has no built-in global event
+  order, but the array mutation above is order-sensitive — two nodes
+  applying the same join/leave events in different orders would compute
+  different arrays. This is fixed with a lightweight elected **epoch
+  sequencer**: whichever live node currently has the lowest `NodeId` (the
+  same deterministic, coordination-free selection Akka Cluster uses for
+  its leader) assigns the next monotonic epoch number to each ring
+  mutation and gossips `(epoch, mutation)`. The sequencer only orders
+  mutations — every node still computes the array itself, replaying
+  mutations strictly in epoch order (buffering any that arrive out of
+  order). If the sequencer dies, the next-lowest-`NodeId` live node
+  resumes sequencing from the last epoch it observed via anti-entropy; no
+  separate failover protocol is needed since "who is the sequencer" is
+  always a pure function of current membership.
+- **Relay mechanism**: client-side redirect, not node-to-node proxying. A
+  node that isn't the current owner of a requested datum replies with a
+  `Redirect(address)` response naming the correct node; the client
+  reconnects there itself. This avoids an extra node-to-node hop on every
+  misrouted request, at the cost of the client needing a redirect-follow
+  loop.
+
+**Sub-project 2 is split into two plans** because of how much is bundled
+above:
+- **2a — Ring & redirect routing**: the ring data structure and mutation
+  replay, `NodeId`/`ThreadId` addressing, the `Redirect` wire message, a
+  redirect-following client helper, and relay logic — proven against a
+  *static*, config-supplied initial membership (no runtime join/leave
+  yet). The ring API is built around replaying an ordered mutation log
+  from the start, so this isn't the same "static now, rewrite for
+  dynamic later" trap as a hardcoded membership list would be.
+- **2b — Dynamic gossip membership**: SWIM ping/ping-req/suspect/dead, the
+  epoch sequencer, and the ring-epoch cache invalidation rules — layered
+  on top of 2a's ring as a new *source* of mutations, without changing the
+  ring or relay logic itself.
+
 ## Open Questions / Future Work
 
 - Storage replication (double-write) for crash resilience.
 - Whether/how to support internal-only compute nodes not directly
   reachable by clients, if that's ever needed (would require rethinking the
   "client hashes directly into the compute ring" assumption).
-- Prior art survey (planned as a follow-up to this design).
