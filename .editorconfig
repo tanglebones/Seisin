@@ -1,0 +1,61 @@
+root = true
+
+[*]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_size = 2
+
+# C#/.NET — Allman braces are enforced by the IDE/analyzers, not editorconfig,
+# but indent/newline/namespace conventions live here.
+[*.cs]
+indent_size = 2
+csharp_new_line_before_open_brace = all
+csharp_style_namespace_declarations = file_scoped:error
+csharp_using_directive_placement = outside_namespace:error
+
+[*.{csproj,sln,props,targets}]
+indent_size = 2
+
+# Rust — rustfmt.toml is authoritative for Rust formatting (2-space is a
+# deliberate house style, not default rustfmt); this just keeps raw edits sane.
+[*.rs]
+indent_size = 4
+
+[Cargo.toml]
+indent_size = 4
+
+# GDScript — Godot's own formatter expects tabs; don't fight it here.
+[*.gd]
+indent_style = tab
+
+[*.{ts,tsx,js,jsx,json}]
+indent_size = 2
+
+[*.{razor,cshtml}]
+indent_size = 4
+
+[*.sql]
+indent_size = 2
+
+[*.{sh,bash}]
+indent_size = 2
+end_of_line = lf
+
+[*.{ps1,psm1}]
+indent_size = 4
+end_of_line = crlf
+
+[*.py]
+indent_size = 4
+
+[Makefile]
+indent_style = tab

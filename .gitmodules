@@ -1,0 +1,4 @@
+[submodule ".guidelines"]
+	path = .guidelines
+	url = git@github.com:tanglebones/coding_guidelines.git
+	branch = main
