@@ -4,7 +4,7 @@
 
 use std::io::{self, Read, Write};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use seisin_core::authority::{AuthorityIdx, ENCODED_LEN as AUTHORITY_LEN};
 use seisin_core::datum::DatumId;
@@ -16,6 +16,17 @@ pub enum Request {
   Delete { id: DatumId },
 }
 
+impl Request {
+  /// The datum_id every `Request` variant carries, regardless of which
+  /// operation it is — used by the server to look up the ring's native
+  /// owner before dispatching.
+  pub fn datum_id(&self) -> DatumId {
+    match self {
+      Request::Get { id } | Request::Put { id, .. } | Request::Delete { id } => *id,
+    }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
   Value {
@@ -24,6 +35,9 @@ pub enum Response {
   },
   NotFound,
   Ok,
+  Redirect {
+    address: String,
+  },
 }
 
 const OP_GET: u8 = 1;
@@ -33,6 +47,7 @@ const OP_DELETE: u8 = 3;
 const RESP_VALUE: u8 = 0;
 const RESP_NOT_FOUND: u8 = 1;
 const RESP_OK: u8 = 2;
+const RESP_REDIRECT: u8 = 3;
 
 const ID_LEN: usize = 16;
 
@@ -82,6 +97,12 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
     }
     Response::NotFound => buf.push(RESP_NOT_FOUND),
     Response::Ok => buf.push(RESP_OK),
+    Response::Redirect { address } => {
+      buf.push(RESP_REDIRECT);
+      let addr_bytes = address.as_bytes();
+      buf.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
+      buf.extend_from_slice(addr_bytes);
+    }
   }
   buf
 }
@@ -107,6 +128,22 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
     }
     RESP_NOT_FOUND => Ok(Response::NotFound),
     RESP_OK => Ok(Response::Ok),
+    RESP_REDIRECT => {
+      if buf.len() < 5 {
+        bail!("redirect response too short for an address length: {} bytes", buf.len());
+      }
+      let addr_len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+      if buf.len() != 5 + addr_len {
+        bail!(
+          "redirect response length mismatch: expected {} bytes, got {}",
+          5 + addr_len,
+          buf.len()
+        );
+      }
+      let address =
+        String::from_utf8(buf[5..].to_vec()).context("redirect address was not valid utf8")?;
+      Ok(Response::Redirect { address })
+    }
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -222,5 +259,38 @@ mod tests {
     let mut cursor = Cursor::new(oversized_len.to_le_bytes().to_vec());
     let err = read_frame(&mut cursor).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+  }
+
+  #[test]
+  fn round_trips_redirect_response() {
+    let resp = Response::Redirect {
+      address: "127.0.0.1:7879".to_string(),
+    };
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  fn rejects_redirect_with_invalid_utf8_address() {
+    let mut buf = encode_response(&Response::Redirect {
+      address: "x".to_string(),
+    });
+    // Corrupt the one address byte into an invalid UTF-8 continuation byte.
+    *buf.last_mut().unwrap() = 0x80;
+    assert!(decode_response(&buf).is_err());
+  }
+
+  #[test]
+  fn datum_id_returns_the_id_for_every_variant() {
+    let id = DatumId::new();
+    assert_eq!(Request::Get { id }.datum_id(), id);
+    assert_eq!(
+      Request::Put {
+        id,
+        content: vec![]
+      }
+      .datum_id(),
+      id
+    );
+    assert_eq!(Request::Delete { id }.datum_id(), id);
   }
 }
