@@ -166,6 +166,7 @@ dependencies = [
  "ron",
  "seisin-core",
  "seisin-protocol",
+ "seisin-ring",
  "serde",
 ]
 

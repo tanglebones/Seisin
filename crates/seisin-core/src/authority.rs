@@ -11,11 +11,11 @@
 use anyhow::{bail, Result};
 
 /// Identifies a compute node within the cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u64);
 
 /// Identifies one owning thread (authority slot) within a compute node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadId(pub u32);
 
 /// Current owner of a datum: either its hash-derived native home, or a

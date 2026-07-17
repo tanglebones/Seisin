@@ -1,22 +1,27 @@
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use seisin_core::authority::AuthorityIdx;
+use seisin_core::authority::{AuthorityIdx, NodeId};
 use seisin_core::datum::DatumId;
 use seisin_core::sk::{decode_sk_entries, encode_sk_entries};
 use seisin_core::store::InMemoryStore;
+use seisin_node::pool::WorkerPool;
 use seisin_node::server::serve;
-use seisin_node::worker::WorkerHandle;
 use seisin_protocol::{
   decode_response, encode_request, read_frame, write_frame, Request, Response,
 };
+use seisin_ring::ring::Ring;
 
 fn start_test_server() -> SocketAddr {
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let addr = listener.local_addr().unwrap();
-  let worker = Arc::new(WorkerHandle::spawn(Arc::new(InMemoryStore::new())));
-  thread::spawn(move || serve(listener, worker));
+  let node_id = NodeId(1);
+  let ring = Arc::new(Ring::from_members(&[(node_id, 1)]));
+  let address_book = Arc::new(HashMap::new());
+  let pool = Arc::new(WorkerPool::spawn(Arc::new(InMemoryStore::new()), 1));
+  thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
   addr
 }
 
