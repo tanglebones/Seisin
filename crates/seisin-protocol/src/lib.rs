@@ -125,12 +125,23 @@ pub fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
   w.flush()
 }
 
+/// Frames larger than this are rejected outright rather than allocated —
+/// caps how much memory a single malformed or malicious length prefix can
+/// make a connection handler allocate before any content is even read.
+pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
+
 /// Reads a single length-prefixed frame written by `write_frame`.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
   let mut len_buf = [0u8; 4];
   r.read_exact(&mut len_buf)?;
-  let len = u32::from_le_bytes(len_buf) as usize;
-  let mut payload = vec![0u8; len];
+  let len = u32::from_le_bytes(len_buf);
+  if len > MAX_FRAME_LEN {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("frame length {len} exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN})"),
+    ));
+  }
+  let mut payload = vec![0u8; len as usize];
   r.read_exact(&mut payload)?;
   Ok(payload)
 }
@@ -203,5 +214,13 @@ mod tests {
     write_frame(&mut buf, b"payload bytes").unwrap();
     let mut cursor = Cursor::new(buf);
     assert_eq!(read_frame(&mut cursor).unwrap(), b"payload bytes");
+  }
+
+  #[test]
+  fn rejects_a_frame_length_over_the_max() {
+    let oversized_len = MAX_FRAME_LEN + 1;
+    let mut cursor = Cursor::new(oversized_len.to_le_bytes().to_vec());
+    let err = read_frame(&mut cursor).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
   }
 }
