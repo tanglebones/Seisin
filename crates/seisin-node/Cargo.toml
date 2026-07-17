@@ -7,3 +7,5 @@ edition = "2021"
 seisin-core = { path = "../seisin-core" }
 seisin-protocol = { path = "../seisin-protocol" }
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
