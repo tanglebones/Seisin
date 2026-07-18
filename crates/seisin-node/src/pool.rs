@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use seisin_core::authority::ThreadId;
+use seisin_core::datum::DatumId;
 use seisin_core::store::Store;
 use seisin_protocol::{Request, Response};
 
@@ -36,6 +37,14 @@ impl WorkerPool {
   /// to this node.
   pub fn submit(&self, thread_id: ThreadId, request: Request) -> Response {
     self.handles[thread_id.0 as usize].submit(request)
+  }
+
+  /// Asks every worker in the pool to evict cache entries `is_native`
+  /// rejects — see `WorkerHandle::evict_non_native`.
+  pub fn evict_non_native(&self, is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>) {
+    for handle in &self.handles {
+      handle.evict_non_native(Arc::clone(&is_native));
+    }
   }
 }
 
