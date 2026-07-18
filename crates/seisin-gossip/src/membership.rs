@@ -161,6 +161,12 @@ impl MemberTable {
     record.to_update(self_id)
   }
 
+  /// A full snapshot of every known member's current update, in no
+  /// particular order.
+  pub fn all(&self) -> Vec<MemberUpdate> {
+    self.members.iter().map(|(node_id, record)| record.to_update(*node_id)).collect()
+  }
+
   /// All members currently believed `Alive`, in ascending `NodeId` order.
   pub fn alive_members(&self) -> Vec<NodeId> {
     let mut ids: Vec<NodeId> = self
@@ -287,6 +293,16 @@ mod tests {
     assert_eq!(result.incarnation, Incarnation(4));
     assert_eq!(result.status, MemberStatus::Alive);
     assert_eq!(table.get(NodeId(1)).unwrap().incarnation, Incarnation(4));
+  }
+
+  #[test]
+  fn all_returns_every_known_member() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(1, 0, MemberStatus::Alive));
+    table.merge_update(update(2, 0, MemberStatus::Suspect));
+    let mut all = table.all();
+    all.sort_by_key(|u| u.node_id.0);
+    assert_eq!(all, vec![update(1, 0, MemberStatus::Alive), update(2, 0, MemberStatus::Suspect)]);
   }
 
   #[test]
