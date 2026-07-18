@@ -162,6 +162,7 @@ dependencies = [
 name = "seisin-gossip"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "seisin-core",
 ]
 
