@@ -164,6 +164,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ron",
+ "seisin-client",
  "seisin-core",
  "seisin-protocol",
  "seisin-ring",

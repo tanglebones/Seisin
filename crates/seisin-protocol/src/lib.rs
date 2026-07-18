@@ -130,7 +130,10 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
     RESP_OK => Ok(Response::Ok),
     RESP_REDIRECT => {
       if buf.len() < 5 {
-        bail!("redirect response too short for an address length: {} bytes", buf.len());
+        bail!(
+          "redirect response too short for an address length: {} bytes",
+          buf.len()
+        );
       }
       let addr_len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
       if buf.len() != 5 + addr_len {

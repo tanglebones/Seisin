@@ -6,14 +6,9 @@
 //! project's style; the algorithm itself is unchanged.
 
 /// Deterministic 64-bit RNG (SplitMix64) used by the hasher.
+#[derive(Default)]
 struct SplitMix64 {
   state: u64,
-}
-
-impl Default for SplitMix64 {
-  fn default() -> Self {
-    Self { state: 0 }
-  }
 }
 
 impl SplitMix64 {
@@ -36,14 +31,9 @@ impl SplitMix64 {
 /// applies the swap-with-last technique on top of this primitive to
 /// support removing an arbitrary (not just the highest-index) bucket
 /// while keeping that guarantee.
+#[derive(Default)]
 pub struct JumpBackHasher {
   rng: SplitMix64,
-}
-
-impl Default for JumpBackHasher {
-  fn default() -> Self {
-    Self { rng: SplitMix64::default() }
-  }
 }
 
 impl JumpBackHasher {
@@ -66,7 +56,7 @@ impl JumpBackHasher {
     let mut u_work = u;
     while u_work != 0 {
       let q: u32 = 1u32 << (31 - u_work.leading_zeros());
-      let shift: u32 = ((u_work.count_ones() << 5) & 63) as u32;
+      let shift: u32 = (u_work.count_ones() << 5) & 63;
       let b0: u32 = ((v >> shift) as u32) & (q - 1);
       let mut b: u32 = q.wrapping_add(b0);
 
@@ -76,7 +66,11 @@ impl JumpBackHasher {
         }
         let w = self.rng.next_long();
 
-        let mask2: u32 = if q == 0x8000_0000 { 0xFFFF_FFFF } else { (q << 1) - 1 };
+        let mask2: u32 = if q == 0x8000_0000 {
+          0xFFFF_FFFF
+        } else {
+          (q << 1) - 1
+        };
 
         b = (w as u32) & mask2;
         if b < q {
