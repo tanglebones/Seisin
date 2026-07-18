@@ -41,6 +41,30 @@ impl Ring {
     ring
   }
 
+  /// Removes all of `node_id`'s slots via swap-with-last: swap the
+  /// removed slot with whatever's at the last index, then shrink by
+  /// one. This is the standard technique for removing an arbitrary (not
+  /// just the highest-index) slot while preserving jump-consistent-
+  /// hash's minimal-remap guarantee for every untouched slot. The result
+  /// is a deterministic function of the starting array and `node_id`, so
+  /// every node applying the same mutation to the same starting ring
+  /// converges on an identical result — required for the epoch-ordered
+  /// replay in Sub-project 2b-ii.
+  pub fn apply_leave(&mut self, node_id: NodeId) {
+    let mut i = 0;
+    while i < self.slots.len() {
+      if self.slots[i].0 == node_id {
+        let last = self.slots.len() - 1;
+        self.slots.swap(i, last);
+        self.slots.pop();
+        // Don't advance i: the slot just swapped into position i might
+        // also belong to node_id if it had multiple thread slots.
+      } else {
+        i += 1;
+      }
+    }
+  }
+
   /// Returns the datum's current native (node, thread).
   ///
   /// # Panics
@@ -109,5 +133,53 @@ mod tests {
   fn single_member_ring_always_resolves_to_that_member() {
     let ring = Ring::from_members(&[(NodeId(9), 1)]);
     assert_eq!(ring.native(DatumId::new()), (NodeId(9), ThreadId(0)));
+  }
+
+  #[test]
+  fn apply_leave_removes_a_single_slot_member() {
+    let mut ring = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
+    ring.apply_leave(NodeId(1));
+    for _ in 0..50 {
+      let (node_id, _) = ring.native(DatumId::new());
+      assert_eq!(node_id, NodeId(2));
+    }
+  }
+
+  #[test]
+  fn apply_leave_removes_all_of_a_multi_slot_members_slots() {
+    let mut ring = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 1)]);
+    ring.apply_leave(NodeId(1));
+    for _ in 0..50 {
+      let (node_id, thread_id) = ring.native(DatumId::new());
+      assert_eq!(node_id, NodeId(2));
+      assert_eq!(thread_id, ThreadId(0));
+    }
+  }
+
+  #[test]
+  fn apply_leave_only_removes_the_named_member() {
+    let mut ring = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1), (NodeId(3), 1)]);
+    ring.apply_leave(NodeId(2));
+    for _ in 0..50 {
+      let (node_id, _) = ring.native(DatumId::new());
+      assert!(node_id == NodeId(1) || node_id == NodeId(3), "unexpected owner: {node_id:?}");
+    }
+  }
+
+  #[test]
+  fn apply_leave_on_an_unknown_member_is_a_no_op() {
+    let mut ring = Ring::from_members(&[(NodeId(1), 1)]);
+    let id = DatumId::new();
+    let before = ring.native(id);
+    ring.apply_leave(NodeId(999));
+    assert_eq!(ring.native(id), before);
+  }
+
+  #[test]
+  #[should_panic]
+  fn native_panics_once_the_last_member_has_left() {
+    let mut ring = Ring::from_members(&[(NodeId(1), 1)]);
+    ring.apply_leave(NodeId(1));
+    ring.native(DatumId::new());
   }
 }
