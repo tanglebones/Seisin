@@ -55,7 +55,13 @@ impl GossipState {
   /// attach to an outbound gossip message.
   pub fn piggyback(&self) -> (Vec<MemberUpdate>, Vec<(u64, RingMutation)>) {
     let updates = self.member_table.lock().unwrap().all();
-    let mutations = self.recent_mutations.lock().unwrap().iter().copied().collect();
+    let mutations = self
+      .recent_mutations
+      .lock()
+      .unwrap()
+      .iter()
+      .copied()
+      .collect();
     (updates, mutations)
   }
 
@@ -77,7 +83,12 @@ impl GossipState {
 /// `ring`, then evicts from `pool`'s cache any entry this node no longer
 /// natively owns as a result — see the design doc's "Cache Invalidation
 /// on Ring Membership Change" section.
-pub fn apply_ready_mutations(gossip: &GossipState, ring: &Arc<RwLock<Ring>>, self_node_id: NodeId, pool: &WorkerPool) {
+pub fn apply_ready_mutations(
+  gossip: &GossipState,
+  ring: &Arc<RwLock<Ring>>,
+  self_node_id: NodeId,
+  pool: &WorkerPool,
+) {
   let ready = gossip.mutation_log.lock().unwrap().drain_applicable();
   if ready.is_empty() {
     return;
@@ -86,13 +97,18 @@ pub fn apply_ready_mutations(gossip: &GossipState, ring: &Arc<RwLock<Ring>>, sel
     let mut ring_guard = ring.write().unwrap();
     for mutation in &ready {
       match *mutation {
-        RingMutation::Join { node_id, thread_count } => ring_guard.apply_join(node_id, thread_count),
+        RingMutation::Join {
+          node_id,
+          thread_count,
+        } => ring_guard.apply_join(node_id, thread_count),
         RingMutation::Leave { node_id } => ring_guard.apply_leave(node_id),
       }
     }
   }
   let ring = Arc::clone(ring);
-  pool.evict_non_native(Arc::new(move |id| ring.read().unwrap().native(id).0 == self_node_id));
+  pool.evict_non_native(Arc::new(move |id| {
+    ring.read().unwrap().native(id).0 == self_node_id
+  }));
 }
 
 #[cfg(test)]
@@ -116,12 +132,24 @@ mod tests {
     let gossip = GossipState::new();
     gossip.merge_incoming(
       vec![sample_update(1)],
-      vec![(1, RingMutation::Join { node_id: NodeId(1), thread_count: 1 })],
+      vec![(
+        1,
+        RingMutation::Join {
+          node_id: NodeId(1),
+          thread_count: 1,
+        },
+      )],
     );
-    assert_eq!(gossip.member_table.lock().unwrap().get(NodeId(1)), Some(sample_update(1)));
+    assert_eq!(
+      gossip.member_table.lock().unwrap().get(NodeId(1)),
+      Some(sample_update(1))
+    );
     assert_eq!(
       gossip.mutation_log.lock().unwrap().drain_applicable(),
-      vec![RingMutation::Join { node_id: NodeId(1), thread_count: 1 }]
+      vec![RingMutation::Join {
+        node_id: NodeId(1),
+        thread_count: 1
+      }]
     );
   }
 
@@ -129,17 +157,37 @@ mod tests {
   fn piggyback_includes_merged_updates_and_recorded_mutations() {
     let gossip = GossipState::new();
     gossip.merge_incoming(vec![sample_update(1)], vec![]);
-    gossip.record_mutation(1, RingMutation::Join { node_id: NodeId(1), thread_count: 1 });
+    gossip.record_mutation(
+      1,
+      RingMutation::Join {
+        node_id: NodeId(1),
+        thread_count: 1,
+      },
+    );
     let (updates, mutations) = gossip.piggyback();
     assert_eq!(updates, vec![sample_update(1)]);
-    assert_eq!(mutations, vec![(1, RingMutation::Join { node_id: NodeId(1), thread_count: 1 })]);
+    assert_eq!(
+      mutations,
+      vec![(
+        1,
+        RingMutation::Join {
+          node_id: NodeId(1),
+          thread_count: 1
+        }
+      )]
+    );
   }
 
   #[test]
   fn recent_mutations_buffer_is_bounded() {
     let gossip = GossipState::new();
     for epoch in 1..=(RECENT_MUTATIONS_CAP as u64 + 5) {
-      gossip.record_mutation(epoch, RingMutation::Leave { node_id: NodeId(epoch) });
+      gossip.record_mutation(
+        epoch,
+        RingMutation::Leave {
+          node_id: NodeId(epoch),
+        },
+      );
     }
     assert_eq!(gossip.piggyback().1.len(), RECENT_MUTATIONS_CAP);
   }

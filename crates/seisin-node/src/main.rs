@@ -28,13 +28,23 @@ fn main() -> Result<()> {
     .iter()
     .find(|m| m.node_id == config.self_node_id)
     .map(|m| m.gossip_address.clone())
-    .with_context(|| format!("self_node_id {} not present in members", config.self_node_id))?;
+    .with_context(|| {
+      format!(
+        "self_node_id {} not present in members",
+        config.self_node_id
+      )
+    })?;
   let self_thread_count = config
     .members
     .iter()
     .find(|m| m.node_id == config.self_node_id)
     .map(|m| m.thread_count)
-    .with_context(|| format!("self_node_id {} not present in members", config.self_node_id))?;
+    .with_context(|| {
+      format!(
+        "self_node_id {} not present in members",
+        config.self_node_id
+      )
+    })?;
 
   let members: Vec<(NodeId, u32)> = config
     .members

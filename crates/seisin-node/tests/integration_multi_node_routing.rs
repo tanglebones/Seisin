@@ -19,7 +19,10 @@ fn start_two_node_cluster() -> (String, String) {
 
   let node_a = NodeId(1);
   let node_b = NodeId(2);
-  let ring = Arc::new(std::sync::RwLock::new(Ring::from_members(&[(node_a, 2), (node_b, 2)])));
+  let ring = Arc::new(std::sync::RwLock::new(Ring::from_members(&[
+    (node_a, 2),
+    (node_b, 2),
+  ])));
 
   let mut address_book = HashMap::new();
   address_book.insert(node_a, addr_a.clone());

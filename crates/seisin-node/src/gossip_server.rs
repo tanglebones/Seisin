@@ -51,7 +51,9 @@ fn handle_gossip_connection(
   };
   let (updates, mutations) = match message {
     GossipMessage::Ping { updates, mutations } => (updates, mutations),
-    GossipMessage::PingReq { updates, mutations, .. } => (updates, mutations),
+    GossipMessage::PingReq {
+      updates, mutations, ..
+    } => (updates, mutations),
     GossipMessage::Ack { updates, mutations } => (updates, mutations),
   };
   gossip.merge_incoming(updates, mutations);

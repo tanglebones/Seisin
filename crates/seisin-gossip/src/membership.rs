@@ -164,7 +164,11 @@ impl MemberTable {
   /// A full snapshot of every known member's current update, in no
   /// particular order.
   pub fn all(&self) -> Vec<MemberUpdate> {
-    self.members.iter().map(|(node_id, record)| record.to_update(*node_id)).collect()
+    self
+      .members
+      .iter()
+      .map(|(node_id, record)| record.to_update(*node_id))
+      .collect()
   }
 
   /// All members currently believed `Alive`, in ascending `NodeId` order.
@@ -302,7 +306,13 @@ mod tests {
     table.merge_update(update(2, 0, MemberStatus::Suspect));
     let mut all = table.all();
     all.sort_by_key(|u| u.node_id.0);
-    assert_eq!(all, vec![update(1, 0, MemberStatus::Alive), update(2, 0, MemberStatus::Suspect)]);
+    assert_eq!(
+      all,
+      vec![
+        update(1, 0, MemberStatus::Alive),
+        update(2, 0, MemberStatus::Suspect)
+      ]
+    );
   }
 
   #[test]

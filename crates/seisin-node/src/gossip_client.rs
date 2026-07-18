@@ -36,21 +36,38 @@ pub fn run_gossip_loop(
   let clock = SystemClock::new();
   let mut detector = FailureDetector::new(&clock, probe_timeout_millis, suspicion_timeout_millis);
   let mut round_robin_index: usize = 0;
+  // The target of a probe that hasn't yet been acked or timed out. Only
+  // one probe is outstanding at a time — critical for a small cluster:
+  // if a new probe were started for the same sole peer on every tick,
+  // its timer would perpetually reset and it would never time out.
+  let mut outstanding_probe: Option<NodeId> = None;
 
   loop {
     thread::sleep(Duration::from_millis(probe_interval_millis));
 
     self_refute_if_falsely_suspected(self_node_id, &gossip);
 
-    let candidates: Vec<NodeId> = {
-      let table = gossip.member_table.lock().unwrap();
-      table.alive_members().into_iter().filter(|id| *id != self_node_id).collect()
-    };
-    if !candidates.is_empty() {
-      let target = candidates[round_robin_index % candidates.len()];
-      round_robin_index = round_robin_index.wrapping_add(1);
-      detector.begin_direct_probe(target);
-      send_ping(&gossip, &target);
+    if outstanding_probe.is_none() {
+      let candidates: Vec<NodeId> = {
+        let table = gossip.member_table.lock().unwrap();
+        table
+          .alive_members()
+          .into_iter()
+          .filter(|id| *id != self_node_id)
+          .collect()
+      };
+      if !candidates.is_empty() {
+        let target = candidates[round_robin_index % candidates.len()];
+        round_robin_index = round_robin_index.wrapping_add(1);
+        detector.begin_direct_probe(target);
+        outstanding_probe = Some(target);
+      }
+    }
+    if let Some(target) = outstanding_probe {
+      if send_ping(&gossip, &target) {
+        detector.on_ack(target);
+        outstanding_probe = None;
+      }
     }
 
     for action in detector.check_timeouts() {
@@ -66,6 +83,9 @@ pub fn run_gossip_loop(
         TimeoutAction::MarkDead(target) => {
           gossip.member_table.lock().unwrap().mark_dead(target);
           mint_leave_if_sequencer(self_node_id, &gossip, target);
+          if outstanding_probe == Some(target) {
+            outstanding_probe = None;
+          }
         }
       }
     }
@@ -82,7 +102,11 @@ fn self_refute_if_falsely_suspected(self_node_id: NodeId, gossip: &GossipState) 
     .get(self_node_id)
     .is_some_and(|update| update.status == MemberStatus::Suspect);
   if is_suspected {
-    let refutation = gossip.member_table.lock().unwrap().confirm_alive_self(self_node_id);
+    let refutation = gossip
+      .member_table
+      .lock()
+      .unwrap()
+      .confirm_alive_self(self_node_id);
     gossip.member_table.lock().unwrap().merge_update(refutation);
   }
 }
@@ -97,23 +121,37 @@ fn mint_leave_if_sequencer(self_node_id: NodeId, gossip: &GossipState, dead_node
 }
 
 fn highest_seen_epoch(gossip: &GossipState) -> u64 {
-  gossip.piggyback().1.iter().map(|(epoch, _)| *epoch).max().unwrap_or(0)
+  gossip
+    .piggyback()
+    .1
+    .iter()
+    .map(|(epoch, _)| *epoch)
+    .max()
+    .unwrap_or(0)
 }
 
-fn send_ping(gossip: &GossipState, target: &NodeId) {
+/// Sends a `Ping` to `target` and merges its `Ack` reply, if any.
+/// Returns whether an `Ack` was actually received — the caller uses this
+/// to clear the failure detector's tracking for `target`.
+fn send_ping(gossip: &GossipState, target: &NodeId) -> bool {
   let address = match gossip.member_table.lock().unwrap().get(*target) {
     Some(update) => update.gossip_address,
-    None => return,
+    None => return false,
   };
-  let Ok(mut stream) = TcpStream::connect(&address) else { return };
+  let Ok(mut stream) = TcpStream::connect(&address) else {
+    return false;
+  };
   let (updates, mutations) = gossip.piggyback();
   let ping = GossipMessage::Ping { updates, mutations };
   if write_frame(&mut stream, &encode_gossip_message(&ping)).is_err() {
-    return;
+    return false;
   }
-  let Ok(payload) = read_frame(&mut stream) else { return };
+  let Ok(payload) = read_frame(&mut stream) else {
+    return false;
+  };
   let Ok(GossipMessage::Ack { updates, mutations }) = decode_gossip_message(&payload) else {
-    return;
+    return false;
   };
   gossip.merge_incoming(updates, mutations);
+  true
 }
