@@ -17,16 +17,28 @@ pub struct Ring {
 }
 
 impl Ring {
+  pub fn empty() -> Self {
+    Self { slots: Vec::new() }
+  }
+
+  /// Appends `thread_count` new slots for `node_id` to the end of the
+  /// ring. Per jump-consistent-hash's own guarantee, growing `n` only
+  /// remaps keys that land in the newly-added range — every existing
+  /// key's owner is unaffected.
+  pub fn apply_join(&mut self, node_id: NodeId, thread_count: u32) {
+    for t in 0..thread_count {
+      self.slots.push((node_id, ThreadId(t)));
+    }
+  }
+
   /// Builds a ring from a static member list: `(node_id, thread_count)`
   /// pairs. Each member contributes `thread_count` slots, in order.
   pub fn from_members(members: &[(NodeId, u32)]) -> Self {
-    let mut slots = Vec::new();
+    let mut ring = Self::empty();
     for (node_id, thread_count) in members {
-      for t in 0..*thread_count {
-        slots.push((*node_id, ThreadId(t)));
-      }
+      ring.apply_join(*node_id, *thread_count);
     }
-    Self { slots }
+    ring
   }
 
   /// Returns the datum's current native (node, thread).
@@ -52,6 +64,28 @@ fn hash_key(datum_id: DatumId) -> u64 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn apply_join_adds_the_new_members_slots() {
+    let mut ring = Ring::empty();
+    ring.apply_join(NodeId(1), 2);
+    for _ in 0..50 {
+      let (node_id, thread_id) = ring.native(DatumId::new());
+      assert_eq!(node_id, NodeId(1));
+      assert!(thread_id.0 < 2);
+    }
+  }
+
+  #[test]
+  fn from_members_matches_building_via_apply_join() {
+    let via_constructor = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 3)]);
+    let mut via_mutation = Ring::empty();
+    via_mutation.apply_join(NodeId(1), 2);
+    via_mutation.apply_join(NodeId(2), 3);
+
+    let id = DatumId::new();
+    assert_eq!(via_constructor.native(id), via_mutation.native(id));
+  }
 
   #[test]
   fn native_is_deterministic_for_the_same_ring() {
