@@ -159,6 +159,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "seisin-gossip"
+version = "0.1.0"
+dependencies = [
+ "seisin-core",
+]
+
+[[package]]
 name = "seisin-node"
 version = "0.1.0"
 dependencies = [

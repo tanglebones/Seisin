@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/seisin-core", "crates/seisin-protocol", "crates/seisin-node", "crates/seisin-ring", "crates/seisin-client"]
+members = ["crates/seisin-core", "crates/seisin-protocol", "crates/seisin-node", "crates/seisin-ring", "crates/seisin-client", "crates/seisin-gossip"]
