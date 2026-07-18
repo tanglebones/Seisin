@@ -199,25 +199,40 @@ ack), then B leaves. Native ownership for X reverts — potentially back to
 A. If A still had a stale pre-B cache entry for X lying around and trusted
 it instead of reloading, B's committed write would be silently lost.
 
-Two separate rules address this:
+**Revised during Sub-project 2b design.** The original plan below assumed
+a vnode-style ring where `datum_id → vnode bucket` is stable across
+membership changes and only `vnode bucket → node` shifts. That doesn't
+hold for jump-consistent-hash: under the swap-with-last mutation (see
+"Compute Ring Mechanics"), only the removed slot and the former
+last-index slot actually change physical identity — every other slot
+keeps both its index *and* its node — but there's no stable notion of
+"which bucket did this key move out of" to partition a cache by, the way
+an actual vnode ring would allow.
+
+Re-examining what's actually required: since every request re-derives
+`ring.native(datum_id)` fresh before deciding to serve or redirect (see
+"Server relay logic" in Sub-project 2a), a stale cache entry for a key
+this node no longer natively owns is harmless on its own — the node will
+simply keep redirecting requests for it elsewhere and never touch that
+entry again. The only genuinely dangerous case is the one below: a node
+**regains** native status for a key without ever having noticed it lost
+it, and serves the stale pre-handoff content straight from cache. So the
+correctness fix only needs to prevent *that* — no cluster-keyspace-wide
+bucket-partitioning apparatus is needed.
 
 - **Correctness — regained native ownership is always a cache miss.**
-  Cache entries are tagged with the ring epoch they were loaded/validated
-  under. Native status is always re-derived against the *current* ring at
-  access time, never trusted from a stale local flag. If that check shows
-  a node has just (re)gained native ownership of a key via a membership
-  change, it is treated as a hard miss — reload from storage — regardless
-  of whatever might already be sitting in the local cache for that key.
-  This is what guarantees a departing node's write-before-ack'd changes
-  are actually picked up: storage is the only thing the two nodes are
-  guaranteed to agree on.
-- **Performance — bulk eviction must not require scanning the whole
-  cache.** The local cache is organized by the discrete hash-ring
-  bucket/vnode id, not just raw datum_id: `datum_id → vnode bucket` is
-  stable, while `vnode bucket → node` is what a membership change actually
-  reassigns. On a membership event, a node computes exactly which vnode
-  buckets it lost and evicts those cache partitions in bulk — O(#reassigned
-  buckets), not an O(cache size) walk re-hashing every entry.
+  On each locally-applied ring mutation, a node scans its *own* cache
+  (not the whole cluster's keyspace — just whatever it's actually holding)
+  and evicts any entry whose native owner under the *new* ring is no
+  longer itself. This guarantees that if this node later regains native
+  status for that key, it's a hard cache miss — reload from storage —
+  rather than serving a stale value that might be missing another node's
+  write-before-ack'd change in the interim. This is O(this node's cache
+  size) per mutation, not O(#reassigned slots) as originally hoped, but
+  it's simple, obviously correct, and reasonable at this project's scale
+  (container-based test clusters, not millions of entries per node).
+  Bounding this more tightly than "scan my own cache" is left as future
+  work if it ever becomes a real bottleneck.
 
 ## Execution Model & Wire Protocol
 
@@ -321,6 +336,45 @@ above:
   epoch sequencer, and the ring-epoch cache invalidation rules — layered
   on top of 2a's ring as a new *source* of mutations, without changing the
   ring or relay logic itself.
+
+## Dynamic Gossip Membership Mechanics (added during Sub-project 2b design)
+
+Concrete mechanics for the SWIM gossip layer and the epoch sequencer
+introduced conceptually above.
+
+- **Transport**: gossip uses the same custom binary framing as the
+  client/relay protocol, but over a separate `gossip_address` per node
+  (distinct from the client-facing address) — keeps the client wire
+  protocol and the gossip wire protocol as two independent message
+  namespaces rather than multiplexing both over one socket.
+- **SWIM parameters**: 1-second probe interval, indirect-probe fanout of
+  3 random peers on a direct-probe timeout, 5-second suspicion timeout
+  before a suspected node is declared dead. These are plain constants for
+  v1, not yet configurable.
+- **Membership state**: each node tracks, per known member, an
+  incarnation number and a status (`Alive` / `Suspect` / `Dead`), plus its
+  client address, gossip address, and thread count. Status changes and
+  incarnation bumps (a node refuting a false suspicion) are disseminated
+  by piggybacking a bounded batch of recent updates onto every ping/ack
+  message — standard SWIM infection-style dissemination.
+- **Ring mutations are derived from membership transitions, not a
+  separate message type**: a node's first-seen `Alive` status is a Join;
+  a confirmed `Dead` status is a Leave. The elected epoch sequencer (the
+  live member with the lowest `NodeId` — see "Compute Ring Mechanics")
+  assigns the next epoch number to each such transition and piggybacks
+  `(epoch, mutation)` records on the same gossip messages, alongside the
+  raw membership updates. Every node applies mutations to its `Ring`
+  strictly in epoch order, buffering any that arrive ahead of the next
+  expected epoch.
+- **`Ring` grows mutation methods** (`apply_join`, `apply_leave`) that
+  implement the append / swap-with-last operations described in "Compute
+  Ring Mechanics", replacing Sub-project 2a's build-once-from-static-list
+  behavior. Existing `native()` lookups are unaffected — this was the
+  point of shaping `Ring`'s API around a mutation log from the start.
+- **Cache invalidation** on each applied mutation follows the revised
+  rule in "Cache Invalidation on Ring Membership Change" above: scan this
+  node's own cache and evict entries whose native owner under the new
+  ring is no longer this node.
 
 ## Open Questions / Future Work
 
