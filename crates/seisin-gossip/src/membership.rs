@@ -115,6 +115,60 @@ impl MemberTable {
   pub fn get(&self, node_id: NodeId) -> Option<MemberUpdate> {
     self.members.get(&node_id).map(|record| record.to_update(node_id))
   }
+
+  /// Transitions a currently-`Alive` member to `Suspect`. No-op (returns
+  /// `None`) if the node is unknown or already `Suspect`/`Dead` — a
+  /// failure detector (added in Sub-project 2b-iii) calls this on a
+  /// probe timeout.
+  pub fn mark_suspect(&mut self, node_id: NodeId) -> Option<MemberUpdate> {
+    let record = self.members.get_mut(&node_id)?;
+    if record.status != MemberStatus::Alive {
+      return None;
+    }
+    record.status = MemberStatus::Suspect;
+    Some(record.to_update(node_id))
+  }
+
+  /// Transitions a currently-`Alive` or `Suspect` member to `Dead`.
+  /// No-op if unknown or already `Dead` — a failure detector calls this
+  /// after the suspicion timeout elapses with no refutation.
+  pub fn mark_dead(&mut self, node_id: NodeId) -> Option<MemberUpdate> {
+    let record = self.members.get_mut(&node_id)?;
+    if record.status == MemberStatus::Dead {
+      return None;
+    }
+    record.status = MemberStatus::Dead;
+    Some(record.to_update(node_id))
+  }
+
+  /// Bumps this node's own incarnation and marks it `Alive` — used to
+  /// refute a false suspicion (gossip reporting this node as `Suspect`
+  /// when it's actually fine).
+  ///
+  /// # Panics
+  /// Panics if `self_id` isn't already registered in this table — a node
+  /// must register itself before it can confirm its own liveness.
+  pub fn confirm_alive_self(&mut self, self_id: NodeId) -> MemberUpdate {
+    let record = self
+      .members
+      .get_mut(&self_id)
+      .expect("self must already be registered");
+    record.incarnation = Incarnation(record.incarnation.0 + 1);
+    record.status = MemberStatus::Alive;
+    record.to_update(self_id)
+  }
+
+  /// All members currently believed `Alive`, in ascending `NodeId` order.
+  pub fn alive_members(&self) -> Vec<NodeId> {
+    let mut ids: Vec<NodeId> = self
+      .members
+      .iter()
+      .filter(|(_, record)| record.status == MemberStatus::Alive)
+      .map(|(node_id, _)| *node_id)
+      .collect();
+    ids.sort_by_key(|node_id| node_id.0);
+    ids
+  }
 }
 
 #[cfg(test)]
@@ -180,5 +234,62 @@ mod tests {
   fn get_on_unknown_node_returns_none() {
     let table = MemberTable::new();
     assert_eq!(table.get(NodeId(42)), None);
+  }
+
+  #[test]
+  fn mark_suspect_transitions_an_alive_member() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(1, 0, MemberStatus::Alive));
+    let result = table.mark_suspect(NodeId(1));
+    assert_eq!(result.unwrap().status, MemberStatus::Suspect);
+    assert_eq!(table.get(NodeId(1)).unwrap().status, MemberStatus::Suspect);
+  }
+
+  #[test]
+  fn mark_suspect_on_unknown_node_is_a_no_op() {
+    let mut table = MemberTable::new();
+    assert_eq!(table.mark_suspect(NodeId(1)), None);
+  }
+
+  #[test]
+  fn mark_suspect_on_already_suspect_member_is_a_no_op() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(1, 0, MemberStatus::Suspect));
+    assert_eq!(table.mark_suspect(NodeId(1)), None);
+  }
+
+  #[test]
+  fn mark_dead_transitions_a_suspect_member() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(1, 0, MemberStatus::Suspect));
+    let result = table.mark_dead(NodeId(1));
+    assert_eq!(result.unwrap().status, MemberStatus::Dead);
+  }
+
+  #[test]
+  fn mark_dead_on_already_dead_member_is_a_no_op() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(1, 0, MemberStatus::Dead));
+    assert_eq!(table.mark_dead(NodeId(1)), None);
+  }
+
+  #[test]
+  fn confirm_alive_self_bumps_incarnation_and_clears_suspicion() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(1, 3, MemberStatus::Suspect));
+    let result = table.confirm_alive_self(NodeId(1));
+    assert_eq!(result.incarnation, Incarnation(4));
+    assert_eq!(result.status, MemberStatus::Alive);
+    assert_eq!(table.get(NodeId(1)).unwrap().incarnation, Incarnation(4));
+  }
+
+  #[test]
+  fn alive_members_excludes_suspect_and_dead_and_is_sorted() {
+    let mut table = MemberTable::new();
+    table.merge_update(update(3, 0, MemberStatus::Alive));
+    table.merge_update(update(1, 0, MemberStatus::Alive));
+    table.merge_update(update(2, 0, MemberStatus::Suspect));
+    table.merge_update(update(4, 0, MemberStatus::Dead));
+    assert_eq!(table.alive_members(), vec![NodeId(1), NodeId(3)]);
   }
 }
