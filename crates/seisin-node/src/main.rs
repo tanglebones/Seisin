@@ -24,7 +24,7 @@ fn main() -> Result<()> {
     .iter()
     .map(|m| (NodeId(m.node_id), m.thread_count))
     .collect();
-  let ring = Arc::new(Ring::from_members(&members));
+  let ring = Arc::new(std::sync::RwLock::new(Ring::from_members(&members)));
 
   let address_book: HashMap<NodeId, String> = config
     .members

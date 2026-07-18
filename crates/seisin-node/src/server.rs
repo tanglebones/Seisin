@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use seisin_core::authority::NodeId;
@@ -18,7 +18,7 @@ use crate::pool::WorkerPool;
 pub fn serve(
   listener: TcpListener,
   self_node_id: NodeId,
-  ring: Arc<Ring>,
+  ring: Arc<RwLock<Ring>>,
   address_book: Arc<HashMap<NodeId, String>>,
   pool: Arc<WorkerPool>,
 ) {
@@ -37,7 +37,7 @@ pub fn serve(
 fn handle_connection(
   mut stream: TcpStream,
   self_node_id: NodeId,
-  ring: Arc<Ring>,
+  ring: Arc<RwLock<Ring>>,
   address_book: Arc<HashMap<NodeId, String>>,
   pool: Arc<WorkerPool>,
 ) {
@@ -50,7 +50,7 @@ fn handle_connection(
       Ok(r) => r,
       Err(_) => return, // malformed request: drop the connection
     };
-    let (owner_node, thread_id) = ring.native(request.datum_id());
+    let (owner_node, thread_id) = ring.read().unwrap().native(request.datum_id());
     let response = if owner_node == self_node_id {
       pool.submit(thread_id, request)
     } else {
