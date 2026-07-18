@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use seisin_core::authority::NodeId;
 
 pub fn is_sequencer(self_id: NodeId, alive_members: &[NodeId]) -> bool {
-  alive_members.iter().min().is_some_and(|lowest| *lowest == self_id)
+  alive_members
+    .iter()
+    .min()
+    .is_some_and(|lowest| *lowest == self_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,18 +27,10 @@ pub enum RingMutation {
 /// gossip delivers `(epoch, mutation)` records with no ordering
 /// guarantee, but the ring's swap-with-last mutation must be applied
 /// identically (and therefore in the same order) on every node.
+#[derive(Default)]
 pub struct MutationLog {
   applied_epoch: u64,
   pending: BTreeMap<u64, RingMutation>,
-}
-
-impl Default for MutationLog {
-  fn default() -> Self {
-    Self {
-      applied_epoch: 0,
-      pending: BTreeMap::new(),
-    }
-  }
 }
 
 impl MutationLog {
@@ -107,12 +102,21 @@ mod mutation_log_tests {
   #[test]
   fn drains_in_order_epochs_immediately() {
     let mut log = MutationLog::new();
-    log.record(1, RingMutation::Join { node_id: NodeId(1), thread_count: 2 });
+    log.record(
+      1,
+      RingMutation::Join {
+        node_id: NodeId(1),
+        thread_count: 2,
+      },
+    );
     log.record(2, RingMutation::Leave { node_id: NodeId(1) });
     assert_eq!(
       log.drain_applicable(),
       vec![
-        RingMutation::Join { node_id: NodeId(1), thread_count: 2 },
+        RingMutation::Join {
+          node_id: NodeId(1),
+          thread_count: 2
+        },
         RingMutation::Leave { node_id: NodeId(1) },
       ]
     );
@@ -124,11 +128,20 @@ mod mutation_log_tests {
     log.record(2, RingMutation::Leave { node_id: NodeId(1) });
     assert_eq!(log.drain_applicable(), vec![]);
 
-    log.record(1, RingMutation::Join { node_id: NodeId(1), thread_count: 2 });
+    log.record(
+      1,
+      RingMutation::Join {
+        node_id: NodeId(1),
+        thread_count: 2,
+      },
+    );
     assert_eq!(
       log.drain_applicable(),
       vec![
-        RingMutation::Join { node_id: NodeId(1), thread_count: 2 },
+        RingMutation::Join {
+          node_id: NodeId(1),
+          thread_count: 2
+        },
         RingMutation::Leave { node_id: NodeId(1) },
       ]
     );
@@ -137,11 +150,23 @@ mod mutation_log_tests {
   #[test]
   fn a_stale_epoch_is_ignored() {
     let mut log = MutationLog::new();
-    log.record(1, RingMutation::Join { node_id: NodeId(1), thread_count: 2 });
+    log.record(
+      1,
+      RingMutation::Join {
+        node_id: NodeId(1),
+        thread_count: 2,
+      },
+    );
     log.drain_applicable();
 
     // Re-delivery of an already-applied epoch must not re-appear or panic.
-    log.record(1, RingMutation::Join { node_id: NodeId(1), thread_count: 2 });
+    log.record(
+      1,
+      RingMutation::Join {
+        node_id: NodeId(1),
+        thread_count: 2,
+      },
+    );
     assert_eq!(log.drain_applicable(), vec![]);
   }
 

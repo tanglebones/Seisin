@@ -113,7 +113,10 @@ impl MemberTable {
   }
 
   pub fn get(&self, node_id: NodeId) -> Option<MemberUpdate> {
-    self.members.get(&node_id).map(|record| record.to_update(node_id))
+    self
+      .members
+      .get(&node_id)
+      .map(|record| record.to_update(node_id))
   }
 
   /// Transitions a currently-`Alive` member to `Suspect`. No-op (returns
@@ -191,7 +194,10 @@ mod tests {
     let mut table = MemberTable::new();
     let accepted = table.merge_update(update(1, 0, MemberStatus::Alive));
     assert!(accepted);
-    assert_eq!(table.get(NodeId(1)), Some(update(1, 0, MemberStatus::Alive)));
+    assert_eq!(
+      table.get(NodeId(1)),
+      Some(update(1, 0, MemberStatus::Alive))
+    );
   }
 
   #[test]
