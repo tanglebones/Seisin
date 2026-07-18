@@ -122,6 +122,116 @@ fn decode_string(buf: &[u8], offset: &mut usize) -> Result<String> {
   Ok(s)
 }
 
+const MSG_PING: u8 = 0;
+const MSG_PING_REQ: u8 = 1;
+const MSG_ACK: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GossipMessage {
+  Ping {
+    updates: Vec<MemberUpdate>,
+    mutations: Vec<(u64, RingMutation)>,
+  },
+  PingReq {
+    target: NodeId,
+    updates: Vec<MemberUpdate>,
+    mutations: Vec<(u64, RingMutation)>,
+  },
+  Ack {
+    updates: Vec<MemberUpdate>,
+    mutations: Vec<(u64, RingMutation)>,
+  },
+}
+
+fn encode_list<T>(buf: &mut Vec<u8>, items: &[T], encode_one: impl Fn(&T) -> Vec<u8>) {
+  buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
+  for item in items {
+    let encoded = encode_one(item);
+    buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&encoded);
+  }
+}
+
+fn decode_list<T>(
+  buf: &[u8],
+  offset: &mut usize,
+  decode_one: impl Fn(&[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+  if buf.len() < *offset + 4 {
+    bail!("truncated list count at offset {offset}");
+  }
+  let count = u32::from_le_bytes(buf[*offset..*offset + 4].try_into().unwrap()) as usize;
+  *offset += 4;
+  let mut items = Vec::with_capacity(count);
+  for _ in 0..count {
+    if buf.len() < *offset + 4 {
+      bail!("truncated list item length at offset {offset}");
+    }
+    let len = u32::from_le_bytes(buf[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
+    if buf.len() < *offset + len {
+      bail!("truncated list item body at offset {offset}: expected {len} bytes");
+    }
+    items.push(decode_one(&buf[*offset..*offset + len])?);
+    *offset += len;
+  }
+  Ok(items)
+}
+
+pub fn encode_gossip_message(msg: &GossipMessage) -> Vec<u8> {
+  let mut buf = Vec::new();
+  match msg {
+    GossipMessage::Ping { updates, mutations } => {
+      buf.push(MSG_PING);
+      encode_list(&mut buf, updates, encode_member_update);
+      encode_list(&mut buf, mutations, |(epoch, m)| encode_ring_mutation_record(*epoch, m));
+    }
+    GossipMessage::PingReq { target, updates, mutations } => {
+      buf.push(MSG_PING_REQ);
+      buf.extend_from_slice(&target.0.to_le_bytes());
+      encode_list(&mut buf, updates, encode_member_update);
+      encode_list(&mut buf, mutations, |(epoch, m)| encode_ring_mutation_record(*epoch, m));
+    }
+    GossipMessage::Ack { updates, mutations } => {
+      buf.push(MSG_ACK);
+      encode_list(&mut buf, updates, encode_member_update);
+      encode_list(&mut buf, mutations, |(epoch, m)| encode_ring_mutation_record(*epoch, m));
+    }
+  }
+  buf
+}
+
+pub fn decode_gossip_message(buf: &[u8]) -> Result<GossipMessage> {
+  if buf.is_empty() {
+    bail!("empty gossip message payload");
+  }
+  match buf[0] {
+    MSG_PING => {
+      let mut offset = 1;
+      let updates = decode_list(buf, &mut offset, decode_member_update)?;
+      let mutations = decode_list(buf, &mut offset, decode_ring_mutation_record)?;
+      Ok(GossipMessage::Ping { updates, mutations })
+    }
+    MSG_PING_REQ => {
+      if buf.len() < 9 {
+        bail!("ping_req payload too short for a target node_id: {} bytes", buf.len());
+      }
+      let target = NodeId(u64::from_le_bytes(buf[1..9].try_into().unwrap()));
+      let mut offset = 9;
+      let updates = decode_list(buf, &mut offset, decode_member_update)?;
+      let mutations = decode_list(buf, &mut offset, decode_ring_mutation_record)?;
+      Ok(GossipMessage::PingReq { target, updates, mutations })
+    }
+    MSG_ACK => {
+      let mut offset = 1;
+      let updates = decode_list(buf, &mut offset, decode_member_update)?;
+      let mutations = decode_list(buf, &mut offset, decode_ring_mutation_record)?;
+      Ok(GossipMessage::Ack { updates, mutations })
+    }
+    tag => bail!("unknown gossip message tag: {tag}"),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -184,5 +294,50 @@ mod tests {
     let mut buf = encode_ring_mutation_record(1, &RingMutation::Leave { node_id: NodeId(1) });
     buf[8] = 99; // tag byte, right after the 8-byte epoch
     assert!(decode_ring_mutation_record(&buf).is_err());
+  }
+
+  fn sample_mutations() -> Vec<(u64, RingMutation)> {
+    vec![
+      (1, RingMutation::Join { node_id: NodeId(1), thread_count: 2 }),
+      (2, RingMutation::Leave { node_id: NodeId(3) }),
+    ]
+  }
+
+  #[test]
+  fn round_trips_ping_with_no_piggybacked_data() {
+    let msg = GossipMessage::Ping { updates: vec![], mutations: vec![] };
+    assert_eq!(decode_gossip_message(&encode_gossip_message(&msg)).unwrap(), msg);
+  }
+
+  #[test]
+  fn round_trips_ping_with_piggybacked_updates_and_mutations() {
+    let msg = GossipMessage::Ping {
+      updates: vec![sample_update()],
+      mutations: sample_mutations(),
+    };
+    assert_eq!(decode_gossip_message(&encode_gossip_message(&msg)).unwrap(), msg);
+  }
+
+  #[test]
+  fn round_trips_ping_req() {
+    let msg = GossipMessage::PingReq {
+      target: NodeId(5),
+      updates: vec![sample_update(), sample_update()],
+      mutations: sample_mutations(),
+    };
+    assert_eq!(decode_gossip_message(&encode_gossip_message(&msg)).unwrap(), msg);
+  }
+
+  #[test]
+  fn round_trips_ack() {
+    let msg = GossipMessage::Ack { updates: vec![], mutations: sample_mutations() };
+    assert_eq!(decode_gossip_message(&encode_gossip_message(&msg)).unwrap(), msg);
+  }
+
+  #[test]
+  fn rejects_unknown_message_tag() {
+    let mut buf = encode_gossip_message(&GossipMessage::Ack { updates: vec![], mutations: vec![] });
+    buf[0] = 99;
+    assert!(decode_gossip_message(&buf).is_err());
   }
 }
