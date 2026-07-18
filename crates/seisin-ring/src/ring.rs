@@ -162,7 +162,10 @@ mod tests {
     ring.apply_leave(NodeId(2));
     for _ in 0..50 {
       let (node_id, _) = ring.native(DatumId::new());
-      assert!(node_id == NodeId(1) || node_id == NodeId(3), "unexpected owner: {node_id:?}");
+      assert!(
+        node_id == NodeId(1) || node_id == NodeId(3),
+        "unexpected owner: {node_id:?}"
+      );
     }
   }
 
