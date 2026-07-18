@@ -11,7 +11,7 @@
 use anyhow::{bail, Result};
 
 /// Identifies a compute node within the cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u64);
 
 /// Identifies one owning thread (authority slot) within a compute node.
