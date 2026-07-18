@@ -52,6 +52,17 @@ impl Cache {
   pub fn invalidate(&mut self, id: DatumId) {
     self.entries.remove(&id);
   }
+
+  /// Evicts every cached entry for which `is_native(datum_id)` returns
+  /// false — called after a ring mutation to drop entries this node no
+  /// longer natively owns. This guarantees that if this node later
+  /// regains ownership of one of them, `get` is a hard miss and reloads
+  /// from the store, rather than serving a value that might predate
+  /// another node's writes in the interim (see the design doc's "Cache
+  /// Invalidation on Ring Membership Change" section).
+  pub fn evict_non_native(&mut self, mut is_native: impl FnMut(DatumId) -> bool) {
+    self.entries.retain(|&id, _| is_native(id));
+  }
 }
 
 #[cfg(test)]
@@ -107,5 +118,26 @@ mod tests {
     cache.delete(id);
     assert_eq!(cache.get(id), None);
     assert_eq!(store.get(id), None);
+  }
+
+  #[test]
+  fn evict_non_native_removes_entries_the_predicate_rejects() {
+    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    let mut cache = Cache::new(Arc::clone(&store));
+    let kept = DatumId::new();
+    let evicted = DatumId::new();
+    cache.put(kept, b"kept".to_vec());
+    cache.put(evicted, b"evicted".to_vec());
+
+    cache.evict_non_native(|id| id == kept);
+
+    // The evicted entry must reload from the store rather than serve a
+    // stale cached value: mutate storage directly, then confirm get
+    // picks up the new value.
+    store.put(evicted, b"updated".to_vec());
+    assert_eq!(cache.get(evicted), Some(b"updated".to_vec()));
+
+    // The kept entry is unaffected.
+    assert_eq!(cache.get(kept), Some(b"kept".to_vec()));
   }
 }
