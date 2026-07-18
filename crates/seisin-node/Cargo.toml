@@ -10,6 +10,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 seisin-ring = { path = "../seisin-ring" }
+seisin-gossip = { path = "../seisin-gossip" }
 
 [dev-dependencies]
 seisin-client = { path = "../seisin-client" }
