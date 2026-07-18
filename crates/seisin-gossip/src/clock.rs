@@ -22,7 +22,15 @@ pub struct SystemClock {
 
 impl SystemClock {
   pub fn new() -> Self {
-    Self { start: Instant::now() }
+    Self {
+      start: Instant::now(),
+    }
+  }
+}
+
+impl Default for SystemClock {
+  fn default() -> Self {
+    Self::new()
   }
 }
 
@@ -36,6 +44,12 @@ impl ClockSource for SystemClock {
 /// moves forward when `advance` is called.
 pub struct FakeClock {
   now: Cell<u64>,
+}
+
+impl Default for FakeClock {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 impl FakeClock {
