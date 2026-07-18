@@ -11,6 +11,7 @@ use serde::Deserialize;
 pub struct MemberConfig {
   pub node_id: u64,
   pub address: String,
+  pub gossip_address: String,
   pub thread_count: u32,
 }
 
@@ -55,8 +56,8 @@ mod tests {
 (
     self_node_id: 1,
     members: [
-        (node_id: 1, address: "127.0.0.1:7878", thread_count: 2),
-        (node_id: 2, address: "127.0.0.1:7879", thread_count: 4),
+        (node_id: 1, address: "127.0.0.1:7878", gossip_address: "127.0.0.1:8878", thread_count: 2),
+        (node_id: 2, address: "127.0.0.1:7879", gossip_address: "127.0.0.1:8879", thread_count: 4),
     ],
 )
 "#;
