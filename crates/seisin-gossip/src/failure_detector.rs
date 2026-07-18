@@ -39,14 +39,18 @@ pub enum TimeoutAction {
 
 pub struct FailureDetector<'c, C: ClockSource> {
   clock: &'c C,
+  probe_timeout_millis: u64,
+  suspicion_timeout_millis: u64,
   probes: HashMap<NodeId, ProbeState>,
   suspected_since: HashMap<NodeId, Tick>,
 }
 
 impl<'c, C: ClockSource> FailureDetector<'c, C> {
-  pub fn new(clock: &'c C) -> Self {
+  pub fn new(clock: &'c C, probe_timeout_millis: u64, suspicion_timeout_millis: u64) -> Self {
     Self {
       clock,
+      probe_timeout_millis,
+      suspicion_timeout_millis,
       probes: HashMap::new(),
       suspected_since: HashMap::new(),
     }
@@ -54,7 +58,12 @@ impl<'c, C: ClockSource> FailureDetector<'c, C> {
 
   /// Records that a direct probe to `target` was just sent.
   pub fn begin_direct_probe(&mut self, target: NodeId) {
-    self.probes.insert(target, ProbeState::AwaitingDirectAck { started_at: self.clock.now() });
+    self.probes.insert(
+      target,
+      ProbeState::AwaitingDirectAck {
+        started_at: self.clock.now(),
+      },
+    );
   }
 
   /// An ack (direct or relayed via an indirect probe) arrived from
@@ -77,19 +86,21 @@ impl<'c, C: ClockSource> FailureDetector<'c, C> {
     for (&target, state) in self.probes.iter() {
       match state {
         ProbeState::AwaitingDirectAck { started_at } => {
-          if now.0.saturating_sub(started_at.0) >= PROBE_TIMEOUT_MILLIS {
+          if now.0.saturating_sub(started_at.0) >= self.probe_timeout_millis {
             escalate.push(target);
           }
         }
         ProbeState::AwaitingIndirectAck { started_at } => {
-          if now.0.saturating_sub(started_at.0) >= PROBE_TIMEOUT_MILLIS {
+          if now.0.saturating_sub(started_at.0) >= self.probe_timeout_millis {
             suspect.push(target);
           }
         }
       }
     }
     for target in escalate {
-      self.probes.insert(target, ProbeState::AwaitingIndirectAck { started_at: now });
+      self
+        .probes
+        .insert(target, ProbeState::AwaitingIndirectAck { started_at: now });
       actions.push(TimeoutAction::EscalateToIndirect(target));
     }
     for target in suspect {
@@ -100,7 +111,7 @@ impl<'c, C: ClockSource> FailureDetector<'c, C> {
 
     let mut dead = Vec::new();
     for (&target, &since) in self.suspected_since.iter() {
-      if now.0.saturating_sub(since.0) >= SUSPICION_TIMEOUT_MILLIS {
+      if now.0.saturating_sub(since.0) >= self.suspicion_timeout_millis {
         dead.push(target);
       }
     }
@@ -121,7 +132,7 @@ mod tests {
   #[test]
   fn no_action_before_the_probe_timeout_elapses() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     fd.begin_direct_probe(NodeId(1));
     clock.advance(PROBE_TIMEOUT_MILLIS - 1);
     assert_eq!(fd.check_timeouts(), vec![]);
@@ -130,40 +141,49 @@ mod tests {
   #[test]
   fn escalates_to_indirect_after_the_probe_timeout() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     fd.begin_direct_probe(NodeId(1));
     clock.advance(PROBE_TIMEOUT_MILLIS);
-    assert_eq!(fd.check_timeouts(), vec![TimeoutAction::EscalateToIndirect(NodeId(1))]);
+    assert_eq!(
+      fd.check_timeouts(),
+      vec![TimeoutAction::EscalateToIndirect(NodeId(1))]
+    );
   }
 
   #[test]
   fn marks_suspect_after_the_indirect_probe_also_times_out() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     fd.begin_direct_probe(NodeId(1));
     clock.advance(PROBE_TIMEOUT_MILLIS);
     fd.check_timeouts(); // escalates to indirect
     clock.advance(PROBE_TIMEOUT_MILLIS);
-    assert_eq!(fd.check_timeouts(), vec![TimeoutAction::MarkSuspect(NodeId(1))]);
+    assert_eq!(
+      fd.check_timeouts(),
+      vec![TimeoutAction::MarkSuspect(NodeId(1))]
+    );
   }
 
   #[test]
   fn marks_dead_after_the_suspicion_timeout_elapses() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     fd.begin_direct_probe(NodeId(1));
     clock.advance(PROBE_TIMEOUT_MILLIS);
     fd.check_timeouts(); // escalates to indirect
     clock.advance(PROBE_TIMEOUT_MILLIS);
     fd.check_timeouts(); // marks suspect
     clock.advance(SUSPICION_TIMEOUT_MILLIS);
-    assert_eq!(fd.check_timeouts(), vec![TimeoutAction::MarkDead(NodeId(1))]);
+    assert_eq!(
+      fd.check_timeouts(),
+      vec![TimeoutAction::MarkDead(NodeId(1))]
+    );
   }
 
   #[test]
   fn an_ack_clears_a_pending_direct_probe() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     fd.begin_direct_probe(NodeId(1));
     fd.on_ack(NodeId(1));
     clock.advance(PROBE_TIMEOUT_MILLIS * 10);
@@ -173,7 +193,7 @@ mod tests {
   #[test]
   fn an_ack_clears_an_active_suspicion() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     fd.begin_direct_probe(NodeId(1));
     clock.advance(PROBE_TIMEOUT_MILLIS);
     fd.check_timeouts();
@@ -188,7 +208,7 @@ mod tests {
   #[test]
   fn check_timeouts_with_nothing_tracked_returns_empty() {
     let clock = FakeClock::new();
-    let mut fd = FailureDetector::new(&clock);
+    let mut fd = FailureDetector::new(&clock, PROBE_TIMEOUT_MILLIS, SUSPICION_TIMEOUT_MILLIS);
     assert_eq!(fd.check_timeouts(), vec![]);
   }
 }

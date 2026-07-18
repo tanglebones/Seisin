@@ -1,6 +1,7 @@
 #![deny(warnings)]
 
 pub mod config;
+pub mod gossip_client;
 pub mod gossip_server;
 pub mod gossip_state;
 pub mod pool;
