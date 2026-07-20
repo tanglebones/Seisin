@@ -76,21 +76,57 @@ commit and push immediately, since work sessions may end abruptly.
   datum away and getting it back, ignoring whatever the interim holder
   wrote or deleted via storage.
 
-As of this entry: 8 crates, 120 tests passing, `cargo fmt --check` and
+- **Sub-project 3b, Part 2a — Peer-link multiplexing & real cross-node
+  acquisition.** New `peer_link.rs`: `PeerLink` (one persistent,
+  multiplexed connection per node pair — envelope-framed
+  `{correlation_id, kind, target_thread, body}` wrapping the existing
+  `Request`/`Response` codec unchanged) and `PeerLinkRegistry` (eager
+  startup-time connections, lower `NodeId` always dials higher, a
+  node-id handshake preamble on connect, an unreachable peer skipped
+  rather than fatal). Wire protocol gained `Request::Acquire`/`Recall`/
+  `Release` and `Response::Granted`/`Released`, all node-to-node only.
+  `worker.rs`'s `AcquireReply`/`RecallReply` let a grant or recall-ack
+  go to either a local `WorkerMessage` send or a peer-link response,
+  transparently. `server.rs` no longer rejects an op whose datums span
+  more than one node — it dispatches locally and lets the destination
+  thread's own `Acquire`/`Recall` machinery pull the remote ones in.
+  Proven end-to-end by `integration_cross_node_collation.rs` (a
+  multi-datum op collating across two real nodes) and
+  `integration_cross_node_wound_wait.rs` (the classic two-op cycle,
+  contended across nodes rather than just threads, resolving without
+  deadlock over real peer-link traffic).
+
+  Found and fixed a real deadlock while first running the cross-node
+  wound-wait test (hung outright, not merely flaky): the release path
+  only ever sent `Release` over a local channel, never checking
+  whether a datum's native home was actually on a different node — a
+  cross-node release silently vanished, leaving the remote wait-queue
+  stuck forever. Fixed by adding `Request::Release` to the wire
+  protocol, so a normal (non-recalled) completion can tell a remote
+  native home it's done with a datum, the same way a recall's ack
+  already could.
+
+  Known gap, deliberately not fixed here (Part 2b's scope): peer-links
+  are only established from the *static* startup member list — a node
+  admitted later via gossip never gets a peer-link connection, and a
+  dead peer's in-flight calls fail via disconnect but nothing
+  proactively reclaims a lock it was holding or retries against a
+  since-moved ring slot.
+
+As of this entry: 8 crates, 136 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
 ## In progress
 
-- **Sub-project 3b, Part 2 — Peer-link & real cross-node acquisition.**
-  Not yet planned. Needs: the multiplexed server-to-server connection
-  layer (one persistent connection per node pair, correlation-id
-  routing so many local threads can share it), wiring `Acquire`/
-  `Recall` across real node boundaries, and the crash-detection/lock-
-  release mechanics already designed in the spec (proactive release on
-  gossip-confirmed node death, reactive release on a failed recall,
-  bounded acquire retry against a moved ring slot, failing an op back
-  to its client on exhausted retries).
+- **Sub-project 3b, Part 2b — Crash detection & lock release.** Not
+  yet planned. Needs: proactive lock release when gossip confirms a
+  node dead (extending the same ring-mutation hook that already
+  triggers cache eviction), a reactive backstop when a recall's
+  peer-link call errors out, bounded acquire retry against a moved
+  ring slot, and failing an op back to its client with `OpError` on
+  exhausted retries rather than hanging — all already designed in the
+  spec's "Crash Detection & Lock Release" section.
 
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-

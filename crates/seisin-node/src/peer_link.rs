@@ -23,9 +23,14 @@ use seisin_protocol::{
   encode_response, read_frame, write_frame, Envelope, EnvelopeKind, Request, Response,
 };
 
+/// A pending call's completion callback, invoked with the eventual
+/// `Response` (or a synthetic `Response::OpError` if the link drops
+/// first).
+type ResponseCallback = Box<dyn FnOnce(Response) + Send>;
+
 pub struct PeerLink {
   writer_tx: Sender<Vec<u8>>,
-  pending: Mutex<HashMap<u64, Box<dyn FnOnce(Response) + Send>>>,
+  pending: Mutex<HashMap<u64, ResponseCallback>>,
   next_correlation_id: AtomicU64,
 }
 
@@ -103,11 +108,7 @@ pub fn spawn(
   let mut read_stream = stream;
   let reader_link = Arc::clone(&link);
   thread::spawn(move || {
-    loop {
-      let frame = match read_frame(&mut read_stream) {
-        Ok(f) => f,
-        Err(_) => break,
-      };
+    while let Ok(frame) = read_frame(&mut read_stream) {
       let envelope = match decode_envelope(&frame) {
         Ok(e) => e,
         Err(_) => continue,
