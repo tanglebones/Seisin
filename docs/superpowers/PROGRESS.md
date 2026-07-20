@@ -34,11 +34,18 @@ As of this entry: 7 crates, 129 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
-## Not started — from the original sub-project sequence
+## In progress
 
-- **Sub-project 3 — Collation & multi-datum ops.** Op-to-thread
-  assignment, foreign-pull collation, wound-wait livelock avoidance, the
-  anti-degeneration return-home rule.
+- **Sub-project 3 — Collation & multi-datum ops.** Split into **3a**
+  (op registry, `OpContext`, single-node uncontended collation +
+  write-back/anti-degeneration) and **3b** (cross-node transfer +
+  wound-wait contention), per the design doc's "Op Registry & Collation
+  Mechanics" section. Resolved the framework-shape question: ops are
+  solution-defined Rust functions the framework collates datums for and
+  invokes, not a generic wire-level batch op. Currently writing/executing
+  3a's implementation plan.
+
+## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-
   weighted consistent hashing, storage's own gossip pool, write-through-
   before-ack wiring, fail-stop halt-on-shard-loss.
