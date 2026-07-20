@@ -24,6 +24,13 @@ use seisin_ring::ring::Ring;
 use crate::collation::{AcquireOutcome, NativeLock};
 use crate::peer_link::{PeerLink, PeerLinkRegistry};
 
+/// How many times a cross-node `Acquire` retries against the current
+/// ring before giving up and failing the whole op — bounded so a
+/// permanently unreachable node fails fast rather than hanging
+/// forever. Each retry re-resolves `ring.native()` fresh, so a retry
+/// naturally picks up wherever gossip has since moved the slot to.
+const MAX_ACQUIRE_RETRIES: u32 = 3;
+
 pub(crate) enum WorkerMessage {
   /// A client's `Request::Op`, assigned to this thread as its
   /// destination (see `pool.rs`'s native-majority heuristic).
@@ -49,6 +56,14 @@ pub(crate) enum WorkerMessage {
   /// Posted into the requesting thread's own inbox once its `Acquire`
   /// is granted (immediately, or after a wait/recall).
   AcquireGranted { op_id: DatumId, datum_id: DatumId },
+  /// Posted into the requesting thread's own inbox when a cross-node
+  /// `Acquire` call fails (peer-link error) — `retries_left` is how
+  /// many more attempts remain from when this specific call was made.
+  AcquireFailed {
+    op_id: DatumId,
+    datum_id: DatumId,
+    retries_left: u32,
+  },
   /// Sent by native home to whoever currently holds `datum_id`, asking
   /// it to evict and release. `reply` is where the resulting `Release`
   /// ack is sent once done — same local/remote distinction as
@@ -182,6 +197,7 @@ impl WorkerHandle {
                 self_node_id,
                 self_thread_id,
                 join_sender.clone(),
+                MAX_ACQUIRE_RETRIES,
               );
             }
             try_run_if_ready(
@@ -252,6 +268,36 @@ impl WorkerHandle {
               self_node_id,
             );
           }
+          WorkerMessage::AcquireFailed {
+            op_id,
+            datum_id,
+            retries_left,
+          } => {
+            if retries_left > 0 {
+              send_acquire(
+                &ring,
+                &peers,
+                &peer_links,
+                op_id,
+                datum_id,
+                self_node_id,
+                self_thread_id,
+                join_sender.clone(),
+                retries_left - 1,
+              );
+            } else {
+              fail_op(
+                op_id,
+                &mut op_records,
+                &mut cache,
+                &ring,
+                &peers,
+                &peer_links,
+                self_node_id,
+                format!("failed to acquire datum {datum_id:?} after {MAX_ACQUIRE_RETRIES} retries"),
+              );
+            }
+          }
           WorkerMessage::Recall { datum_id, reply } => {
             cache.invalidate(datum_id);
             let mut wounded_op_id = None;
@@ -274,6 +320,7 @@ impl WorkerHandle {
                 self_node_id,
                 self_thread_id,
                 join_sender.clone(),
+                MAX_ACQUIRE_RETRIES,
               );
             }
           }
@@ -369,6 +416,7 @@ fn send_acquire(
   self_node_id: NodeId,
   self_thread_id: ThreadId,
   requester_inbox: Sender<WorkerMessage>,
+  retries_left: u32,
 ) {
   let (native_node, native_thread) = ring.read().unwrap().native(datum_id);
   if native_node == self_node_id {
@@ -392,6 +440,12 @@ fn send_acquire(
       Box::new(move |response| {
         if matches!(response, seisin_protocol::Response::Granted) {
           let _ = requester_inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
+        } else {
+          let _ = requester_inbox.send(WorkerMessage::AcquireFailed {
+            op_id,
+            datum_id,
+            retries_left,
+          });
         }
       }),
     );
@@ -426,14 +480,29 @@ fn try_run_if_ready(
     &record.payload,
   );
   let _ = record.reply.send(result);
-  for datum_id in record.acquired {
-    // This thread is done with the datum — evict its own cache entry
-    // (whether or not it was this datum's native home) so it never
-    // serves a stale value from a future use, then tell native home
-    // it's free to grant elsewhere — locally if native home is this
-    // same node, over the peer-link if it's a different one (a plain
-    // completion release needs to reach a remote native home just as
-    // much as a recall's ack does).
+  release_datums(
+    record.acquired,
+    cache,
+    ring,
+    peers,
+    peer_links,
+    self_node_id,
+  );
+}
+
+/// Releases every datum in `datum_ids`, evicting this thread's own
+/// cache entry for each first — locally if native home is this same
+/// node, over the peer-link if it's a different one. Shared by normal
+/// op completion (`try_run_if_ready`) and whole-op failure (`fail_op`).
+fn release_datums(
+  datum_ids: Vec<DatumId>,
+  cache: &mut Cache,
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
+  self_node_id: NodeId,
+) {
+  for datum_id in datum_ids {
     cache.invalidate(datum_id);
     let (native_node, thread_id) = ring.read().unwrap().native(datum_id);
     if native_node == self_node_id {
@@ -446,6 +515,34 @@ fn try_run_if_ready(
         Box::new(|_response| {}),
       );
     }
+  }
+}
+
+/// Abandons `op_id` entirely: replies with `Err(message)` and releases
+/// every datum it had already acquired (unlike a wound, which loses
+/// only the one contended datum and keeps going, a whole-op failure
+/// gives up everything).
+#[allow(clippy::too_many_arguments)]
+fn fail_op(
+  op_id: DatumId,
+  op_records: &mut HashMap<DatumId, OpRecord>,
+  cache: &mut Cache,
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
+  self_node_id: NodeId,
+  message: String,
+) {
+  if let Some(record) = op_records.remove(&op_id) {
+    let _ = record.reply.send(Err(message));
+    release_datums(
+      record.acquired,
+      cache,
+      ring,
+      peers,
+      peer_links,
+      self_node_id,
+    );
   }
 }
 
