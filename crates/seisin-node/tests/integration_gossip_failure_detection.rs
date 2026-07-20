@@ -27,16 +27,21 @@ const SUSPICION_TIMEOUT_MILLIS: u64 = 40;
 /// via gossip — `reserve_silent_address` below is how the test creates a
 /// member entry that looks valid in config but has nothing listening,
 /// simulating a node that's stopped responding.
-fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String)]) {
+fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String, String)]) {
   let this = members.iter().find(|m| m.0 == node_id).unwrap();
   let client_listener = TcpListener::bind(&this.2).unwrap();
   let gossip_listener = TcpListener::bind(&this.3).unwrap();
+  let peer_link_listener = TcpListener::bind(&this.4).unwrap();
 
   let ring_members: Vec<(NodeId, u32)> = members.iter().map(|m| (m.0, m.1)).collect();
   let ring = Arc::new(RwLock::new(Ring::from_members(&ring_members)));
 
   let address_book: HashMap<NodeId, String> = members.iter().map(|m| (m.0, m.2.clone())).collect();
   let address_book = Arc::new(address_book);
+
+  let peer_link_address_book: HashMap<NodeId, String> =
+    members.iter().map(|m| (m.0, m.4.clone())).collect();
+  let peer_link_address_book = Arc::new(peer_link_address_book);
 
   let gossip = Arc::new(GossipState::new());
   {
@@ -67,6 +72,8 @@ fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String)]) {
     Arc::new(ops),
     Arc::clone(&ring),
     node_id,
+    peer_link_listener,
+    peer_link_address_book,
   ));
 
   {
@@ -123,8 +130,20 @@ fn a_node_that_stops_responding_on_gossip_is_eventually_removed_from_the_ring() 
   let silent_gossip_addr_b = reserve_silent_address();
 
   let members = vec![
-    (node_a, 2u32, addr_a.clone(), gossip_addr_a.clone()),
-    (node_b, 2u32, addr_b.clone(), silent_gossip_addr_b),
+    (
+      node_a,
+      2u32,
+      addr_a.clone(),
+      gossip_addr_a.clone(),
+      reserve_silent_address(),
+    ),
+    (
+      node_b,
+      2u32,
+      addr_b.clone(),
+      silent_gossip_addr_b,
+      reserve_silent_address(),
+    ),
   ];
 
   start_node(node_a, &members);

@@ -54,12 +54,15 @@ fn start_test_server() -> SocketAddr {
   let node_id = NodeId(1);
   let ring = Arc::new(RwLock::new(Ring::from_members(&[(node_id, 1)])));
   let address_book = Arc::new(HashMap::new());
+  let peer_link_listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let pool = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     1,
     Arc::new(build_registry()),
     Arc::clone(&ring),
     node_id,
+    peer_link_listener,
+    Arc::new(HashMap::new()),
   ));
   thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
   addr

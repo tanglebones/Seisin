@@ -43,12 +43,24 @@ fn start_two_node_cluster() -> (String, String) {
   address_book.insert(node_b, addr_b.clone());
   let address_book = Arc::new(address_book);
 
+  let peer_link_listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+  let peer_link_listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+  let peer_link_addr_a = peer_link_listener_a.local_addr().unwrap().to_string();
+  let peer_link_addr_b = peer_link_listener_b.local_addr().unwrap().to_string();
+
+  let mut peer_link_address_book = HashMap::new();
+  peer_link_address_book.insert(node_a, peer_link_addr_a);
+  peer_link_address_book.insert(node_b, peer_link_addr_b);
+  let peer_link_address_book = Arc::new(peer_link_address_book);
+
   let pool_a = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     2,
     Arc::new(build_registry()),
     Arc::clone(&ring),
     node_a,
+    peer_link_listener_a,
+    Arc::clone(&peer_link_address_book),
   ));
   let pool_b = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
@@ -56,6 +68,8 @@ fn start_two_node_cluster() -> (String, String) {
     Arc::new(build_registry()),
     Arc::clone(&ring),
     node_b,
+    peer_link_listener_b,
+    peer_link_address_book,
   ));
 
   {

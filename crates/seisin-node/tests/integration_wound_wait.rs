@@ -29,12 +29,15 @@ fn start_single_node_server(thread_count: u32) -> (String, Arc<RwLock<Ring>>, No
     }),
   );
 
+  let peer_link_listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let pool = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     thread_count,
     Arc::new(ops),
     Arc::clone(&ring),
     node_id,
+    peer_link_listener,
+    Arc::new(HashMap::new()),
   ));
   let serve_ring = Arc::clone(&ring);
   thread::spawn(move || serve(listener, node_id, serve_ring, address_book, pool));

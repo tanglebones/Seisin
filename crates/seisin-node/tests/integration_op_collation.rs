@@ -48,12 +48,15 @@ fn start_single_node_server() -> String {
     Box::new(|ctx, ids, _payload| ctx.get(ids[0]).unwrap_or_default()),
   );
 
+  let peer_link_listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let pool = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     4,
     Arc::new(ops),
     Arc::clone(&ring),
     node_id,
+    peer_link_listener,
+    Arc::new(HashMap::new()),
   ));
 
   thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
