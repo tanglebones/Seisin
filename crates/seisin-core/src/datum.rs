@@ -6,7 +6,7 @@ use uuid::Uuid;
 /// Backed by a UUIDv7 so ids are k-sortable by creation time, which the
 /// wound-wait collation scheme (a later sub-project) relies on for op
 /// ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatumId(Uuid);
 
 impl DatumId {
@@ -46,5 +46,12 @@ mod tests {
   #[test]
   fn new_ids_are_distinct() {
     assert_ne!(DatumId::new(), DatumId::new());
+  }
+
+  #[test]
+  fn ordering_matches_creation_order() {
+    let first = DatumId::new();
+    let second = DatumId::new();
+    assert!(first < second, "a later-created UUIDv7 id must sort greater");
   }
 }
