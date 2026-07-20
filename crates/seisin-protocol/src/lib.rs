@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::{bail, Context, Result};
 
+use seisin_core::authority::{NodeId, ThreadId};
 use seisin_core::datum::DatumId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,18 @@ pub enum Request {
     datum_ids: Vec<DatumId>,
     payload: Vec<u8>,
   },
+  /// Node-to-node only: requests the wound-wait lock on `datum_id` at
+  /// whichever thread this frame's peer-link envelope targets, on
+  /// behalf of `op_id`. Never sent by a client.
+  Acquire {
+    op_id: DatumId,
+    datum_id: DatumId,
+    requester_node: NodeId,
+    requester_thread: ThreadId,
+  },
+  /// Node-to-node only: asks the envelope-targeted thread to evict and
+  /// release `datum_id` right now.
+  Recall { datum_id: DatumId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,13 +43,22 @@ pub enum Response {
   Redirect { address: String },
   OpResult { payload: Vec<u8> },
   OpError { message: String },
+  /// Reply to a granted `Acquire` — no content, see the design doc's
+  /// "No Content In Transfer Messages" section.
+  Granted,
+  /// Reply to an acknowledged `Recall`.
+  Released,
 }
 
 const OP_OP: u8 = 1;
+const OP_ACQUIRE: u8 = 2;
+const OP_RECALL: u8 = 3;
 
 const RESP_REDIRECT: u8 = 1;
 const RESP_OP_RESULT: u8 = 2;
 const RESP_OP_ERROR: u8 = 3;
+const RESP_GRANTED: u8 = 4;
+const RESP_RELEASED: u8 = 5;
 
 const ID_LEN: usize = 16;
 
@@ -60,6 +82,22 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       }
       buf.extend_from_slice(payload);
     }
+    Request::Acquire {
+      op_id,
+      datum_id,
+      requester_node,
+      requester_thread,
+    } => {
+      buf.push(OP_ACQUIRE);
+      buf.extend_from_slice(&op_id.as_bytes());
+      buf.extend_from_slice(&datum_id.as_bytes());
+      buf.extend_from_slice(&requester_node.0.to_le_bytes());
+      buf.extend_from_slice(&requester_thread.0.to_le_bytes());
+    }
+    Request::Recall { datum_id } => {
+      buf.push(OP_RECALL);
+      buf.extend_from_slice(&datum_id.as_bytes());
+    }
   }
   buf
 }
@@ -70,8 +108,48 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
   }
   match buf[0] {
     OP_OP => decode_op_request(buf),
+    OP_ACQUIRE => decode_acquire_request(buf),
+    OP_RECALL => decode_recall_request(buf),
     op => bail!("unknown request opcode: {op}"),
   }
+}
+
+fn decode_acquire_request(buf: &[u8]) -> Result<Request> {
+  if buf.len() != 1 + ID_LEN + ID_LEN + 8 + 4 {
+    bail!(
+      "acquire request has the wrong length: expected {} bytes, got {}",
+      1 + ID_LEN + ID_LEN + 8 + 4,
+      buf.len()
+    );
+  }
+  let op_id = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
+  let datum_id = DatumId::from_bytes(buf[1 + ID_LEN..1 + 2 * ID_LEN].try_into().unwrap());
+  let node_offset = 1 + 2 * ID_LEN;
+  let requester_node = NodeId(u64::from_le_bytes(
+    buf[node_offset..node_offset + 8].try_into().unwrap(),
+  ));
+  let thread_offset = node_offset + 8;
+  let requester_thread = ThreadId(u32::from_le_bytes(
+    buf[thread_offset..thread_offset + 4].try_into().unwrap(),
+  ));
+  Ok(Request::Acquire {
+    op_id,
+    datum_id,
+    requester_node,
+    requester_thread,
+  })
+}
+
+fn decode_recall_request(buf: &[u8]) -> Result<Request> {
+  if buf.len() != 1 + ID_LEN {
+    bail!(
+      "recall request has the wrong length: expected {} bytes, got {}",
+      1 + ID_LEN,
+      buf.len()
+    );
+  }
+  let datum_id = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
+  Ok(Request::Recall { datum_id })
 }
 
 fn decode_op_request(buf: &[u8]) -> Result<Request> {
@@ -133,6 +211,8 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
       buf.push(RESP_OP_ERROR);
       buf.extend_from_slice(message.as_bytes());
     }
+    Response::Granted => buf.push(RESP_GRANTED),
+    Response::Released => buf.push(RESP_RELEASED),
   }
   buf
 }
@@ -169,8 +249,69 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
         String::from_utf8(buf[1..].to_vec()).context("op error message was not valid utf8")?;
       Ok(Response::OpError { message })
     }
+    RESP_GRANTED => Ok(Response::Granted),
+    RESP_RELEASED => Ok(Response::Released),
     op => bail!("unknown response opcode: {op}"),
   }
+}
+
+/// Which of the two peer-link message flows this envelope carries —
+/// peer-link connections are bidirectional and multiplexed, so an
+/// incoming frame could be either a response to one of *our* earlier
+/// calls or a fresh incoming request from the peer; the reader needs
+/// this tag to know which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeKind {
+  Request,
+  Response,
+}
+
+/// A peer-link frame: `body` is an encoded `Request` or `Response`
+/// (per `kind`), tagged with a `correlation_id` so many concurrent
+/// calls can share one connection, and (for requests only) a
+/// `target_thread` naming which local worker thread on the receiving
+/// node should handle it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+  pub correlation_id: u64,
+  pub kind: EnvelopeKind,
+  pub target_thread: ThreadId,
+  pub body: Vec<u8>,
+}
+
+const ENVELOPE_KIND_REQUEST: u8 = 0;
+const ENVELOPE_KIND_RESPONSE: u8 = 1;
+
+pub fn encode_envelope(env: &Envelope) -> Vec<u8> {
+  let mut buf = Vec::with_capacity(13 + env.body.len());
+  buf.extend_from_slice(&env.correlation_id.to_le_bytes());
+  buf.push(match env.kind {
+    EnvelopeKind::Request => ENVELOPE_KIND_REQUEST,
+    EnvelopeKind::Response => ENVELOPE_KIND_RESPONSE,
+  });
+  buf.extend_from_slice(&env.target_thread.0.to_le_bytes());
+  buf.extend_from_slice(&env.body);
+  buf
+}
+
+pub fn decode_envelope(buf: &[u8]) -> Result<Envelope> {
+  if buf.len() < 13 {
+    bail!("envelope too short for its header: {} bytes", buf.len());
+  }
+  let correlation_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+  let kind = match buf[8] {
+    ENVELOPE_KIND_REQUEST => EnvelopeKind::Request,
+    ENVELOPE_KIND_RESPONSE => EnvelopeKind::Response,
+    tag => bail!("invalid envelope kind tag: {tag}"),
+  };
+  let target_thread = ThreadId(u32::from_le_bytes(buf[9..13].try_into().unwrap()));
+  let body = buf[13..].to_vec();
+  Ok(Envelope {
+    correlation_id,
+    kind,
+    target_thread,
+    body,
+  })
 }
 
 /// Writes a length-prefixed frame: a 4-byte little-endian length followed
@@ -282,6 +423,53 @@ mod tests {
   }
 
   #[test]
+  fn round_trips_acquire_request() {
+    let req = Request::Acquire {
+      op_id: DatumId::new(),
+      datum_id: DatumId::new(),
+      requester_node: seisin_core::authority::NodeId(7),
+      requester_thread: seisin_core::authority::ThreadId(3),
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_recall_request() {
+    let req = Request::Recall {
+      datum_id: DatumId::new(),
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_granted_response() {
+    assert_eq!(
+      decode_response(&encode_response(&Response::Granted)).unwrap(),
+      Response::Granted
+    );
+  }
+
+  #[test]
+  fn round_trips_released_response() {
+    assert_eq!(
+      decode_response(&encode_response(&Response::Released)).unwrap(),
+      Response::Released
+    );
+  }
+
+  #[test]
+  fn rejects_a_truncated_acquire_request() {
+    let mut buf = encode_request(&Request::Acquire {
+      op_id: DatumId::new(),
+      datum_id: DatumId::new(),
+      requester_node: seisin_core::authority::NodeId(1),
+      requester_thread: seisin_core::authority::ThreadId(0),
+    });
+    buf.truncate(buf.len() - 1);
+    assert!(decode_request(&buf).is_err());
+  }
+
+  #[test]
   fn frame_round_trips_over_a_buffer() {
     let mut buf = Vec::new();
     write_frame(&mut buf, b"payload bytes").unwrap();
@@ -295,5 +483,46 @@ mod tests {
     let mut cursor = Cursor::new(oversized_len.to_le_bytes().to_vec());
     let err = read_frame(&mut cursor).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+  }
+
+  #[test]
+  fn round_trips_a_request_envelope() {
+    let env = Envelope {
+      correlation_id: 42,
+      kind: EnvelopeKind::Request,
+      target_thread: seisin_core::authority::ThreadId(3),
+      body: encode_request(&Request::Recall {
+        datum_id: DatumId::new(),
+      }),
+    };
+    assert_eq!(decode_envelope(&encode_envelope(&env)).unwrap(), env);
+  }
+
+  #[test]
+  fn round_trips_a_response_envelope() {
+    let env = Envelope {
+      correlation_id: 7,
+      kind: EnvelopeKind::Response,
+      target_thread: seisin_core::authority::ThreadId(0),
+      body: encode_response(&Response::Granted),
+    };
+    assert_eq!(decode_envelope(&encode_envelope(&env)).unwrap(), env);
+  }
+
+  #[test]
+  fn rejects_an_envelope_too_short_for_its_header() {
+    assert!(decode_envelope(&[0u8; 5]).is_err());
+  }
+
+  #[test]
+  fn rejects_an_envelope_with_an_invalid_kind_tag() {
+    let mut buf = encode_envelope(&Envelope {
+      correlation_id: 1,
+      kind: EnvelopeKind::Request,
+      target_thread: seisin_core::authority::ThreadId(0),
+      body: vec![],
+    });
+    buf[8] = 99;
+    assert!(decode_envelope(&buf).is_err());
   }
 }
