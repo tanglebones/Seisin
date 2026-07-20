@@ -81,6 +81,9 @@ fn handle_request(cache: &mut Cache, request: Request) -> Response {
       cache.delete(id);
       Response::Ok
     }
+    Request::Op { .. } => Response::OpError {
+      message: "Request::Op must be dispatched via run_op, not submit".to_string(),
+    },
   }
 }
 

@@ -14,15 +14,19 @@ pub enum Request {
   Get { id: DatumId },
   Put { id: DatumId, content: Vec<u8> },
   Delete { id: DatumId },
+  Op { op_name: String, datum_ids: Vec<DatumId>, payload: Vec<u8> },
 }
 
 impl Request {
-  /// The datum_id every `Request` variant carries, regardless of which
-  /// operation it is — used by the server to look up the ring's native
-  /// owner before dispatching.
+  /// The datum_id every single-datum `Request` variant carries.
+  ///
+  /// # Panics
+  /// Panics on `Request::Op`, which carries multiple datum_ids —
+  /// callers must match on the variant directly before calling this.
   pub fn datum_id(&self) -> DatumId {
     match self {
       Request::Get { id } | Request::Put { id, .. } | Request::Delete { id } => *id,
+      Request::Op { .. } => panic!("Request::Op has no single datum_id; match on the variant directly"),
     }
   }
 }
@@ -38,16 +42,25 @@ pub enum Response {
   Redirect {
     address: String,
   },
+  OpResult {
+    payload: Vec<u8>,
+  },
+  OpError {
+    message: String,
+  },
 }
 
 const OP_GET: u8 = 1;
 const OP_PUT: u8 = 2;
 const OP_DELETE: u8 = 3;
+const OP_OP: u8 = 4;
 
 const RESP_VALUE: u8 = 0;
 const RESP_NOT_FOUND: u8 = 1;
 const RESP_OK: u8 = 2;
 const RESP_REDIRECT: u8 = 3;
+const RESP_OP_RESULT: u8 = 4;
+const RESP_OP_ERROR: u8 = 5;
 
 const ID_LEN: usize = 16;
 
@@ -67,11 +80,28 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.push(OP_DELETE);
       buf.extend_from_slice(&id.as_bytes());
     }
+    Request::Op { op_name, datum_ids, payload } => {
+      buf.push(OP_OP);
+      let name_bytes = op_name.as_bytes();
+      buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+      buf.extend_from_slice(name_bytes);
+      buf.extend_from_slice(&(datum_ids.len() as u32).to_le_bytes());
+      for id in datum_ids {
+        buf.extend_from_slice(&id.as_bytes());
+      }
+      buf.extend_from_slice(payload);
+    }
   }
   buf
 }
 
 pub fn decode_request(buf: &[u8]) -> Result<Request> {
+  if buf.is_empty() {
+    bail!("empty request payload");
+  }
+  if buf[0] == OP_OP {
+    return decode_op_request(buf);
+  }
   if buf.len() < 1 + ID_LEN {
     bail!("request payload too short for an id: {} bytes", buf.len());
   }
@@ -85,6 +115,35 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_DELETE => Ok(Request::Delete { id }),
     op => bail!("unknown request opcode: {op}"),
   }
+}
+
+fn decode_op_request(buf: &[u8]) -> Result<Request> {
+  if buf.len() < 5 {
+    bail!("op request too short for a name length: {} bytes", buf.len());
+  }
+  let name_len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+  let mut offset = 5;
+  if buf.len() < offset + name_len {
+    bail!("op request too short for its name: expected {name_len} bytes");
+  }
+  let op_name = String::from_utf8(buf[offset..offset + name_len].to_vec()).context("op name was not valid utf8")?;
+  offset += name_len;
+  if buf.len() < offset + 4 {
+    bail!("op request too short for a datum_ids count");
+  }
+  let id_count = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+  offset += 4;
+  let mut datum_ids = Vec::with_capacity(id_count);
+  for _ in 0..id_count {
+    if buf.len() < offset + ID_LEN {
+      bail!("op request truncated in datum_ids list");
+    }
+    let id_bytes: [u8; ID_LEN] = buf[offset..offset + ID_LEN].try_into().unwrap();
+    datum_ids.push(DatumId::from_bytes(id_bytes));
+    offset += ID_LEN;
+  }
+  let payload = buf[offset..].to_vec();
+  Ok(Request::Op { op_name, datum_ids, payload })
 }
 
 pub fn encode_response(resp: &Response) -> Vec<u8> {
@@ -102,6 +161,14 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
       let addr_bytes = address.as_bytes();
       buf.extend_from_slice(&(addr_bytes.len() as u32).to_le_bytes());
       buf.extend_from_slice(addr_bytes);
+    }
+    Response::OpResult { payload } => {
+      buf.push(RESP_OP_RESULT);
+      buf.extend_from_slice(payload);
+    }
+    Response::OpError { message } => {
+      buf.push(RESP_OP_ERROR);
+      buf.extend_from_slice(message.as_bytes());
     }
   }
   buf
@@ -146,6 +213,11 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
       let address =
         String::from_utf8(buf[5..].to_vec()).context("redirect address was not valid utf8")?;
       Ok(Response::Redirect { address })
+    }
+    RESP_OP_RESULT => Ok(Response::OpResult { payload: buf[1..].to_vec() }),
+    RESP_OP_ERROR => {
+      let message = String::from_utf8(buf[1..].to_vec()).context("op error message was not valid utf8")?;
+      Ok(Response::OpError { message })
     }
     op => bail!("unknown response opcode: {op}"),
   }
@@ -295,5 +367,50 @@ mod tests {
       id
     );
     assert_eq!(Request::Delete { id }.datum_id(), id);
+  }
+
+  #[test]
+  fn round_trips_op_request_with_no_datum_ids() {
+    let req = Request::Op {
+      op_name: "noop".to_string(),
+      datum_ids: vec![],
+      payload: vec![],
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_op_request_with_datum_ids_and_payload() {
+    let req = Request::Op {
+      op_name: "transfer".to_string(),
+      datum_ids: vec![DatumId::new(), DatumId::new()],
+      payload: b"amount:100".to_vec(),
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_op_result_response() {
+    let resp = Response::OpResult { payload: b"ok".to_vec() };
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  fn round_trips_op_error_response() {
+    let resp = Response::OpError {
+      message: "unknown op: foo".to_string(),
+    };
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  #[should_panic]
+  fn datum_id_panics_on_op_request() {
+    Request::Op {
+      op_name: "x".to_string(),
+      datum_ids: vec![],
+      payload: vec![],
+    }
+    .datum_id();
   }
 }
