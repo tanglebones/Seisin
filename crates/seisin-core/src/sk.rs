@@ -1,7 +1,7 @@
 //! Encode/decode for secondary-key datum content.
 //!
 //! A secondary-key datum (e.g. `sk:user.name:cliff`) is a regular datum —
-//! same Get/Put/Delete path as any primary-key datum — whose content
+//! same collate-then-run op path as any primary-key datum — whose content
 //! happens to be an encoded list of `(DatumId, AuthorityIdx)` pairs for
 //! the primary datums it currently matches. The wire/server layer never
 //! needs to know this; it just sees bytes.
