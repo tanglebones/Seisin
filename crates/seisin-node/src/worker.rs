@@ -221,9 +221,16 @@ impl WorkerHandle {
                   holder.thread_id,
                   seisin_protocol::Request::Recall { datum_id },
                   Box::new(move |response| {
-                    if matches!(response, seisin_protocol::Response::Released) {
-                      let _ = self_sender.send(WorkerMessage::Release { datum_id });
-                    }
+                    // Either an explicit `Released` ack, or the call
+                    // failed outright (the peer-link disconnected,
+                    // meaning the holder is unreachable) — either way,
+                    // treat it as released rather than waiting on a
+                    // call that may never resolve. This is the
+                    // reactive backstop for the gap between an actual
+                    // crash and gossip confirming it (Task 3 handles
+                    // the confirmed case).
+                    let _ = response;
+                    let _ = self_sender.send(WorkerMessage::Release { datum_id });
                   }),
                 );
               }
