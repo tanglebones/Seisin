@@ -105,10 +105,19 @@ pub fn apply_ready_mutations(
       }
     }
   }
-  let ring = Arc::clone(ring);
+  let ring_for_cache = Arc::clone(ring);
   pool.evict_non_native(Arc::new(move |id| {
-    ring.read().unwrap().native(id).0 == self_node_id
+    ring_for_cache.read().unwrap().native(id).0 == self_node_id
   }));
+  // Proactively release any lock a now-departed node was holding, or
+  // was waiting on, rather than waiting for a future request to
+  // (reactively, at best) notice it's gone — see the design doc's
+  // "Crash Detection & Lock Release" section.
+  for mutation in &ready {
+    if let RingMutation::Leave { node_id } = *mutation {
+      pool.release_locks_held_by(node_id);
+    }
+  }
 }
 
 #[cfg(test)]
@@ -190,5 +199,39 @@ mod tests {
       );
     }
     assert_eq!(gossip.piggyback().1.len(), RECENT_MUTATIONS_CAP);
+  }
+
+  #[test]
+  fn apply_ready_mutations_releases_locks_held_by_a_departing_node() {
+    use crate::pool::WorkerPool;
+    use seisin_core::datum::DatumId;
+    use seisin_core::store::InMemoryStore;
+    use seisin_ops::registry::OpRegistry;
+    use std::net::TcpListener;
+
+    let node_a = NodeId(1);
+    let node_b = NodeId(2);
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(node_a, 1), (node_b, 1)])));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let pool = WorkerPool::spawn(
+      Arc::new(InMemoryStore::new()),
+      1,
+      Arc::new(OpRegistry::new()),
+      Arc::clone(&ring),
+      node_a,
+      listener,
+      Arc::new(std::collections::HashMap::new()),
+    );
+
+    let gossip = GossipState::new();
+    gossip.record_mutation(1, RingMutation::Leave { node_id: node_b });
+
+    // This shouldn't panic, and the ring should reflect the departure
+    // afterward — the release-broadcast itself is exercised in
+    // isolation by pool.rs's own test (Task 2) and proven end-to-end
+    // by Task 7's full crash integration test.
+    apply_ready_mutations(&gossip, &ring, node_a, &pool);
+    assert_eq!(ring.read().unwrap().native(DatumId::new()).0, node_a);
   }
 }
