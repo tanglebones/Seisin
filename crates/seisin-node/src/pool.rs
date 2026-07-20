@@ -47,6 +47,32 @@ impl WorkerPool {
       handle.evict_non_native(Arc::clone(&is_native));
     }
   }
+
+  /// Evicts a single cache entry from the named thread only.
+  pub fn evict_single(&self, thread_id: ThreadId, datum_id: DatumId) {
+    self.handles[thread_id.0 as usize].evict(datum_id);
+  }
+
+  /// Asks the named thread (only) to evict cache entries `is_native`
+  /// rejects — see `WorkerHandle::evict_non_native`.
+  pub fn evict_non_native_for(
+    &self,
+    thread_id: ThreadId,
+    is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>,
+  ) {
+    self.handles[thread_id.0 as usize].evict_non_native(is_native);
+  }
+
+  /// Runs a registered op on the named thread and blocks for its result.
+  pub fn run_op(
+    &self,
+    thread_id: ThreadId,
+    op_name: String,
+    datum_ids: Vec<DatumId>,
+    payload: Vec<u8>,
+  ) -> Result<Vec<u8>, String> {
+    self.handles[thread_id.0 as usize].run_op(op_name, datum_ids, payload)
+  }
 }
 
 #[cfg(test)]
@@ -80,6 +106,62 @@ mod tests {
       },
     );
     match pool.submit(ThreadId(1), Request::Get { id }) {
+      Response::Value { content, .. } => assert_eq!(content, b"hello"),
+      other => panic!("expected Value, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn evict_single_removes_only_the_named_datum_from_the_named_thread() {
+    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
+    let id = DatumId::new();
+    pool.submit(
+      ThreadId(0),
+      Request::Put {
+        id,
+        content: b"hello".to_vec(),
+      },
+    );
+    pool.evict_single(ThreadId(0), id);
+    match pool.submit(ThreadId(0), Request::Get { id }) {
+      Response::Value { content, .. } => assert_eq!(content, b"hello"),
+      other => panic!("expected Value, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn run_op_dispatches_to_the_named_thread() {
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "put_first",
+      Box::new(|ctx, ids, payload| {
+        ctx.put(ids[0], payload.to_vec());
+        payload.to_vec()
+      }),
+    );
+    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(ops));
+    let id = DatumId::new();
+    let result = pool.run_op(ThreadId(1), "put_first".to_string(), vec![id], b"hi".to_vec());
+    assert_eq!(result, Ok(b"hi".to_vec()));
+    match pool.submit(ThreadId(1), Request::Get { id }) {
+      Response::Value { content, .. } => assert_eq!(content, b"hi"),
+      other => panic!("expected Value, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn evict_non_native_for_only_affects_the_named_thread() {
+    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
+    let id = DatumId::new();
+    pool.submit(
+      ThreadId(0),
+      Request::Put {
+        id,
+        content: b"hello".to_vec(),
+      },
+    );
+    pool.evict_non_native_for(ThreadId(0), Arc::new(|_| false));
+    match pool.submit(ThreadId(0), Request::Get { id }) {
       Response::Value { content, .. } => assert_eq!(content, b"hello"),
       other => panic!("expected Value, got {other:?}"),
     }
