@@ -53,7 +53,10 @@ pub(crate) enum WorkerMessage {
   /// it to evict and release. `reply` is where the resulting `Release`
   /// ack is sent once done — same local/remote distinction as
   /// `Acquire`'s `reply`.
-  Recall { datum_id: DatumId, reply: RecallReply },
+  Recall {
+    datum_id: DatumId,
+    reply: RecallReply,
+  },
   /// Tells native home that whoever held `datum_id` is done with it
   /// (normal op completion, or a recall's evict-and-ack) — grants it to
   /// the oldest waiter, if any.
@@ -175,7 +178,16 @@ impl WorkerHandle {
                 join_sender.clone(),
               );
             }
-            try_run_if_ready(op_id, &mut op_records, &mut cache, &ops, &ring, &peers);
+            try_run_if_ready(
+              op_id,
+              &mut op_records,
+              &mut cache,
+              &ops,
+              &ring,
+              &peers,
+              &peer_links,
+              self_node_id,
+            );
           }
           WorkerMessage::Acquire {
             op_id,
@@ -216,7 +228,16 @@ impl WorkerHandle {
               record.still_needed.retain(|id| *id != datum_id);
               record.acquired.push(datum_id);
             }
-            try_run_if_ready(op_id, &mut op_records, &mut cache, &ops, &ring, &peers);
+            try_run_if_ready(
+              op_id,
+              &mut op_records,
+              &mut cache,
+              &ops,
+              &ring,
+              &peers,
+              &peer_links,
+              self_node_id,
+            );
           }
           WorkerMessage::Recall { datum_id, reply } => {
             cache.invalidate(datum_id);
@@ -349,6 +370,7 @@ fn send_acquire(
 
 /// If `op_id`'s record has nothing left to acquire, runs it, replies,
 /// then releases every acquired datum back toward its native home.
+#[allow(clippy::too_many_arguments)]
 fn try_run_if_ready(
   op_id: DatumId,
   op_records: &mut HashMap<DatumId, OpRecord>,
@@ -356,6 +378,8 @@ fn try_run_if_ready(
   ops: &OpRegistry,
   ring: &Arc<RwLock<Ring>>,
   peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
+  self_node_id: NodeId,
 ) {
   let ready = op_records
     .get(&op_id)
@@ -376,10 +400,22 @@ fn try_run_if_ready(
     // This thread is done with the datum — evict its own cache entry
     // (whether or not it was this datum's native home) so it never
     // serves a stale value from a future use, then tell native home
-    // it's free to grant elsewhere.
+    // it's free to grant elsewhere — locally if native home is this
+    // same node, over the peer-link if it's a different one (a plain
+    // completion release needs to reach a remote native home just as
+    // much as a recall's ack does).
     cache.invalidate(datum_id);
-    let (_, thread_id) = ring.read().unwrap().native(datum_id);
-    let _ = peers[thread_id.0 as usize].send(WorkerMessage::Release { datum_id });
+    let (native_node, thread_id) = ring.read().unwrap().native(datum_id);
+    if native_node == self_node_id {
+      let _ = peers[thread_id.0 as usize].send(WorkerMessage::Release { datum_id });
+    } else {
+      let link = peer_links.lock().unwrap().get(native_node);
+      link.call(
+        thread_id,
+        seisin_protocol::Request::Release { datum_id },
+        Box::new(|_response| {}),
+      );
+    }
   }
 }
 

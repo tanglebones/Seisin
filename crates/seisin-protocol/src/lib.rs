@@ -36,13 +36,27 @@ pub enum Request {
   /// Node-to-node only: asks the envelope-targeted thread to evict and
   /// release `datum_id` right now.
   Recall { datum_id: DatumId },
+  /// Node-to-node only: tells whichever thread is native home for
+  /// `datum_id` that the sender is done with it after a normal
+  /// (non-recalled) op completion — grants it to the oldest waiter, if
+  /// any, exactly like the local same-node release path. Acked with
+  /// `Response::Released`, though the sender doesn't need to wait for
+  /// it for correctness (this is fire-and-forget, same as the local
+  /// case).
+  Release { datum_id: DatumId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-  Redirect { address: String },
-  OpResult { payload: Vec<u8> },
-  OpError { message: String },
+  Redirect {
+    address: String,
+  },
+  OpResult {
+    payload: Vec<u8>,
+  },
+  OpError {
+    message: String,
+  },
   /// Reply to a granted `Acquire` — no content, see the design doc's
   /// "No Content In Transfer Messages" section.
   Granted,
@@ -53,6 +67,7 @@ pub enum Response {
 const OP_OP: u8 = 1;
 const OP_ACQUIRE: u8 = 2;
 const OP_RECALL: u8 = 3;
+const OP_RELEASE: u8 = 4;
 
 const RESP_REDIRECT: u8 = 1;
 const RESP_OP_RESULT: u8 = 2;
@@ -98,6 +113,10 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.push(OP_RECALL);
       buf.extend_from_slice(&datum_id.as_bytes());
     }
+    Request::Release { datum_id } => {
+      buf.push(OP_RELEASE);
+      buf.extend_from_slice(&datum_id.as_bytes());
+    }
   }
   buf
 }
@@ -110,6 +129,7 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_OP => decode_op_request(buf),
     OP_ACQUIRE => decode_acquire_request(buf),
     OP_RECALL => decode_recall_request(buf),
+    OP_RELEASE => decode_release_request(buf),
     op => bail!("unknown request opcode: {op}"),
   }
 }
@@ -150,6 +170,18 @@ fn decode_recall_request(buf: &[u8]) -> Result<Request> {
   }
   let datum_id = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
   Ok(Request::Recall { datum_id })
+}
+
+fn decode_release_request(buf: &[u8]) -> Result<Request> {
+  if buf.len() != 1 + ID_LEN {
+    bail!(
+      "release request has the wrong length: expected {} bytes, got {}",
+      1 + ID_LEN,
+      buf.len()
+    );
+  }
+  let datum_id = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
+  Ok(Request::Release { datum_id })
 }
 
 fn decode_op_request(buf: &[u8]) -> Result<Request> {
@@ -436,6 +468,14 @@ mod tests {
   #[test]
   fn round_trips_recall_request() {
     let req = Request::Recall {
+      datum_id: DatumId::new(),
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_release_request() {
+    let req = Request::Release {
       datum_id: DatumId::new(),
     };
     assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);

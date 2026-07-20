@@ -49,29 +49,38 @@ impl WorkerPool {
     let peers = Arc::new(senders);
 
     let dispatch_peers = Arc::clone(&peers);
-    let on_request: Arc<dyn Fn(ThreadId, seisin_protocol::Request, Arc<PeerLink>, u64) + Send + Sync> =
-      Arc::new(move |target_thread, request, link, correlation_id| {
-        let message = match request {
-          seisin_protocol::Request::Acquire {
-            op_id,
-            datum_id,
-            requester_node,
-            requester_thread,
-          } => WorkerMessage::Acquire {
-            op_id,
-            datum_id,
-            requester_node,
-            requester_thread,
-            reply: AcquireReply::Remote(Arc::clone(&link), correlation_id),
-          },
-          seisin_protocol::Request::Recall { datum_id } => WorkerMessage::Recall {
-            datum_id,
-            reply: RecallReply::Remote(Arc::clone(&link), correlation_id),
-          },
-          seisin_protocol::Request::Op { .. } => return, // client-only; never sent over a peer-link
-        };
-        let _ = dispatch_peers[target_thread.0 as usize].send(message);
-      });
+    let on_request: Arc<
+      dyn Fn(ThreadId, seisin_protocol::Request, Arc<PeerLink>, u64) + Send + Sync,
+    > = Arc::new(move |target_thread, request, link, correlation_id| {
+      let message = match request {
+        seisin_protocol::Request::Acquire {
+          op_id,
+          datum_id,
+          requester_node,
+          requester_thread,
+        } => WorkerMessage::Acquire {
+          op_id,
+          datum_id,
+          requester_node,
+          requester_thread,
+          reply: AcquireReply::Remote(Arc::clone(&link), correlation_id),
+        },
+        seisin_protocol::Request::Recall { datum_id } => WorkerMessage::Recall {
+          datum_id,
+          reply: RecallReply::Remote(Arc::clone(&link), correlation_id),
+        },
+        seisin_protocol::Request::Release { datum_id } => {
+          // Fire-and-forget, same as the local same-node case — ack
+          // immediately rather than waiting on the local dispatch,
+          // since the sender's callback doesn't depend on timing for
+          // correctness (see try_run_if_ready).
+          link.respond(correlation_id, seisin_protocol::Response::Released);
+          WorkerMessage::Release { datum_id }
+        }
+        seisin_protocol::Request::Op { .. } => return, // client-only; never sent over a peer-link
+      };
+      let _ = dispatch_peers[target_thread.0 as usize].send(message);
+    });
     let peer_links = PeerLinkRegistry::start(
       peer_link_listener,
       self_node_id,
