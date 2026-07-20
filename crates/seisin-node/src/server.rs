@@ -2,8 +2,10 @@
 //! directly if every one of its datum_ids natively belongs to this
 //! node, redirect if they all belong to exactly one other node (the
 //! same idea as before 3b, just generalized from a single datum_id to a
-//! list), or reject if they're genuinely spread across more than one
-//! node (cross-node collation — a later sub-project).
+//! list) — and, once an op's datums are genuinely spread across more
+//! than one node, dispatch locally anyway, relying on the destination
+//! thread's own Acquire/Recall machinery (see `worker.rs`/`peer_link.rs`)
+//! to pull the remote ones in over the wire.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
@@ -88,8 +90,8 @@ fn handle_connection(
 /// runs the op locally. If they're all exactly one *other* node,
 /// redirects there (the client reconnects and retries — the same
 /// mechanism a single-datum request used before 3b, just generalized).
-/// If they're spread across more than one node, rejects — cross-node
-/// collation is a later sub-project.
+/// Otherwise (spread across more than one node), dispatches locally —
+/// the destination thread pulls in whatever it doesn't already have.
 #[allow(clippy::too_many_arguments)]
 fn handle_op_request(
   self_node_id: NodeId,
@@ -106,22 +108,20 @@ fn handle_op_request(
     datum_ids.iter().map(|id| ring.native(*id).0).collect()
   };
 
-  if native_nodes.len() > 1 {
-    return Response::OpError {
-      message: "cross-node collation is not supported in this version".to_string(),
-    };
-  }
-
-  if let Some(&only_node) = native_nodes.iter().next() {
+  // A single-node op whose one native node isn't this one still takes
+  // the cheaper redirect path (the client reconnects directly to the
+  // node that already has everything it needs) — this is unchanged
+  // from Part 1. Only once an op's datums are genuinely spread across
+  // more than one node does it now fall through to local dispatch,
+  // relying on the destination thread's own Acquire/Recall machinery
+  // to pull the remote ones in — no more outright rejection.
+  if native_nodes.len() == 1 {
+    let only_node = *native_nodes.iter().next().unwrap();
     if only_node != self_node_id {
       return match address_book.get(&only_node) {
         Some(address) => Response::Redirect {
           address: address.clone(),
         },
-        // Ring and address book disagree — a static-config bug in this
-        // plan's scope; there's no sensible response, so this arm is
-        // unreachable in practice, but return an error rather than
-        // panicking a connection thread over a config mismatch.
         None => Response::OpError {
           message: format!("no known address for node {only_node:?}"),
         },
