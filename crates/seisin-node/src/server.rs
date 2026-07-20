@@ -9,7 +9,9 @@ use std::thread;
 
 use seisin_core::authority::{NodeId, ThreadId};
 use seisin_core::datum::DatumId;
-use seisin_protocol::{decode_request, encode_response, read_frame, write_frame, Request, Response};
+use seisin_protocol::{
+  decode_request, encode_response, read_frame, write_frame, Request, Response,
+};
 use seisin_ring::ring::Ring;
 
 use crate::pool::WorkerPool;
@@ -138,7 +140,9 @@ fn handle_op_request(
   let ring_for_predicate = Arc::clone(ring);
   pool.evict_non_native_for(
     destination,
-    Arc::new(move |id| ring_for_predicate.read().unwrap().native(id) == (self_node_id, destination)),
+    Arc::new(move |id| {
+      ring_for_predicate.read().unwrap().native(id) == (self_node_id, destination)
+    }),
   );
 
   match result {

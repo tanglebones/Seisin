@@ -83,7 +83,11 @@ mod tests {
 
   #[test]
   fn each_thread_id_indexes_a_distinct_worker() {
-    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
+    let pool = WorkerPool::spawn(
+      Arc::new(InMemoryStore::new()),
+      2,
+      Arc::new(OpRegistry::new()),
+    );
     assert_eq!(
       pool.submit(ThreadId(0), Request::Get { id: DatumId::new() }),
       Response::NotFound
@@ -96,7 +100,11 @@ mod tests {
 
   #[test]
   fn writes_on_one_thread_are_visible_via_the_shared_store_from_another() {
-    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
+    let pool = WorkerPool::spawn(
+      Arc::new(InMemoryStore::new()),
+      2,
+      Arc::new(OpRegistry::new()),
+    );
     let id = DatumId::new();
     pool.submit(
       ThreadId(0),
@@ -113,7 +121,11 @@ mod tests {
 
   #[test]
   fn evict_single_removes_only_the_named_datum_from_the_named_thread() {
-    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
+    let pool = WorkerPool::spawn(
+      Arc::new(InMemoryStore::new()),
+      2,
+      Arc::new(OpRegistry::new()),
+    );
     let id = DatumId::new();
     pool.submit(
       ThreadId(0),
@@ -141,7 +153,12 @@ mod tests {
     );
     let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(ops));
     let id = DatumId::new();
-    let result = pool.run_op(ThreadId(1), "put_first".to_string(), vec![id], b"hi".to_vec());
+    let result = pool.run_op(
+      ThreadId(1),
+      "put_first".to_string(),
+      vec![id],
+      b"hi".to_vec(),
+    );
     assert_eq!(result, Ok(b"hi".to_vec()));
     match pool.submit(ThreadId(1), Request::Get { id }) {
       Response::Value { content, .. } => assert_eq!(content, b"hi"),
@@ -151,7 +168,11 @@ mod tests {
 
   #[test]
   fn evict_non_native_for_only_affects_the_named_thread() {
-    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
+    let pool = WorkerPool::spawn(
+      Arc::new(InMemoryStore::new()),
+      2,
+      Arc::new(OpRegistry::new()),
+    );
     let id = DatumId::new();
     pool.submit(
       ThreadId(0),

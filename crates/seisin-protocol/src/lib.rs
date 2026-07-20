@@ -11,10 +11,21 @@ use seisin_core::datum::DatumId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-  Get { id: DatumId },
-  Put { id: DatumId, content: Vec<u8> },
-  Delete { id: DatumId },
-  Op { op_name: String, datum_ids: Vec<DatumId>, payload: Vec<u8> },
+  Get {
+    id: DatumId,
+  },
+  Put {
+    id: DatumId,
+    content: Vec<u8>,
+  },
+  Delete {
+    id: DatumId,
+  },
+  Op {
+    op_name: String,
+    datum_ids: Vec<DatumId>,
+    payload: Vec<u8>,
+  },
 }
 
 impl Request {
@@ -26,7 +37,9 @@ impl Request {
   pub fn datum_id(&self) -> DatumId {
     match self {
       Request::Get { id } | Request::Put { id, .. } | Request::Delete { id } => *id,
-      Request::Op { .. } => panic!("Request::Op has no single datum_id; match on the variant directly"),
+      Request::Op { .. } => {
+        panic!("Request::Op has no single datum_id; match on the variant directly")
+      }
     }
   }
 }
@@ -80,7 +93,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.push(OP_DELETE);
       buf.extend_from_slice(&id.as_bytes());
     }
-    Request::Op { op_name, datum_ids, payload } => {
+    Request::Op {
+      op_name,
+      datum_ids,
+      payload,
+    } => {
       buf.push(OP_OP);
       let name_bytes = op_name.as_bytes();
       buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
@@ -119,14 +136,18 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
 
 fn decode_op_request(buf: &[u8]) -> Result<Request> {
   if buf.len() < 5 {
-    bail!("op request too short for a name length: {} bytes", buf.len());
+    bail!(
+      "op request too short for a name length: {} bytes",
+      buf.len()
+    );
   }
   let name_len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
   let mut offset = 5;
   if buf.len() < offset + name_len {
     bail!("op request too short for its name: expected {name_len} bytes");
   }
-  let op_name = String::from_utf8(buf[offset..offset + name_len].to_vec()).context("op name was not valid utf8")?;
+  let op_name = String::from_utf8(buf[offset..offset + name_len].to_vec())
+    .context("op name was not valid utf8")?;
   offset += name_len;
   if buf.len() < offset + 4 {
     bail!("op request too short for a datum_ids count");
@@ -143,7 +164,11 @@ fn decode_op_request(buf: &[u8]) -> Result<Request> {
     offset += ID_LEN;
   }
   let payload = buf[offset..].to_vec();
-  Ok(Request::Op { op_name, datum_ids, payload })
+  Ok(Request::Op {
+    op_name,
+    datum_ids,
+    payload,
+  })
 }
 
 pub fn encode_response(resp: &Response) -> Vec<u8> {
@@ -214,9 +239,12 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
         String::from_utf8(buf[5..].to_vec()).context("redirect address was not valid utf8")?;
       Ok(Response::Redirect { address })
     }
-    RESP_OP_RESULT => Ok(Response::OpResult { payload: buf[1..].to_vec() }),
+    RESP_OP_RESULT => Ok(Response::OpResult {
+      payload: buf[1..].to_vec(),
+    }),
     RESP_OP_ERROR => {
-      let message = String::from_utf8(buf[1..].to_vec()).context("op error message was not valid utf8")?;
+      let message =
+        String::from_utf8(buf[1..].to_vec()).context("op error message was not valid utf8")?;
       Ok(Response::OpError { message })
     }
     op => bail!("unknown response opcode: {op}"),
@@ -391,7 +419,9 @@ mod tests {
 
   #[test]
   fn round_trips_op_result_response() {
-    let resp = Response::OpResult { payload: b"ok".to_vec() };
+    let resp = Response::OpResult {
+      payload: b"ok".to_vec(),
+    };
     assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
   }
 

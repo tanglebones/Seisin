@@ -175,6 +175,7 @@ dependencies = [
  "seisin-client",
  "seisin-core",
  "seisin-gossip",
+ "seisin-ops",
  "seisin-protocol",
  "seisin-ring",
  "serde",

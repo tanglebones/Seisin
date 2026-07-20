@@ -29,8 +29,16 @@ fn start_two_node_cluster() -> (String, String) {
   address_book.insert(node_b, addr_b.clone());
   let address_book = Arc::new(address_book);
 
-  let pool_a = Arc::new(WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(seisin_ops::registry::OpRegistry::new())));
-  let pool_b = Arc::new(WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(seisin_ops::registry::OpRegistry::new())));
+  let pool_a = Arc::new(WorkerPool::spawn(
+    Arc::new(InMemoryStore::new()),
+    2,
+    Arc::new(seisin_ops::registry::OpRegistry::new()),
+  ));
+  let pool_b = Arc::new(WorkerPool::spawn(
+    Arc::new(InMemoryStore::new()),
+    2,
+    Arc::new(seisin_ops::registry::OpRegistry::new()),
+  ));
 
   {
     let ring = Arc::clone(&ring);

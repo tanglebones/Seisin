@@ -20,7 +20,11 @@ fn start_test_server() -> SocketAddr {
   let node_id = NodeId(1);
   let ring = Arc::new(std::sync::RwLock::new(Ring::from_members(&[(node_id, 1)])));
   let address_book = Arc::new(HashMap::new());
-  let pool = Arc::new(WorkerPool::spawn(Arc::new(InMemoryStore::new()), 1, Arc::new(seisin_ops::registry::OpRegistry::new())));
+  let pool = Arc::new(WorkerPool::spawn(
+    Arc::new(InMemoryStore::new()),
+    1,
+    Arc::new(seisin_ops::registry::OpRegistry::new()),
+  ));
   thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
   addr
 }

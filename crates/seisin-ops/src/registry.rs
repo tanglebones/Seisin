@@ -41,8 +41,12 @@ impl OpRegistry {
     datum_ids: &[DatumId],
     payload: &[u8],
   ) -> Result<Vec<u8>, String> {
-    let handler = self.handlers.get(name).ok_or_else(|| format!("unknown op: {name}"))?;
-    catch_unwind(AssertUnwindSafe(|| handler(ctx, datum_ids, payload))).map_err(|_| format!("op '{name}' panicked"))
+    let handler = self
+      .handlers
+      .get(name)
+      .ok_or_else(|| format!("unknown op: {name}"))?;
+    catch_unwind(AssertUnwindSafe(|| handler(ctx, datum_ids, payload)))
+      .map_err(|_| format!("op '{name}' panicked"))
   }
 }
 
@@ -61,7 +65,10 @@ mod tests {
 
     let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
     let mut ctx = OpContext::new(&mut cache);
-    assert_eq!(registry.invoke("echo", &mut ctx, &[], b"hello").unwrap(), b"hello");
+    assert_eq!(
+      registry.invoke("echo", &mut ctx, &[], b"hello").unwrap(),
+      b"hello"
+    );
   }
 
   #[test]
@@ -75,7 +82,10 @@ mod tests {
   #[test]
   fn a_panicking_op_is_caught_and_reported_as_an_error() {
     let mut registry = OpRegistry::new();
-    registry.register("boom", Box::new(|_ctx, _ids, _payload| panic!("solution bug")));
+    registry.register(
+      "boom",
+      Box::new(|_ctx, _ids, _payload| panic!("solution bug")),
+    );
     let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
     let mut ctx = OpContext::new(&mut cache);
     assert!(registry.invoke("boom", &mut ctx, &[], b"").is_err());
@@ -94,7 +104,9 @@ mod tests {
     let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
     let mut ctx = OpContext::new(&mut cache);
     let id = DatumId::new();
-    registry.invoke("put_first", &mut ctx, &[id], b"hi").unwrap();
+    registry
+      .invoke("put_first", &mut ctx, &[id], b"hi")
+      .unwrap();
     assert_eq!(ctx.get(id), Some(b"hi".to_vec()));
   }
 }
