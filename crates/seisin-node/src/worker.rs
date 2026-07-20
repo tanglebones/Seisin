@@ -343,9 +343,8 @@ impl WorkerHandle {
           }
           WorkerMessage::ReleaseLocksHeldBy(node_id) => {
             for (&datum_id, lock) in native_locks.iter_mut() {
-              let was_held_by_dead_node = lock
-                .current_holder()
-                .is_some_and(|h| h.node_id == node_id);
+              let was_held_by_dead_node =
+                lock.current_holder().is_some_and(|h| h.node_id == node_id);
               lock.handle_node_death(node_id);
               if was_held_by_dead_node {
                 cache.invalidate(datum_id);
