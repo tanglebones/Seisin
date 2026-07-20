@@ -452,6 +452,60 @@ introduced conceptually above.
   node's own cache and evict entries whose native owner under the new
   ring is no longer this node.
 
+## Op Registry & Collation Mechanics (added during Sub-project 3 design)
+
+Concrete mechanics for how a "multi-datum op" (referenced in "Collation &
+Op Execution" above) is actually defined and invoked, decided while
+designing Sub-project 3 — resolves the framework-shape question from the
+2026-07-20 notes for this specific piece.
+
+- **Ops are solution-defined Rust functions, not a generic wire-level
+  batch operation.** A solution registers named operations (a function
+  taking mutable access to the datums it needs, plus an op-specific
+  payload) with the server framework at startup. The wire protocol
+  carries an op identifier, the *caller-supplied* explicit list of
+  datum_ids the op needs (the framework can't discover this by inspecting
+  arbitrary Rust code, so the client must state it up front), and an
+  opaque payload (the op's arguments, serialized however the solution
+  chooses). The framework's job is purely collation + invocation +
+  write-back — it never interprets the op's internal logic.
+- **`OpContext`** is the interface an op function operates through:
+  byte-level `get`/`put`/`delete` over exactly the collated datums (not
+  the typed layer from the Datum Type System notes above — that's a
+  separate, not-yet-designed layer a solution's own generated code would
+  sit on top of; the framework itself stays type-agnostic).
+- **Panic safety**: op invocation is wrapped so a panicking op function
+  doesn't take down its owning thread (and every other datum that thread
+  owns) — the panic is caught and converted into an error response,
+  rather than being allowed to unwind through the framework's dispatch
+  loop.
+- **Thread assignment (v1 simplification)**: the chosen thread is
+  whichever local thread *natively* owns the most of the op's requested
+  datum_ids — a pure function of the ring, requiring no visibility into
+  what any thread's cache currently happens to hold. The original
+  design's "or already-foreign" refinement (preferring a thread that
+  already has a datum on hand, even non-natively) is deferred; it would
+  require a live reverse-index of cache contents that isn't needed to
+  prove the core mechanism.
+- **Cross-node transfer** reuses the existing client-facing wire
+  protocol and port rather than standing up a third protocol: a new
+  request variant lets one node ask another for a datum it needs to
+  collate. The request always goes to whoever `ring.native(datum_id)`
+  currently resolves to, exactly like a client request would — if that
+  node currently holds the datum, it hands it over (evicting its own
+  copy and, if it's the native home, recording "currently elsewhere");
+  if not, it relays/redirects exactly as client requests already do.
+  Reusing this machinery (rather than inventing a parallel one) is
+  possible because "the current owner replies or points elsewhere" is
+  already exactly what the client protocol does.
+- **Sub-project 3 is split**: **3a** proves the op-registry, `OpContext`,
+  thread-assignment, and write-back/anti-degeneration mechanics for the
+  *single-node, uncontended* case (every requested datum_id already
+  natively on the one running node, no concurrent op wants the same
+  datum). **3b** adds cross-node transfer and wound-wait contention
+  handling (the case where two ops' collation requests race for the same
+  datum) on top, without changing 3a's op-invocation mechanics.
+
 ## Open Questions / Future Work
 
 - Storage replication (double-write) for crash resilience.
