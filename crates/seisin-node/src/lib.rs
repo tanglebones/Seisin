@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 pub mod collation;
 pub mod config;
 pub mod gossip_client;

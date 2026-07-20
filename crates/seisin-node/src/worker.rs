@@ -53,7 +53,6 @@ pub(crate) enum WorkerMessage {
   /// resulting `Release` is sent once done.
   Recall {
     datum_id: DatumId,
-    requesting_op_id: DatumId,
     native_home_inbox: Sender<WorkerMessage>,
   },
   /// Tells native home that whoever held `datum_id` is done with it
@@ -80,7 +79,7 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
   #[allow(clippy::too_many_arguments)]
-  pub fn spawn(
+  pub(crate) fn spawn(
     self_thread_id: ThreadId,
     receiver: Receiver<WorkerMessage>,
     sender: Sender<WorkerMessage>,
@@ -143,7 +142,6 @@ impl WorkerHandle {
             if let AcquireOutcome::RecallNeeded(holder) = outcome {
               let _ = peers[holder.thread_id.0 as usize].send(WorkerMessage::Recall {
                 datum_id,
-                requesting_op_id: op_id,
                 native_home_inbox: join_sender.clone(),
               });
             }
@@ -157,7 +155,6 @@ impl WorkerHandle {
           }
           WorkerMessage::Recall {
             datum_id,
-            requesting_op_id: _,
             native_home_inbox,
           } => {
             cache.invalidate(datum_id);
@@ -198,12 +195,6 @@ impl WorkerHandle {
       sender,
       _join: join,
     }
-  }
-
-  /// Returns a clone of this thread's inbox sender — used by `pool.rs`
-  /// to relay requests directly to a specific thread by `ThreadId`.
-  pub(crate) fn sender(&self) -> Sender<WorkerMessage> {
-    self.sender.clone()
   }
 
   /// Assigns a new op to this thread and blocks for its result. The
