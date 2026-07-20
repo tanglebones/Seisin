@@ -145,6 +145,14 @@ impl WorkerPool {
       handle.evict_non_native(Arc::clone(&is_native));
     }
   }
+
+  /// Tells every worker in the pool that `node_id` is confirmed dead —
+  /// see `WorkerHandle::release_locks_held_by`.
+  pub fn release_locks_held_by(&self, node_id: NodeId) {
+    for handle in &self.handles {
+      handle.release_locks_held_by(node_id);
+    }
+  }
 }
 
 #[cfg(test)]
@@ -251,5 +259,46 @@ mod tests {
       .unwrap();
     let result = pool.run_op(DatumId::new(), "get_first".to_string(), vec![id], vec![]);
     assert_eq!(result, Ok(b"hello".to_vec()));
+  }
+
+  #[test]
+  fn release_locks_held_by_does_not_disturb_unrelated_locks_or_break_the_pool() {
+    // This test only proves the broadcast plumbing (WorkerPool ->
+    // every WorkerHandle -> every NativeLock) doesn't panic and
+    // doesn't disturb locks unrelated to the dead node — it can't, at
+    // this single-node layer, construct a lock genuinely held by some
+    // *other* node's thread (that requires real cross-node contention).
+    // The actual release-a-remote-holder mechanics are proven
+    // end-to-end by Task 7's integration test, which has a real second
+    // node to hold the lock in the first place.
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "touch",
+      Box::new(|ctx, ids, _payload| {
+        ctx.put(ids[0], b"touched".to_vec());
+        vec![]
+      }),
+    );
+    let (listener, address_book) = no_peers();
+    let pool = WorkerPool::spawn(
+      Arc::new(InMemoryStore::new()),
+      1,
+      Arc::new(ops),
+      Arc::clone(&ring),
+      NodeId(1),
+      listener,
+      address_book,
+    );
+
+    let id = DatumId::new();
+    pool
+      .run_op(DatumId::new(), "touch".to_string(), vec![id], vec![])
+      .unwrap();
+
+    pool.release_locks_held_by(NodeId(99));
+
+    let result = pool.run_op(DatumId::new(), "touch".to_string(), vec![id], vec![]);
+    assert_eq!(result, Ok(vec![]));
   }
 }

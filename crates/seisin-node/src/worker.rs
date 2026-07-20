@@ -64,6 +64,12 @@ pub(crate) enum WorkerMessage {
   /// Evicts every cached entry `is_native` rejects — used after a ring
   /// mutation; unrelated to op collation.
   EvictNonNative(Arc<dyn Fn(DatumId) -> bool + Send + Sync>),
+  /// Every datum this thread is native home for, if currently held by
+  /// `NodeId`, is released immediately (granting to the next waiter);
+  /// any of that node's own queued waiters are pruned too. Driven by
+  /// gossip's failure detector confirming a node dead — see
+  /// `gossip_state.rs::apply_ready_mutations`.
+  ReleaseLocksHeldBy(NodeId),
 }
 
 /// Where an `Acquire`'s eventual grant should be delivered — a local
@@ -281,6 +287,17 @@ impl WorkerHandle {
           WorkerMessage::EvictNonNative(is_native) => {
             cache.evict_non_native(|id| is_native(id));
           }
+          WorkerMessage::ReleaseLocksHeldBy(node_id) => {
+            for (&datum_id, lock) in native_locks.iter_mut() {
+              let was_held_by_dead_node = lock
+                .current_holder()
+                .is_some_and(|h| h.node_id == node_id);
+              lock.handle_node_death(node_id);
+              if was_held_by_dead_node {
+                cache.invalidate(datum_id);
+              }
+            }
+          }
         }
       }
     });
@@ -320,6 +337,12 @@ impl WorkerHandle {
   /// is a single ordered queue).
   pub fn evict_non_native(&self, is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>) {
     let _ = self.sender.send(WorkerMessage::EvictNonNative(is_native));
+  }
+
+  /// Tells this thread that `node_id` is confirmed dead — see
+  /// `WorkerMessage::ReleaseLocksHeldBy`.
+  pub fn release_locks_held_by(&self, node_id: NodeId) {
+    let _ = self.sender.send(WorkerMessage::ReleaseLocksHeldBy(node_id));
   }
 }
 
