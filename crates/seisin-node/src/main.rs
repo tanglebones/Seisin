@@ -45,6 +45,17 @@ fn main() -> Result<()> {
         config.self_node_id
       )
     })?;
+  let self_peer_link_address = config
+    .members
+    .iter()
+    .find(|m| m.node_id == config.self_node_id)
+    .map(|m| m.peer_link_address.clone())
+    .with_context(|| {
+      format!(
+        "self_node_id {} not present in members",
+        config.self_node_id
+      )
+    })?;
 
   let members: Vec<(NodeId, u32)> = config
     .members
@@ -59,6 +70,13 @@ fn main() -> Result<()> {
     .map(|m| (NodeId(m.node_id), m.address.clone()))
     .collect();
   let address_book = Arc::new(address_book);
+
+  let peer_link_address_book: HashMap<NodeId, String> = config
+    .members
+    .iter()
+    .map(|m| (NodeId(m.node_id), m.peer_link_address.clone()))
+    .collect();
+  let peer_link_address_book = Arc::new(peer_link_address_book);
 
   let gossip = Arc::new(GossipState::new());
   {
@@ -75,6 +93,10 @@ fn main() -> Result<()> {
     }
   }
 
+  let peer_link_listener = TcpListener::bind(&self_peer_link_address)
+    .with_context(|| format!("failed to bind {self_peer_link_address}"))?;
+  println!("seisin-node {self_node_id:?} peer-link listener on {self_peer_link_address}");
+
   let store = Arc::new(InMemoryStore::new());
   // No solution has been wired up yet — an empty registry until a real
   // solution built on this framework needs one populated with actual
@@ -85,6 +107,8 @@ fn main() -> Result<()> {
     Arc::new(seisin_ops::registry::OpRegistry::new()),
     Arc::clone(&ring),
     self_node_id,
+    peer_link_listener,
+    peer_link_address_book,
   ));
 
   let client_listener =
