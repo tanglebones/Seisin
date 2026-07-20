@@ -76,7 +76,14 @@ fn main() -> Result<()> {
   }
 
   let store = Arc::new(InMemoryStore::new());
-  let pool = Arc::new(WorkerPool::spawn(store, self_thread_count));
+  // No solution has been wired up yet — an empty registry until
+  // Sub-project 3b (or a real solution built on this framework) needs
+  // one populated with actual operations.
+  let pool = Arc::new(WorkerPool::spawn(
+    store,
+    self_thread_count,
+    Arc::new(seisin_ops::registry::OpRegistry::new()),
+  ));
 
   let client_listener =
     TcpListener::bind(&self_address).with_context(|| format!("failed to bind {self_address}"))?;

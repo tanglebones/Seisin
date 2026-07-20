@@ -52,7 +52,7 @@ fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String)]) {
     }
   }
 
-  let pool = Arc::new(WorkerPool::spawn(Arc::new(InMemoryStore::new()), this.1));
+  let pool = Arc::new(WorkerPool::spawn(Arc::new(InMemoryStore::new()), this.1, Arc::new(seisin_ops::registry::OpRegistry::new())));
 
   {
     let ring = Arc::clone(&ring);
