@@ -10,11 +10,19 @@ use seisin_core::authority::AuthorityIdx;
 use seisin_core::cache::Cache;
 use seisin_core::datum::DatumId;
 use seisin_core::store::Store;
+use seisin_ops::registry::OpRegistry;
 use seisin_protocol::{Request, Response};
 
 enum WorkerMessage {
   Request(Request, Sender<Response>),
   EvictNonNative(Arc<dyn Fn(DatumId) -> bool + Send + Sync>),
+  Evict(DatumId),
+  RunOp {
+    op_name: String,
+    datum_ids: Vec<DatumId>,
+    payload: Vec<u8>,
+    reply: Sender<Result<Vec<u8>, String>>,
+  },
 }
 
 pub struct WorkerHandle {
@@ -23,7 +31,7 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
-  pub fn spawn(store: Arc<dyn Store>) -> Self {
+  pub fn spawn(store: Arc<dyn Store>, ops: Arc<OpRegistry>) -> Self {
     let (sender, receiver) = mpsc::channel::<WorkerMessage>();
     let join = thread::spawn(move || {
       let mut cache = Cache::new(store);
@@ -35,6 +43,19 @@ impl WorkerHandle {
           }
           WorkerMessage::EvictNonNative(is_native) => {
             cache.evict_non_native(|id| is_native(id));
+          }
+          WorkerMessage::Evict(id) => {
+            cache.invalidate(id);
+          }
+          WorkerMessage::RunOp {
+            op_name,
+            datum_ids,
+            payload,
+            reply,
+          } => {
+            let mut ctx = seisin_ops::context::OpContext::new(&mut cache);
+            let result = ops.invoke(&op_name, &mut ctx, &datum_ids, &payload);
+            let _ = reply.send(result);
           }
         }
       }
@@ -61,6 +82,32 @@ impl WorkerHandle {
   /// is a single ordered queue).
   pub fn evict_non_native(&self, is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>) {
     let _ = self.sender.send(WorkerMessage::EvictNonNative(is_native));
+  }
+
+  /// Asks the owning thread to evict a single cache entry — fire-and-
+  /// forget, same ordering guarantee as `evict_non_native`.
+  pub fn evict(&self, id: DatumId) {
+    let _ = self.sender.send(WorkerMessage::Evict(id));
+  }
+
+  /// Runs a registered op on the owning thread and blocks for its result.
+  pub fn run_op(
+    &self,
+    op_name: String,
+    datum_ids: Vec<DatumId>,
+    payload: Vec<u8>,
+  ) -> Result<Vec<u8>, String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    self
+      .sender
+      .send(WorkerMessage::RunOp {
+        op_name,
+        datum_ids,
+        payload,
+        reply: reply_tx,
+      })
+      .expect("worker thread exited unexpectedly");
+    reply_rx.recv().expect("worker dropped the reply channel")
   }
 }
 
@@ -95,7 +142,7 @@ mod tests {
 
   #[test]
   fn put_then_get_returns_the_stored_content() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()));
+    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
     let id = DatumId::new();
 
     assert_eq!(
@@ -116,7 +163,7 @@ mod tests {
 
   #[test]
   fn get_on_missing_datum_returns_not_found() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()));
+    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
     assert_eq!(
       worker.submit(Request::Get { id: DatumId::new() }),
       Response::NotFound
@@ -125,7 +172,7 @@ mod tests {
 
   #[test]
   fn delete_then_get_returns_not_found() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()));
+    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
     let id = DatumId::new();
     worker.submit(Request::Put {
       id,
@@ -138,7 +185,7 @@ mod tests {
   #[test]
   fn evict_non_native_removes_rejected_entries_before_a_later_submit_sees_them() {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-    let worker = WorkerHandle::spawn(Arc::clone(&store));
+    let worker = WorkerHandle::spawn(Arc::clone(&store), Arc::new(OpRegistry::new()));
     let id = DatumId::new();
     worker.submit(Request::Put {
       id,
@@ -154,5 +201,54 @@ mod tests {
       Response::Value { content, .. } => assert_eq!(content, b"updated"),
       other => panic!("expected Value, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn evict_removes_one_entry_without_touching_others() {
+    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
+    let kept = DatumId::new();
+    let evicted = DatumId::new();
+    worker.submit(Request::Put {
+      id: kept,
+      content: b"kept".to_vec(),
+    });
+    worker.submit(Request::Put {
+      id: evicted,
+      content: b"evicted".to_vec(),
+    });
+
+    worker.evict(evicted);
+
+    match worker.submit(Request::Get { id: kept }) {
+      Response::Value { content, .. } => assert_eq!(content, b"kept"),
+      other => panic!("expected Value, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn run_op_invokes_the_registered_handler() {
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "put_first",
+      Box::new(|ctx, ids, payload| {
+        ctx.put(ids[0], payload.to_vec());
+        payload.to_vec()
+      }),
+    );
+    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(ops));
+    let id = DatumId::new();
+    let result = worker.run_op("put_first".to_string(), vec![id], b"hi".to_vec());
+    assert_eq!(result, Ok(b"hi".to_vec()));
+
+    match worker.submit(Request::Get { id }) {
+      Response::Value { content, .. } => assert_eq!(content, b"hi"),
+      other => panic!("expected Value, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn run_op_on_unknown_name_returns_an_error() {
+    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
+    assert!(worker.run_op("nope".to_string(), vec![], vec![]).is_err());
   }
 }

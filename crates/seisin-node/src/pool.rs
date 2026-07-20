@@ -11,6 +11,7 @@ use std::sync::Arc;
 use seisin_core::authority::ThreadId;
 use seisin_core::datum::DatumId;
 use seisin_core::store::Store;
+use seisin_ops::registry::OpRegistry;
 use seisin_protocol::{Request, Response};
 
 use crate::worker::WorkerHandle;
@@ -22,9 +23,9 @@ pub struct WorkerPool {
 impl WorkerPool {
   /// Spawns `thread_count` worker threads, each with its own `Cache`
   /// over the same shared `store`.
-  pub fn spawn(store: Arc<dyn Store>, thread_count: u32) -> Self {
+  pub fn spawn(store: Arc<dyn Store>, thread_count: u32, ops: Arc<OpRegistry>) -> Self {
     let handles = (0..thread_count)
-      .map(|_| WorkerHandle::spawn(Arc::clone(&store)))
+      .map(|_| WorkerHandle::spawn(Arc::clone(&store), Arc::clone(&ops)))
       .collect();
     Self { handles }
   }
@@ -56,7 +57,7 @@ mod tests {
 
   #[test]
   fn each_thread_id_indexes_a_distinct_worker() {
-    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2);
+    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
     assert_eq!(
       pool.submit(ThreadId(0), Request::Get { id: DatumId::new() }),
       Response::NotFound
@@ -69,7 +70,7 @@ mod tests {
 
   #[test]
   fn writes_on_one_thread_are_visible_via_the_shared_store_from_another() {
-    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2);
+    let pool = WorkerPool::spawn(Arc::new(InMemoryStore::new()), 2, Arc::new(OpRegistry::new()));
     let id = DatumId::new();
     pool.submit(
       ThreadId(0),

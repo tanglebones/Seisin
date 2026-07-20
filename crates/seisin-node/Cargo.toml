@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 ron = "0.8"
 seisin-ring = { path = "../seisin-ring" }
 seisin-gossip = { path = "../seisin-gossip" }
+seisin-ops = { path = "../seisin-ops" }
 
 [dev-dependencies]
 seisin-client = { path = "../seisin-client" }
