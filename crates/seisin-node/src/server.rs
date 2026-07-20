@@ -61,7 +61,13 @@ fn handle_connection(
       op_name,
       datum_ids,
       payload,
-    } = request;
+    } = request
+    else {
+      // Acquire/Recall are node-to-node only, carried over a
+      // peer-link connection (see peer_link.rs) — a client should
+      // never send one on this client-facing connection.
+      return;
+    };
     let response = handle_op_request(
       self_node_id,
       &ring,
