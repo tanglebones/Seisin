@@ -181,6 +181,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "seisin-ops"
+version = "0.1.0"
+dependencies = [
+ "seisin-core",
+]
+
+[[package]]
 name = "seisin-protocol"
 version = "0.1.0"
 dependencies = [
