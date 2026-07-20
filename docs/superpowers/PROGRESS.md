@@ -29,21 +29,30 @@ commit and push immediately, since work sessions may end abruptly.
   proving a silently-dead node gets removed from the ring. Indirect
   probing and runtime join of brand-new nodes are explicitly deferred
   (see the plan's "deliberately out of scope" note).
+- **Sub-project 3a — Op registry & single-node collation.** New crate
+  `seisin-ops` (`OpContext`, `OpRegistry` with panic-safe `invoke` via
+  `catch_unwind`). Wire protocol gained `Request::Op` /
+  `Response::OpResult`/`OpError`. `WorkerHandle`/`WorkerPool` gained
+  `evict`/`evict_single`, `run_op`. `server.rs`'s `handle_op_request`
+  resolves every datum_id's native owner, rejects cross-node op requests
+  (that's 3b), picks the local thread natively owning the most datums,
+  evicts the rest onto it, runs the solution-defined op, then evicts
+  anything left foreign afterward (simplified anti-degeneration, no
+  peek-ahead). Proven end-to-end by
+  `integration_op_collation.rs`: an op moving content between two datums
+  natively owned by different local threads on a single 4-thread node.
 
-As of this entry: 7 crates, 129 tests passing, `cargo fmt --check` and
+As of this entry: 8 crates, 127 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
 ## In progress
 
-- **Sub-project 3 — Collation & multi-datum ops.** Split into **3a**
-  (op registry, `OpContext`, single-node uncontended collation +
-  write-back/anti-degeneration) and **3b** (cross-node transfer +
-  wound-wait contention), per the design doc's "Op Registry & Collation
-  Mechanics" section. Resolved the framework-shape question: ops are
-  solution-defined Rust functions the framework collates datums for and
-  invokes, not a generic wire-level batch op. Currently writing/executing
-  3a's implementation plan.
+- **Sub-project 3b — Cross-node transfer & wound-wait contention.** Not
+  yet planned. Needs: reusing the client protocol for cross-node datum
+  transfer (per the design doc), and a wound-wait scheme using
+  client-generated UUIDv7 ids to break contention livelock/deadlock
+  without a centralized transaction manager.
 
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-
