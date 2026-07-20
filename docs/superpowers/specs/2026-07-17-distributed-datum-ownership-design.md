@@ -17,6 +17,17 @@ system (deployed via containers) that validates this ownership/routing/
 collation model end-to-end. It intentionally excludes concerns unrelated to
 proving the core model out (see Non-Goals).
 
+**What Seisin actually ships (added 2026-07-20).** Seisin itself is not a
+single running system — it's a set of base libraries (a server framework
+and a paired client library) that a specific *solution* builds on top of.
+A solution defines its datum types and the operations over them in code
+using these libraries; that definition compiles into two deployable
+pieces: a server executable (the compute/storage node binary, specialized
+to that solution's datum types) and a client library tied to the same
+datum/compute definitions. Everything in this doc describes the mechanics
+those base libraries implement — the ring, gossip, collation, storage —
+not a specific solution built on them.
+
 ## Non-Goals (v1)
 
 - Authentication, authorization, or transport encryption. The system runs on
@@ -82,6 +93,61 @@ compute) — so it collapses into the compute role entirely.
   Because it's client-generated, ordering is time-*ish* but subject to
   clock drift across clients — sufficient to break livelock cycles, not a
   linearizability guarantee.
+
+## Datum Type System (added 2026-07-20)
+
+- Datums are **typed**, and each datum type is **homogeneous** — every
+  datum of a given type has the same shape. Content is no longer just an
+  opaque byte blob at the solution level (it's still opaque at the
+  storage/replication layer — see "Storage Tier" — but a solution's
+  server and client code operate on typed values, not raw bytes).
+- A type definition's field types are: Rust's primitive types, arrays,
+  and dictionaries (maps) whose keys are restricted to primitive types
+  (values can presumably be any supported type, including nested
+  arrays/dicts — exact nesting rules are still to be nailed down; see
+  Open Questions).
+- **Secondary indexes are declared as part of the type definition**, not
+  constructed ad hoc by client queries. This ties the "which fields are
+  indexable" decision to the schema itself, alongside the SK-datum
+  mechanics already described above (an SK datum is still a regular
+  datum; this section just fixes *where* the definition of one comes
+  from — the owning type's schema, not caller-supplied index
+  expressions).
+- **Relational constraints** (e.g. foreign-key-style references between
+  datum types) exist in the type system, but full synchronous
+  update-time enforcement may not be achievable given the ownership
+  model — enforcement is likely **eventual or advisory** rather than a
+  hard constraint checked on every write. The exact mechanism is still
+  open — see Open Questions.
+
+## Deployment & Schema Evolution (added 2026-07-20)
+
+- A **central deployment management system** handles rolling out cluster
+  updates. It is not part of the always-running cluster — it's only
+  invoked when a deployment is actually happening.
+- **Every node must remain compatible with the immediately prior version
+  (n-1)** — a node on version `n` must be able to interoperate (wire
+  protocol, gossip, datum type handling) with peers still on `n-1` during
+  a rolling update.
+- **A new deployment can only be started when every node in the cluster
+  is currently on the same version `n`** — deployments don't stack; the
+  cluster must fully settle on a uniform version before the next rollout
+  begins.
+- **Update order within a single deployment: storage nodes first, then
+  compute nodes, then clients.** This ordering exists so that by the time
+  compute nodes (and then clients) start expecting a schema/behavior
+  change, the storage tier underneath them already supports it.
+- **Datum type evolution rules**:
+  - New datum types, and new fields on an existing type, can be added
+    freely.
+  - Existing types/fields can be deprecated, and deprecated types/fields
+    can subsequently be removed — but only after having been deprecated
+    first (no direct removal of a still-active type/field).
+  - **No renames.** A rename is modeled as an alias on the original
+    name, never as an in-place identity change — this keeps the n/n-1
+    compatibility guarantee simple (an n-1 node or client that only knows
+    the old name still resolves to the same underlying thing via the
+    alias, rather than needing to understand a rename event).
 
 ## Routing & Ownership Protocol
 
@@ -382,3 +448,15 @@ introduced conceptually above.
 - Whether/how to support internal-only compute nodes not directly
   reachable by clients, if that's ever needed (would require rethinking the
   "client hashes directly into the compute ring" assumption).
+- **Relational constraint enforcement mechanism.** Whether constraints
+  between datum types are checked eventually (a background
+  reconciliation pass), advisory-only (surfaced but never blocking a
+  write), or some mix per-constraint — not yet decided.
+- **Exact type-system nesting rules.** Whether dictionary/array values
+  can themselves be arrays/dicts (arbitrary nesting) or only primitives,
+  and how deeply — not yet decided.
+- **Deployment management system's own design** — how it detects "all
+  nodes on version n," drives the storage→compute→client rollout order,
+  and what happens if a rollout is interrupted partway through. Not yet
+  designed at all; the rules above are constraints on it, not a design
+  for it.
