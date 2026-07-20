@@ -113,6 +113,16 @@ compute) — so it collapses into the compute role entirely.
   datum; this section just fixes *where* the definition of one comes
   from — the owning type's schema, not caller-supplied index
   expressions).
+- **Index types** (added 2026-07-23, to be detailed later): every datum
+  type declares one or more indexes, each of a specific kind:
+  - **pk** (primary key) — required on every datum type; this is the
+    datum_id itself.
+  - **sk** (secondary key) — the SK-datum mechanism already described
+    above.
+  - **rk** (stochastically ranked) — a ranked/sampled index; mechanics
+    not yet designed.
+  - **tk** (temporal) — a time-oriented index; mechanics not yet
+    designed.
 - **Relational constraints** (e.g. foreign-key-style references between
   datum types) exist in the type system, but full synchronous
   update-time enforcement may not be achievable given the ownership

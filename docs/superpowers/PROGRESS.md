@@ -54,7 +54,10 @@ sub-project plans:
 - **Datum type system.** Typed, homogeneous datum types (Rust primitives/
   arrays/dicts with primitive keys), secondary indexes declared as part
   of a type, relational constraints (enforcement mechanism undecided —
-  see the design doc's Open Questions).
+  see the design doc's Open Questions). Four index kinds per type: pk
+  (required, the datum_id itself), sk (secondary key, already mechanically
+  specified), rk (stochastically ranked, mechanics TBD), tk (temporal,
+  mechanics TBD) — rk/tk explicitly deferred for later detailing.
 - **Framework/codegen shape.** Seisin's actual deliverable is base
   libraries a solution uses to define datum types + operations in code,
   compiling into a server executable and a paired client library. None
@@ -69,12 +72,17 @@ sub-project plans:
   designed at all yet — see the design doc's Open Questions for what's
   still undecided even at the rules level.
 
-## Suggested next step
+## Sequencing decision (2026-07-23)
 
-Given the datum type system and framework shape directly affect how
-solutions define types/operations, it's worth brainstorming those before
-sinking more effort into Sub-project 3 (collation), since collation logic
-operates on datums and may need to know about typed content/relational
-constraints. Not yet decided — flag this to the user before picking
-between "continue with Sub-project 3 as originally sequenced" and
-"design the type system first."
+Proceeding with **Sub-project 3 (Collation & multi-datum ops)** next,
+per the original sequence, rather than designing the datum type system
+first. Rationale: collation operates at the `DatumId`/`AuthorityIdx`
+level (which thread runs an op touching multiple datums), not on typed
+content — the existing `Cache`/`Request`/`Response` model already treats
+content as opaque bytes, and nothing about wound-wait/foreign-pull/
+anti-degeneration needs to know about datum types, index kinds, or
+relational constraints. The type system and deployment system are both
+still being actively sketched (index kinds added 2026-07-23 with rk/tk
+mechanics explicitly deferred) and aren't yet concrete enough to plan
+against — better to let them keep accumulating design notes and revisit
+once they're ready for their own brainstorm → plan cycle.
