@@ -1,28 +1,76 @@
-//! The single owning thread for this sub-project's one authority slot.
-//! Later sub-projects add a ring of these, one per (node, thread); for
-//! now there is exactly one, so every response reports `AuthorityIdx::Native`.
+//! One owning thread per `ThreadId`. Each thread is the sole lock
+//! manager (via `NativeLock`) for every datum whose `ring.native()`
+//! resolves here, and independently tracks its own in-flight op records
+//! (op_id -> still-needed/acquired datum_ids) for ops assigned to it.
+//! All cross-thread coordination is non-blocking message passing — no
+//! thread ever blocks waiting on another; a request that can't be
+//! granted immediately is queued at the native-home thread and the
+//! requester is notified later via an ordinary inbox message. See the
+//! design doc's "Node/Thread Architecture" section.
 
-use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
-use seisin_core::authority::AuthorityIdx;
+use seisin_core::authority::{NodeId, ThreadId};
 use seisin_core::cache::Cache;
 use seisin_core::datum::DatumId;
 use seisin_core::store::Store;
+use seisin_ops::context::OpContext;
 use seisin_ops::registry::OpRegistry;
-use seisin_protocol::{Request, Response};
+use seisin_ring::ring::Ring;
 
-enum WorkerMessage {
-  Request(Request, Sender<Response>),
-  EvictNonNative(Arc<dyn Fn(DatumId) -> bool + Send + Sync>),
-  Evict(DatumId),
+use crate::collation::{AcquireOutcome, NativeLock};
+
+pub(crate) enum WorkerMessage {
+  /// A client's `Request::Op`, assigned to this thread as its
+  /// destination (see `pool.rs`'s native-majority heuristic).
   RunOp {
+    op_id: DatumId,
     op_name: String,
     datum_ids: Vec<DatumId>,
     payload: Vec<u8>,
     reply: Sender<Result<Vec<u8>, String>>,
   },
+  /// Sent to whichever thread is native home for `datum_id`, requesting
+  /// the lock on behalf of `op_id`. `requester_inbox` is where the
+  /// grant (`AcquireGranted`) is posted once available — always a
+  /// local `WorkerMessage` sender in this plan (cross-node requesters
+  /// are a later sub-project).
+  Acquire {
+    op_id: DatumId,
+    datum_id: DatumId,
+    requester_node: NodeId,
+    requester_thread: ThreadId,
+    requester_inbox: Sender<WorkerMessage>,
+  },
+  /// Posted into the requesting thread's own inbox once its `Acquire`
+  /// is granted (immediately, or after a wait/recall).
+  AcquireGranted { op_id: DatumId, datum_id: DatumId },
+  /// Sent by native home to whoever currently holds `datum_id`, asking
+  /// it to evict and release. `native_home_inbox` is where the
+  /// resulting `Release` is sent once done.
+  Recall {
+    datum_id: DatumId,
+    requesting_op_id: DatumId,
+    native_home_inbox: Sender<WorkerMessage>,
+  },
+  /// Tells native home that whoever held `datum_id` is done with it
+  /// (normal op completion, or a recall's evict-and-ack) — grants it to
+  /// the oldest waiter, if any.
+  Release { datum_id: DatumId },
+  /// Evicts every cached entry `is_native` rejects — used after a ring
+  /// mutation; unrelated to op collation.
+  EvictNonNative(Arc<dyn Fn(DatumId) -> bool + Send + Sync>),
+}
+
+struct OpRecord {
+  op_name: String,
+  payload: Vec<u8>,
+  still_needed: Vec<DatumId>,
+  acquired: Vec<DatumId>,
+  reply: Sender<Result<Vec<u8>, String>>,
 }
 
 pub struct WorkerHandle {
@@ -31,31 +79,117 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
-  pub fn spawn(store: Arc<dyn Store>, ops: Arc<OpRegistry>) -> Self {
-    let (sender, receiver) = mpsc::channel::<WorkerMessage>();
+  #[allow(clippy::too_many_arguments)]
+  pub fn spawn(
+    self_thread_id: ThreadId,
+    receiver: Receiver<WorkerMessage>,
+    sender: Sender<WorkerMessage>,
+    peers: Arc<Vec<Sender<WorkerMessage>>>,
+    store: Arc<dyn Store>,
+    ops: Arc<OpRegistry>,
+    ring: Arc<RwLock<Ring>>,
+    self_node_id: NodeId,
+  ) -> Self {
+    let join_sender = sender.clone();
     let join = thread::spawn(move || {
       let mut cache = Cache::new(store);
+      let mut native_locks: HashMap<DatumId, NativeLock> = HashMap::new();
+      let mut op_records: HashMap<DatumId, OpRecord> = HashMap::new();
+
       for message in receiver {
         match message {
-          WorkerMessage::Request(request, reply) => {
-            let response = handle_request(&mut cache, request);
-            let _ = reply.send(response);
-          }
-          WorkerMessage::EvictNonNative(is_native) => {
-            cache.evict_non_native(|id| is_native(id));
-          }
-          WorkerMessage::Evict(id) => {
-            cache.invalidate(id);
-          }
           WorkerMessage::RunOp {
+            op_id,
             op_name,
             datum_ids,
             payload,
             reply,
           } => {
-            let mut ctx = seisin_ops::context::OpContext::new(&mut cache);
-            let result = ops.invoke(&op_name, &mut ctx, &datum_ids, &payload);
-            let _ = reply.send(result);
+            op_records.insert(
+              op_id,
+              OpRecord {
+                op_name,
+                payload,
+                still_needed: datum_ids.clone(),
+                acquired: Vec::new(),
+                reply,
+              },
+            );
+            for datum_id in datum_ids {
+              send_acquire(
+                &ring,
+                &peers,
+                op_id,
+                datum_id,
+                self_node_id,
+                self_thread_id,
+                join_sender.clone(),
+              );
+            }
+            try_run_if_ready(op_id, &mut op_records, &mut cache, &ops, &ring, &peers);
+          }
+          WorkerMessage::Acquire {
+            op_id,
+            datum_id,
+            requester_node,
+            requester_thread,
+            requester_inbox,
+          } => {
+            let lock = native_locks.entry(datum_id).or_default();
+            let on_granted = Box::new(move || {
+              let _ = requester_inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
+            });
+            let outcome = lock.request(op_id, requester_node, requester_thread, on_granted);
+            if let AcquireOutcome::RecallNeeded(holder) = outcome {
+              let _ = peers[holder.thread_id.0 as usize].send(WorkerMessage::Recall {
+                datum_id,
+                requesting_op_id: op_id,
+                native_home_inbox: join_sender.clone(),
+              });
+            }
+          }
+          WorkerMessage::AcquireGranted { op_id, datum_id } => {
+            if let Some(record) = op_records.get_mut(&op_id) {
+              record.still_needed.retain(|id| *id != datum_id);
+              record.acquired.push(datum_id);
+            }
+            try_run_if_ready(op_id, &mut op_records, &mut cache, &ops, &ring, &peers);
+          }
+          WorkerMessage::Recall {
+            datum_id,
+            requesting_op_id: _,
+            native_home_inbox,
+          } => {
+            cache.invalidate(datum_id);
+            let mut wounded_op_id = None;
+            for (op_id, record) in op_records.iter_mut() {
+              if let Some(pos) = record.acquired.iter().position(|id| *id == datum_id) {
+                record.acquired.remove(pos);
+                record.still_needed.push(datum_id);
+                wounded_op_id = Some(*op_id);
+                break;
+              }
+            }
+            let _ = native_home_inbox.send(WorkerMessage::Release { datum_id });
+            if let Some(op_id) = wounded_op_id {
+              send_acquire(
+                &ring,
+                &peers,
+                op_id,
+                datum_id,
+                self_node_id,
+                self_thread_id,
+                join_sender.clone(),
+              );
+            }
+          }
+          WorkerMessage::Release { datum_id } => {
+            if let Some(lock) = native_locks.get_mut(&datum_id) {
+              lock.release();
+            }
+          }
+          WorkerMessage::EvictNonNative(is_native) => {
+            cache.evict_non_native(|id| is_native(id));
           }
         }
       }
@@ -66,41 +200,27 @@ impl WorkerHandle {
     }
   }
 
-  /// Submits a request to the owning thread and blocks for its response.
-  pub fn submit(&self, request: Request) -> Response {
-    let (reply_tx, reply_rx) = mpsc::channel();
-    self
-      .sender
-      .send(WorkerMessage::Request(request, reply_tx))
-      .expect("worker thread exited unexpectedly");
-    reply_rx.recv().expect("worker dropped the reply channel")
+  /// Returns a clone of this thread's inbox sender — used by `pool.rs`
+  /// to relay requests directly to a specific thread by `ThreadId`.
+  pub(crate) fn sender(&self) -> Sender<WorkerMessage> {
+    self.sender.clone()
   }
 
-  /// Asks the owning thread to evict any cache entry `is_native` rejects
-  /// — fire-and-forget, no reply, but guaranteed to be processed before
-  /// any `submit` call made after this one returns (the worker's inbox
-  /// is a single ordered queue).
-  pub fn evict_non_native(&self, is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>) {
-    let _ = self.sender.send(WorkerMessage::EvictNonNative(is_native));
-  }
-
-  /// Asks the owning thread to evict a single cache entry — fire-and-
-  /// forget, same ordering guarantee as `evict_non_native`.
-  pub fn evict(&self, id: DatumId) {
-    let _ = self.sender.send(WorkerMessage::Evict(id));
-  }
-
-  /// Runs a registered op on the owning thread and blocks for its result.
+  /// Assigns a new op to this thread and blocks for its result. The
+  /// thread's own message loop drives collation (acquiring whatever
+  /// datums it doesn't already hold) before invoking the op.
   pub fn run_op(
     &self,
+    op_id: DatumId,
     op_name: String,
     datum_ids: Vec<DatumId>,
     payload: Vec<u8>,
   ) -> Result<Vec<u8>, String> {
-    let (reply_tx, reply_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     self
       .sender
       .send(WorkerMessage::RunOp {
+        op_id,
         op_name,
         datum_ids,
         payload,
@@ -109,125 +229,112 @@ impl WorkerHandle {
       .expect("worker thread exited unexpectedly");
     reply_rx.recv().expect("worker dropped the reply channel")
   }
+
+  /// Asks the owning thread to evict any cache entry `is_native` rejects
+  /// — fire-and-forget, no reply, but guaranteed to be processed before
+  /// any `run_op` call made after this one returns (the worker's inbox
+  /// is a single ordered queue).
+  pub fn evict_non_native(&self, is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>) {
+    let _ = self.sender.send(WorkerMessage::EvictNonNative(is_native));
+  }
 }
 
-fn handle_request(cache: &mut Cache, request: Request) -> Response {
-  match request {
-    Request::Get { id } => match cache.get(id) {
-      Some(content) => Response::Value {
-        content,
-        authority: AuthorityIdx::Native,
-      },
-      None => Response::NotFound,
-    },
-    Request::Put { id, content } => {
-      cache.put(id, content);
-      Response::Ok
-    }
-    Request::Delete { id } => {
-      cache.delete(id);
-      Response::Ok
-    }
-    Request::Op { .. } => Response::OpError {
-      message: "Request::Op must be dispatched via run_op, not submit".to_string(),
-    },
+/// Sends an `Acquire` for `datum_id` on behalf of `op_id` to whichever
+/// thread `ring.native()` currently names — always via a message, even
+/// when that's the calling thread itself (a cheap, non-blocking
+/// self-send), so there's exactly one code path regardless of whether
+/// the native home turns out to be local-to-self or a different local
+/// thread.
+#[allow(clippy::too_many_arguments)]
+fn send_acquire(
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  op_id: DatumId,
+  datum_id: DatumId,
+  self_node_id: NodeId,
+  self_thread_id: ThreadId,
+  requester_inbox: Sender<WorkerMessage>,
+) {
+  let (_, native_thread) = ring.read().unwrap().native(datum_id);
+  let _ = peers[native_thread.0 as usize].send(WorkerMessage::Acquire {
+    op_id,
+    datum_id,
+    requester_node: self_node_id,
+    requester_thread: self_thread_id,
+    requester_inbox,
+  });
+}
+
+/// If `op_id`'s record has nothing left to acquire, runs it, replies,
+/// then releases every acquired datum back toward its native home.
+fn try_run_if_ready(
+  op_id: DatumId,
+  op_records: &mut HashMap<DatumId, OpRecord>,
+  cache: &mut Cache,
+  ops: &OpRegistry,
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+) {
+  let ready = op_records
+    .get(&op_id)
+    .is_some_and(|record| record.still_needed.is_empty());
+  if !ready {
+    return;
+  }
+  let record = op_records.remove(&op_id).unwrap();
+  let mut ctx = OpContext::new(cache);
+  let result = ops.invoke(&record.op_name, &mut ctx, &record.acquired, &record.payload);
+  let _ = record.reply.send(result);
+  for datum_id in record.acquired {
+    let (_, thread_id) = ring.read().unwrap().native(datum_id);
+    let _ = peers[thread_id.0 as usize].send(WorkerMessage::Release { datum_id });
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use seisin_core::datum::DatumId;
+  use std::sync::mpsc;
+
   use seisin_core::store::InMemoryStore;
 
-  #[test]
-  fn put_then_get_returns_the_stored_content() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
-    let id = DatumId::new();
-
-    assert_eq!(
-      worker.submit(Request::Put {
-        id,
-        content: b"hello".to_vec()
-      }),
-      Response::Ok
-    );
-    assert_eq!(
-      worker.submit(Request::Get { id }),
-      Response::Value {
-        content: b"hello".to_vec(),
-        authority: AuthorityIdx::Native
-      }
-    );
-  }
-
-  #[test]
-  fn get_on_missing_datum_returns_not_found() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
-    assert_eq!(
-      worker.submit(Request::Get { id: DatumId::new() }),
-      Response::NotFound
-    );
-  }
-
-  #[test]
-  fn delete_then_get_returns_not_found() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
-    let id = DatumId::new();
-    worker.submit(Request::Put {
-      id,
-      content: b"hello".to_vec(),
-    });
-    assert_eq!(worker.submit(Request::Delete { id }), Response::Ok);
-    assert_eq!(worker.submit(Request::Get { id }), Response::NotFound);
-  }
-
-  #[test]
-  fn evict_non_native_removes_rejected_entries_before_a_later_submit_sees_them() {
+  /// Spawns `thread_count` interconnected `WorkerHandle`s sharing one
+  /// store, ring, and op registry — a minimal in-process pool, built by
+  /// hand here since `pool.rs` doesn't exist in this shape yet (Task 4).
+  fn spawn_test_pool(
+    thread_count: u32,
+    ring: Arc<RwLock<Ring>>,
+    ops: OpRegistry,
+  ) -> Vec<WorkerHandle> {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-    let worker = WorkerHandle::spawn(Arc::clone(&store), Arc::new(OpRegistry::new()));
-    let id = DatumId::new();
-    worker.submit(Request::Put {
-      id,
-      content: b"original".to_vec(),
-    });
-
-    // Mutate storage directly (simulating another node's write-through)
-    // and evict, then confirm the very next Get reloads the new value.
-    store.put(id, b"updated".to_vec());
-    worker.evict_non_native(Arc::new(|_| false));
-
-    match worker.submit(Request::Get { id }) {
-      Response::Value { content, .. } => assert_eq!(content, b"updated"),
-      other => panic!("expected Value, got {other:?}"),
+    let ops = Arc::new(ops);
+    let mut senders = Vec::with_capacity(thread_count as usize);
+    let mut receivers = Vec::with_capacity(thread_count as usize);
+    for _ in 0..thread_count {
+      let (tx, rx) = mpsc::channel();
+      senders.push(tx);
+      receivers.push(rx);
     }
+    let peers = Arc::new(senders);
+    receivers
+      .into_iter()
+      .enumerate()
+      .map(|(idx, receiver)| {
+        WorkerHandle::spawn(
+          ThreadId(idx as u32),
+          receiver,
+          peers[idx].clone(),
+          Arc::clone(&peers),
+          Arc::clone(&store),
+          Arc::clone(&ops),
+          Arc::clone(&ring),
+          NodeId(1),
+        )
+      })
+      .collect()
   }
 
-  #[test]
-  fn evict_removes_one_entry_without_touching_others() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
-    let kept = DatumId::new();
-    let evicted = DatumId::new();
-    worker.submit(Request::Put {
-      id: kept,
-      content: b"kept".to_vec(),
-    });
-    worker.submit(Request::Put {
-      id: evicted,
-      content: b"evicted".to_vec(),
-    });
-
-    worker.evict(evicted);
-
-    match worker.submit(Request::Get { id: kept }) {
-      Response::Value { content, .. } => assert_eq!(content, b"kept"),
-      other => panic!("expected Value, got {other:?}"),
-    }
-  }
-
-  #[test]
-  fn run_op_invokes_the_registered_handler() {
-    let mut ops = OpRegistry::new();
+  fn register_echo_ops(ops: &mut OpRegistry) {
     ops.register(
       "put_first",
       Box::new(|ctx, ids, payload| {
@@ -235,20 +342,124 @@ mod tests {
         payload.to_vec()
       }),
     );
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(ops));
-    let id = DatumId::new();
-    let result = worker.run_op("put_first".to_string(), vec![id], b"hi".to_vec());
-    assert_eq!(result, Ok(b"hi".to_vec()));
-
-    match worker.submit(Request::Get { id }) {
-      Response::Value { content, .. } => assert_eq!(content, b"hi"),
-      other => panic!("expected Value, got {other:?}"),
-    }
+    ops.register(
+      "get_first",
+      Box::new(|ctx, ids, _payload| ctx.get(ids[0]).unwrap_or_default()),
+    );
   }
 
   #[test]
-  fn run_op_on_unknown_name_returns_an_error() {
-    let worker = WorkerHandle::spawn(Arc::new(InMemoryStore::new()), Arc::new(OpRegistry::new()));
-    assert!(worker.run_op("nope".to_string(), vec![], vec![]).is_err());
+  fn a_single_datum_op_on_its_own_native_thread_runs_immediately() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut ops = OpRegistry::new();
+    register_echo_ops(&mut ops);
+    let handles = spawn_test_pool(1, ring, ops);
+    let id = DatumId::new();
+
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "put_first".to_string(),
+      vec![id],
+      b"hello".to_vec(),
+    );
+    assert_eq!(result, Ok(b"hello".to_vec()));
+
+    let result = handles[0].run_op(DatumId::new(), "get_first".to_string(), vec![id], vec![]);
+    assert_eq!(result, Ok(b"hello".to_vec()));
+  }
+
+  #[test]
+  fn an_op_collates_a_datum_natively_owned_by_a_different_local_thread() {
+    // With 4 threads, find two ids whose native homes differ so this
+    // test actually exercises cross-thread acquisition rather than
+    // relying on luck.
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 4)])));
+    let (from, to) = loop {
+      let a = DatumId::new();
+      let b = DatumId::new();
+      if ring.read().unwrap().native(a) != ring.read().unwrap().native(b) {
+        break (a, b);
+      }
+    };
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "move_content",
+      Box::new(|ctx, ids, _payload| {
+        let content = ctx.get(ids[0]).unwrap_or_default();
+        ctx.delete(ids[0]);
+        ctx.put(ids[1], content.clone());
+        content
+      }),
+    );
+    register_echo_ops(&mut ops);
+    let handles = spawn_test_pool(4, ring.clone(), ops);
+
+    let (_, from_thread) = ring.read().unwrap().native(from);
+    handles[from_thread.0 as usize]
+      .run_op(
+        DatumId::new(),
+        "put_first".to_string(),
+        vec![from],
+        b"payload".to_vec(),
+      )
+      .unwrap();
+
+    // Dispatch the collating op from thread 0 regardless of where
+    // `from`/`to` natively live, to prove collation reaches across
+    // threads.
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "move_content".to_string(),
+      vec![from, to],
+      vec![],
+    );
+    assert_eq!(result, Ok(b"payload".to_vec()));
+  }
+
+  #[test]
+  fn an_older_op_recalls_a_datum_from_a_younger_ops_in_flight_collation() {
+    // Classic two-op cycle: op1 needs (a, b), op2 needs (b, a) — opposite
+    // acquisition order — with op1 the strictly older op_id. Neither
+    // should deadlock; op1 (older) must win any contention immediately
+    // and both ops must eventually complete. A genuine deadlock would
+    // hang `thread::join` below rather than fail an assertion — that's
+    // an accepted trade-off here: `cargo test`'s own harness timeout is
+    // the backstop, and a hang is just as informative as a clean
+    // failure for this specific bug class.
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 4)])));
+    let (a, b) = loop {
+      let x = DatumId::new();
+      let y = DatumId::new();
+      if ring.read().unwrap().native(x) != ring.read().unwrap().native(y) {
+        break (x, y);
+      }
+    };
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "touch_both",
+      Box::new(|ctx, ids, _payload| {
+        ctx.put(ids[0], b"touched".to_vec());
+        ctx.put(ids[1], b"touched".to_vec());
+        vec![]
+      }),
+    );
+    let handles = Arc::new(spawn_test_pool(4, ring, ops));
+
+    let op1 = DatumId::new(); // older: created first
+    let op2 = DatumId::new(); // younger
+
+    let handles_a = Arc::clone(&handles);
+    let thread1 = std::thread::spawn(move || {
+      handles_a[0].run_op(op1, "touch_both".to_string(), vec![a, b], vec![])
+    });
+    let handles_b = Arc::clone(&handles);
+    let thread2 = std::thread::spawn(move || {
+      handles_b[1].run_op(op2, "touch_both".to_string(), vec![b, a], vec![])
+    });
+
+    let result1 = thread1.join().unwrap();
+    let result2 = thread2.join().unwrap();
+    assert_eq!(result1, Ok(vec![]));
+    assert_eq!(result2, Ok(vec![]));
   }
 }
