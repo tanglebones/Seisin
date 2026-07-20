@@ -76,13 +76,15 @@ fn main() -> Result<()> {
   }
 
   let store = Arc::new(InMemoryStore::new());
-  // No solution has been wired up yet — an empty registry until
-  // Sub-project 3b (or a real solution built on this framework) needs
-  // one populated with actual operations.
+  // No solution has been wired up yet — an empty registry until a real
+  // solution built on this framework needs one populated with actual
+  // operations.
   let pool = Arc::new(WorkerPool::spawn(
     store,
     self_thread_count,
     Arc::new(seisin_ops::registry::OpRegistry::new()),
+    Arc::clone(&ring),
+    self_node_id,
   ));
 
   let client_listener =
