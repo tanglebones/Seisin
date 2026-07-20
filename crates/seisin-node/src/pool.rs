@@ -4,6 +4,7 @@
 //! node's backing store and op registry.
 
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
@@ -13,7 +14,8 @@ use seisin_core::store::Store;
 use seisin_ops::registry::OpRegistry;
 use seisin_ring::ring::Ring;
 
-use crate::worker::{WorkerHandle, WorkerMessage};
+use crate::peer_link::{PeerLink, PeerLinkRegistry};
+use crate::worker::{AcquireReply, RecallReply, WorkerHandle, WorkerMessage};
 
 pub struct WorkerPool {
   handles: Vec<WorkerHandle>,
@@ -22,13 +24,20 @@ pub struct WorkerPool {
 
 impl WorkerPool {
   /// Spawns `thread_count` interconnected worker threads sharing one
-  /// `store` and `ops` registry.
+  /// `store` and `ops` registry, plus the node-to-node peer-link
+  /// registry every thread uses for cross-node `Acquire`/`Recall`
+  /// traffic — built here, after `peers` exists but before any worker
+  /// thread starts, since the registry's own incoming-request dispatch
+  /// needs `peers` to route by `ThreadId`.
+  #[allow(clippy::too_many_arguments)]
   pub fn spawn(
     store: Arc<dyn Store>,
     thread_count: u32,
     ops: Arc<OpRegistry>,
     ring: Arc<RwLock<Ring>>,
     self_node_id: NodeId,
+    peer_link_listener: TcpListener,
+    peer_link_address_book: Arc<HashMap<NodeId, String>>,
   ) -> Self {
     let mut senders = Vec::with_capacity(thread_count as usize);
     let mut receivers = Vec::with_capacity(thread_count as usize);
@@ -38,6 +47,38 @@ impl WorkerPool {
       receivers.push(rx);
     }
     let peers = Arc::new(senders);
+
+    let dispatch_peers = Arc::clone(&peers);
+    let on_request: Arc<dyn Fn(ThreadId, seisin_protocol::Request, Arc<PeerLink>, u64) + Send + Sync> =
+      Arc::new(move |target_thread, request, link, correlation_id| {
+        let message = match request {
+          seisin_protocol::Request::Acquire {
+            op_id,
+            datum_id,
+            requester_node,
+            requester_thread,
+          } => WorkerMessage::Acquire {
+            op_id,
+            datum_id,
+            requester_node,
+            requester_thread,
+            reply: AcquireReply::Remote(Arc::clone(&link), correlation_id),
+          },
+          seisin_protocol::Request::Recall { datum_id } => WorkerMessage::Recall {
+            datum_id,
+            reply: RecallReply::Remote(Arc::clone(&link), correlation_id),
+          },
+          seisin_protocol::Request::Op { .. } => return, // client-only; never sent over a peer-link
+        };
+        let _ = dispatch_peers[target_thread.0 as usize].send(message);
+      });
+    let peer_links = PeerLinkRegistry::start(
+      peer_link_listener,
+      self_node_id,
+      peer_link_address_book,
+      on_request,
+    );
+
     let handles = receivers
       .into_iter()
       .enumerate()
@@ -51,6 +92,7 @@ impl WorkerPool {
           Arc::clone(&ops),
           Arc::clone(&ring),
           self_node_id,
+          Arc::clone(&peer_links),
         )
       })
       .collect();
@@ -101,17 +143,27 @@ mod tests {
   use super::*;
   use seisin_core::store::InMemoryStore;
 
+  fn no_peers() -> (TcpListener, Arc<HashMap<NodeId, String>>) {
+    (
+      TcpListener::bind("127.0.0.1:0").unwrap(),
+      Arc::new(HashMap::new()),
+    )
+  }
+
   fn test_pool(thread_count: u32) -> WorkerPool {
     let ring = Arc::new(RwLock::new(Ring::from_members(&[(
       NodeId(1),
       thread_count,
     )])));
+    let (listener, address_book) = no_peers();
     WorkerPool::spawn(
       Arc::new(InMemoryStore::new()),
       thread_count,
       Arc::new(OpRegistry::new()),
       ring,
       NodeId(1),
+      listener,
+      address_book,
     )
   }
 
@@ -126,12 +178,15 @@ mod tests {
         payload.to_vec()
       }),
     );
+    let (listener, address_book) = no_peers();
     let pool = WorkerPool::spawn(
       Arc::new(InMemoryStore::new()),
       2,
       Arc::new(ops),
       ring,
       NodeId(1),
+      listener,
+      address_book,
     );
     let id = DatumId::new();
     let result = pool.run_op(
@@ -166,12 +221,15 @@ mod tests {
       "get_first",
       Box::new(|ctx, ids, _payload| ctx.get(ids[0]).unwrap_or_default()),
     );
+    let (listener, address_book) = no_peers();
     let pool = WorkerPool::spawn(
       Arc::new(InMemoryStore::new()),
       2,
       Arc::new(ops),
       ring,
       NodeId(1),
+      listener,
+      address_book,
     );
     let id = DatumId::new();
     pool
