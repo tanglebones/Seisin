@@ -118,11 +118,14 @@ fn handle_op_request(
   for (_, thread_id) in &owners {
     *counts.entry(*thread_id).or_insert(0) += 1;
   }
+  // An op with no datum_ids (e.g. one that only ever fails an unknown-
+  // name lookup) has no owner to pick a destination from — thread 0 is
+  // as good as any since no cache entry will be touched.
   let destination = *counts
     .iter()
     .max_by_key(|(thread_id, count)| (**count, std::cmp::Reverse(thread_id.0)))
     .map(|(thread_id, _)| thread_id)
-    .expect("datum_ids (and therefore owners/counts) is non-empty for a well-formed op request");
+    .unwrap_or(&ThreadId(0));
 
   for (id, (_, thread_id)) in datum_ids.iter().zip(owners.iter()) {
     if *thread_id != destination {
