@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use seisin_core::authority::{NodeId, ThreadId};
@@ -22,6 +22,7 @@ use seisin_ops::registry::OpRegistry;
 use seisin_ring::ring::Ring;
 
 use crate::collation::{AcquireOutcome, NativeLock};
+use crate::peer_link::{PeerLink, PeerLinkRegistry};
 
 pub(crate) enum WorkerMessage {
   /// A client's `Request::Op`, assigned to this thread as its
@@ -34,27 +35,25 @@ pub(crate) enum WorkerMessage {
     reply: Sender<Result<Vec<u8>, String>>,
   },
   /// Sent to whichever thread is native home for `datum_id`, requesting
-  /// the lock on behalf of `op_id`. `requester_inbox` is where the
-  /// grant (`AcquireGranted`) is posted once available — always a
-  /// local `WorkerMessage` sender in this plan (cross-node requesters
-  /// are a later sub-project).
+  /// the lock on behalf of `op_id`. `reply` is where the grant
+  /// (`AcquireGranted`) is posted once available — a local
+  /// `WorkerMessage` send for a same-node requester, or a peer-link
+  /// response for a requester on a different node.
   Acquire {
     op_id: DatumId,
     datum_id: DatumId,
     requester_node: NodeId,
     requester_thread: ThreadId,
-    requester_inbox: Sender<WorkerMessage>,
+    reply: AcquireReply,
   },
   /// Posted into the requesting thread's own inbox once its `Acquire`
   /// is granted (immediately, or after a wait/recall).
   AcquireGranted { op_id: DatumId, datum_id: DatumId },
   /// Sent by native home to whoever currently holds `datum_id`, asking
-  /// it to evict and release. `native_home_inbox` is where the
-  /// resulting `Release` is sent once done.
-  Recall {
-    datum_id: DatumId,
-    native_home_inbox: Sender<WorkerMessage>,
-  },
+  /// it to evict and release. `reply` is where the resulting `Release`
+  /// ack is sent once done — same local/remote distinction as
+  /// `Acquire`'s `reply`.
+  Recall { datum_id: DatumId, reply: RecallReply },
   /// Tells native home that whoever held `datum_id` is done with it
   /// (normal op completion, or a recall's evict-and-ack) — grants it to
   /// the oldest waiter, if any.
@@ -62,6 +61,47 @@ pub(crate) enum WorkerMessage {
   /// Evicts every cached entry `is_native` rejects — used after a ring
   /// mutation; unrelated to op collation.
   EvictNonNative(Arc<dyn Fn(DatumId) -> bool + Send + Sync>),
+}
+
+/// Where an `Acquire`'s eventual grant should be delivered — a local
+/// `WorkerMessage` send for a same-node requester, or a peer-link
+/// response for a requester on a different node.
+pub(crate) enum AcquireReply {
+  Local(Sender<WorkerMessage>),
+  Remote(Arc<PeerLink>, u64),
+}
+
+impl AcquireReply {
+  fn grant(self, op_id: DatumId, datum_id: DatumId) {
+    match self {
+      AcquireReply::Local(inbox) => {
+        let _ = inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
+      }
+      AcquireReply::Remote(link, correlation_id) => {
+        link.respond(correlation_id, seisin_protocol::Response::Granted);
+      }
+    }
+  }
+}
+
+/// Where a `Recall`'s eventual ack should be delivered — same shape as
+/// `AcquireReply`, for the same reason.
+pub(crate) enum RecallReply {
+  Local(Sender<WorkerMessage>),
+  Remote(Arc<PeerLink>, u64),
+}
+
+impl RecallReply {
+  fn ack(self, datum_id: DatumId) {
+    match self {
+      RecallReply::Local(inbox) => {
+        let _ = inbox.send(WorkerMessage::Release { datum_id });
+      }
+      RecallReply::Remote(link, correlation_id) => {
+        link.respond(correlation_id, seisin_protocol::Response::Released);
+      }
+    }
+  }
 }
 
 struct OpRecord {
@@ -95,6 +135,7 @@ impl WorkerHandle {
     ops: Arc<OpRegistry>,
     ring: Arc<RwLock<Ring>>,
     self_node_id: NodeId,
+    peer_links: Arc<StdMutex<PeerLinkRegistry>>,
   ) -> Self {
     let join_sender = sender.clone();
     let join = thread::spawn(move || {
@@ -126,6 +167,7 @@ impl WorkerHandle {
               send_acquire(
                 &ring,
                 &peers,
+                &peer_links,
                 op_id,
                 datum_id,
                 self_node_id,
@@ -140,18 +182,33 @@ impl WorkerHandle {
             datum_id,
             requester_node,
             requester_thread,
-            requester_inbox,
+            reply,
           } => {
             let lock = native_locks.entry(datum_id).or_default();
             let on_granted = Box::new(move || {
-              let _ = requester_inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
+              reply.grant(op_id, datum_id);
             });
             let outcome = lock.request(op_id, requester_node, requester_thread, on_granted);
             if let AcquireOutcome::RecallNeeded(holder) = outcome {
-              let _ = peers[holder.thread_id.0 as usize].send(WorkerMessage::Recall {
-                datum_id,
-                native_home_inbox: join_sender.clone(),
-              });
+              let recall_reply = RecallReply::Local(join_sender.clone());
+              if holder.node_id == self_node_id {
+                let _ = peers[holder.thread_id.0 as usize].send(WorkerMessage::Recall {
+                  datum_id,
+                  reply: recall_reply,
+                });
+              } else {
+                let link = peer_links.lock().unwrap().get(holder.node_id);
+                let self_sender = join_sender.clone();
+                link.call(
+                  holder.thread_id,
+                  seisin_protocol::Request::Recall { datum_id },
+                  Box::new(move |response| {
+                    if matches!(response, seisin_protocol::Response::Released) {
+                      let _ = self_sender.send(WorkerMessage::Release { datum_id });
+                    }
+                  }),
+                );
+              }
             }
           }
           WorkerMessage::AcquireGranted { op_id, datum_id } => {
@@ -161,10 +218,7 @@ impl WorkerHandle {
             }
             try_run_if_ready(op_id, &mut op_records, &mut cache, &ops, &ring, &peers);
           }
-          WorkerMessage::Recall {
-            datum_id,
-            native_home_inbox,
-          } => {
+          WorkerMessage::Recall { datum_id, reply } => {
             cache.invalidate(datum_id);
             let mut wounded_op_id = None;
             for (op_id, record) in op_records.iter_mut() {
@@ -175,11 +229,12 @@ impl WorkerHandle {
                 break;
               }
             }
-            let _ = native_home_inbox.send(WorkerMessage::Release { datum_id });
+            reply.ack(datum_id);
             if let Some(op_id) = wounded_op_id {
               send_acquire(
                 &ring,
                 &peers,
+                &peer_links,
                 op_id,
                 datum_id,
                 self_node_id,
@@ -257,20 +312,39 @@ impl WorkerHandle {
 fn send_acquire(
   ring: &Arc<RwLock<Ring>>,
   peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
   op_id: DatumId,
   datum_id: DatumId,
   self_node_id: NodeId,
   self_thread_id: ThreadId,
   requester_inbox: Sender<WorkerMessage>,
 ) {
-  let (_, native_thread) = ring.read().unwrap().native(datum_id);
-  let _ = peers[native_thread.0 as usize].send(WorkerMessage::Acquire {
-    op_id,
-    datum_id,
-    requester_node: self_node_id,
-    requester_thread: self_thread_id,
-    requester_inbox,
-  });
+  let (native_node, native_thread) = ring.read().unwrap().native(datum_id);
+  if native_node == self_node_id {
+    let _ = peers[native_thread.0 as usize].send(WorkerMessage::Acquire {
+      op_id,
+      datum_id,
+      requester_node: self_node_id,
+      requester_thread: self_thread_id,
+      reply: AcquireReply::Local(requester_inbox),
+    });
+  } else {
+    let link = peer_links.lock().unwrap().get(native_node);
+    link.call(
+      native_thread,
+      seisin_protocol::Request::Acquire {
+        op_id,
+        datum_id,
+        requester_node: self_node_id,
+        requester_thread: self_thread_id,
+      },
+      Box::new(move |response| {
+        if matches!(response, seisin_protocol::Response::Granted) {
+          let _ = requester_inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
+        }
+      }),
+    );
+  }
 }
 
 /// If `op_id`'s record has nothing left to acquire, runs it, replies,
@@ -316,6 +390,18 @@ mod tests {
 
   use seisin_core::store::InMemoryStore;
 
+  use crate::peer_link::PeerLinkRegistry;
+
+  fn empty_peer_links() -> Arc<StdMutex<PeerLinkRegistry>> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    PeerLinkRegistry::start(
+      listener,
+      NodeId(1),
+      Arc::new(HashMap::new()),
+      Arc::new(|_thread, _request, _link, _cid| {}),
+    )
+  }
+
   /// Spawns `thread_count` interconnected `WorkerHandle`s sharing one
   /// store, ring, and op registry — a minimal in-process pool, built by
   /// hand here since `pool.rs` doesn't exist in this shape yet (Task 4).
@@ -326,6 +412,7 @@ mod tests {
   ) -> Vec<WorkerHandle> {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
     let ops = Arc::new(ops);
+    let peer_links = empty_peer_links();
     let mut senders = Vec::with_capacity(thread_count as usize);
     let mut receivers = Vec::with_capacity(thread_count as usize);
     for _ in 0..thread_count {
@@ -347,6 +434,7 @@ mod tests {
           Arc::clone(&ops),
           Arc::clone(&ring),
           NodeId(1),
+          Arc::clone(&peer_links),
         )
       })
       .collect()
