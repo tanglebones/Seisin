@@ -53,6 +53,15 @@ Explicitly out of scope / deferred:
   rewriting against equivalent registered ops as part of this plan's
   task list — noted here so it isn't a surprise mid-implementation.
 
+This spec is implemented across two plans: **Part 1** covers everything
+above except genuine cross-node communication — wire unification and
+the full acquire/wound-wait mechanics, proven via contention *within
+one node's threads* (cross-node acquisition stays explicitly rejected,
+same as 3a). **Part 2** adds the peer-link connection layer, real
+cross-node acquisition, and — since only Part 2 introduces a scenario
+where one node can crash while another stays alive — "Crash Detection &
+Lock Release" below.
+
 ## Why Get/Put/Delete Disappear as Wire Variants
 
 Retiring them isn't just cosmetic. Once every request must acquire its
@@ -250,10 +259,72 @@ existing one-shot client-connection protocol (`read_frame`/
 it's strictly one-at-a-time) is untouched.
 
 If a peer-link drops, every pending correlation id on it fails with an
-error — this propagates back exactly like today's "relay/forward
-failed" case, which the existing lazy-reclaim philosophy already
-covers (native home just reclaims and reloads from storage on next
-access). No new failure-handling concept is needed.
+error — this is one of the two triggers "Crash Detection & Lock
+Release" below relies on to reclaim a lock whose holder is gone; see
+that section for the full mechanism (a bare "propagate the error" isn't
+sufficient on its own — see why there).
+
+## Crash Detection & Lock Release
+
+Once locks and acquisitions cross node boundaries, a crashed node can
+leave state stuck on nodes that are still alive. Three distinct
+failure surfaces need covering — this section is entirely **Part 2**
+scope (it requires the peer-link and cross-node acquisition to exist);
+Part 1 (same-node only, single process) has no partial-crash scenario
+to cover, since a crash there takes native home and every holder down
+together.
+
+**1. A lock's holder-node crashes.** Native home's `current_holder`
+now names a node that's gone; without a fix, the datum is stuck
+forever, and anyone who later needs it queues behind a holder that
+will never release it. Two complementary mechanisms:
+- **Proactive**: gossip's existing SWIM failure detector already
+  confirms node death and drives a `RingMutation::Leave`, which
+  `gossip_state.rs`'s `apply_ready_mutations` already turns into a
+  `pool.evict_non_native(...)` cache-eviction broadcast. Extend this
+  with a parallel broadcast — e.g. `pool.release_locks_held_by(node_id)`
+  — telling every worker thread: for every datum it's native home for,
+  if `current_holder.node_id == node_id`, release it immediately
+  (granting to the next waiter, if any); and separately, prune any
+  *waiters* in that datum's queue whose `node_id == node_id` too (a
+  dead node's own pending requests are equally moot and would otherwise
+  eventually get granted a lock nobody will ever use). This fixes the
+  common case immediately, cluster-wide, without waiting for anyone to
+  actually need that specific datum again.
+- **Reactive backstop**: for the gap between an actual crash and gossip
+  confirming it (SWIM's suspicion timeout isn't instant), a `Recall`
+  whose peer-link call fails outright (connection error) is treated as
+  an immediate release — native home proceeds exactly as if the
+  recall's ack had arrived, rather than waiting on a call that will
+  never resolve. This is why the peer-link section's old "the error
+  just propagates" note wasn't sufficient by itself: propagating the
+  error nowhere is not the same as *treating it as a release* — this
+  reactive path is the specific behavior that closes the gap.
+
+**2. A collating thread's in-flight `Acquire` targets a node that's
+gone.** Whether from a peer-link error or from noticing (via the ring,
+already updated by gossip) that the target no longer exists, the
+requester doesn't just hang: it re-resolves `ring.native(datum_id)`
+against the *current* ring — which will already have shifted the slot
+elsewhere once gossip has caught up — and retries, bounded by a fixed
+attempt cap (mirroring the existing lazy-reclaim philosophy of
+"retry against current state" rather than trusting stale routing).
+Exceeding the cap fails that specific `Acquire` outright rather than
+retrying forever.
+
+**3. The op fails back to its client instead of hanging.** An
+`Acquire` that exceeds its retry cap doesn't just leave the op's
+`still_needed` list stuck — it fails the *whole* op: every datum
+already in `acquired` for that op_id is released (unlike a wound, which
+loses only the one contended datum and keeps going, an acquire-failure
+abandons the entire attempt), and an `OpError` is sent through the
+op's `reply` channel. If the client's own connection happens to be to
+the node where the crash occurred, it would already see this via the
+ordinary connection-drop path (no special handling needed); this
+mechanism specifically covers the case where the *coordinating* node is
+healthy but a *dependency* (a remote native home or holder) isn't, so
+the client — still connected to a live node — gets an actual error
+response instead of an indefinite hang.
 
 ## Testing Strategy
 
@@ -279,6 +350,22 @@ access). No new failure-handling concept is needed.
 - **Peer-link failure**: a dropped connection fails in-flight calls
   cleanly rather than hanging; a subsequent call successfully
   re-establishes the connection.
+- **Proactive lock release on confirmed node death**: a node holding a
+  lock is killed; once gossip confirms it dead, the lock releases (and
+  grants to any waiter) without requiring a new request to trigger it.
+- **Reactive release-on-failed-recall**: a recall's peer-link call
+  errors out; the lock releases immediately rather than waiting on an
+  ack that will never come.
+- **Bounded acquire retry against a moved slot**: an `Acquire` in
+  flight to a node that dies gets retried against the ring once gossip
+  reassigns that datum's native home elsewhere, and succeeds — proving
+  the retry-against-current-state path actually recovers, not just
+  fails cleanly.
+- **Op failure on exhausted retries**: an `Acquire` whose target never
+  comes back (retries exhausted) fails the whole op with `OpError`,
+  releasing whatever it had already acquired — verified by checking
+  those datums become available to a different op afterward, not stuck
+  as orphaned holds.
 - Existing 3a tests get rewritten against equivalent registered ops in
   place of the retired `Get`/`Put`/`Delete` variants.
 
