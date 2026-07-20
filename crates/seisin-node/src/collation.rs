@@ -103,6 +103,21 @@ impl NativeLock {
     self.grant_front();
   }
 
+  /// `node_id` is confirmed dead: releases it as the current holder if
+  /// it was one (granting to the next surviving waiter, if any), and
+  /// prunes any of its own still-queued waiters first, so a dead node's
+  /// pending request is never later handed a grant nobody will use.
+  pub fn handle_node_death(&mut self, node_id: NodeId) {
+    self.waiters.retain(|w| w.node_id != node_id);
+    if self
+      .current_holder
+      .as_ref()
+      .is_some_and(|h| h.node_id == node_id)
+    {
+      self.release();
+    }
+  }
+
   fn grant_front(&mut self) {
     if let Some(waiter) = self.waiters.pop_front() {
       self.current_holder = Some(Holder {
@@ -267,5 +282,121 @@ mod tests {
     let mut lock = NativeLock::new();
     lock.release();
     assert_eq!(lock.current_holder(), None);
+  }
+
+  #[test]
+  fn handle_node_death_releases_the_current_holder_from_that_node() {
+    let mut lock = NativeLock::new();
+    let (tx, _rx) = mpsc::channel();
+    let holder_op = DatumId::new();
+    lock.request(
+      holder_op,
+      NodeId(1),
+      ThreadId(0),
+      Box::new(move || {
+        let _ = tx.send(());
+      }),
+    );
+    assert!(lock.current_holder().is_some());
+
+    lock.handle_node_death(NodeId(1));
+    assert_eq!(lock.current_holder(), None);
+  }
+
+  #[test]
+  fn handle_node_death_grants_to_a_surviving_waiter() {
+    let mut lock = NativeLock::new();
+    let (tx_holder, _rx_holder) = mpsc::channel();
+    let holder_op = DatumId::new();
+    lock.request(
+      holder_op,
+      NodeId(1),
+      ThreadId(0),
+      Box::new(move || {
+        let _ = tx_holder.send(());
+      }),
+    );
+
+    let (tx_waiter, rx_waiter) = mpsc::channel();
+    let waiter_op = DatumId::new(); // created after holder_op, sorts younger
+    lock.request(
+      waiter_op,
+      NodeId(2),
+      ThreadId(0),
+      Box::new(move || {
+        let _ = tx_waiter.send(());
+      }),
+    );
+    assert!(rx_waiter.try_recv().is_err());
+
+    lock.handle_node_death(NodeId(1));
+    assert!(
+      rx_waiter.try_recv().is_ok(),
+      "the surviving waiter should be granted once the dead holder is released"
+    );
+    assert_eq!(
+      lock.current_holder(),
+      Some(&Holder {
+        node_id: NodeId(2),
+        thread_id: ThreadId(0),
+        op_id: waiter_op
+      })
+    );
+  }
+
+  #[test]
+  fn handle_node_death_prunes_that_nodes_own_queued_waiters() {
+    let mut lock = NativeLock::new();
+    let (tx_holder, _rx_holder) = mpsc::channel();
+    let holder_op = DatumId::new();
+    lock.request(
+      holder_op,
+      NodeId(1),
+      ThreadId(0),
+      Box::new(move || {
+        let _ = tx_holder.send(());
+      }),
+    );
+
+    // A waiter from the node that's about to die — should be pruned,
+    // not granted, even though it would otherwise be next in line.
+    let (tx_dead_waiter, rx_dead_waiter) = mpsc::channel();
+    let dead_waiter_op = DatumId::new();
+    lock.request(
+      dead_waiter_op,
+      NodeId(2),
+      ThreadId(0),
+      Box::new(move || {
+        let _ = tx_dead_waiter.send(());
+      }),
+    );
+
+    // A later, still-alive waiter.
+    let (tx_alive_waiter, rx_alive_waiter) = mpsc::channel();
+    let alive_waiter_op = DatumId::new();
+    lock.request(
+      alive_waiter_op,
+      NodeId(3),
+      ThreadId(0),
+      Box::new(move || {
+        let _ = tx_alive_waiter.send(());
+      }),
+    );
+
+    lock.handle_node_death(NodeId(2));
+    assert!(
+      rx_dead_waiter.try_recv().is_err(),
+      "a waiter from the dead node must never be granted"
+    );
+    assert!(
+      rx_alive_waiter.try_recv().is_err(),
+      "the current holder (node 1) is still alive, so nothing should be granted yet"
+    );
+
+    lock.handle_node_death(NodeId(1));
+    assert!(
+      rx_alive_waiter.try_recv().is_ok(),
+      "once the holder dies too, the surviving waiter should be granted"
+    );
   }
 }
