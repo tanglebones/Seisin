@@ -291,7 +291,12 @@ fn try_run_if_ready(
   }
   let record = op_records.remove(&op_id).unwrap();
   let mut ctx = OpContext::new(cache);
-  let result = ops.invoke(&record.op_name, &mut ctx, &record.datum_ids, &record.payload);
+  let result = ops.invoke(
+    &record.op_name,
+    &mut ctx,
+    &record.datum_ids,
+    &record.payload,
+  );
   let _ = record.reply.send(result);
   for datum_id in record.acquired {
     // This thread is done with the datum — evict its own cache entry

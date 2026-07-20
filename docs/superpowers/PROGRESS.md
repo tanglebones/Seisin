@@ -42,17 +42,55 @@ commit and push immediately, since work sessions may end abruptly.
   `integration_op_collation.rs`: an op moving content between two datums
   natively owned by different local threads on a single 4-thread node.
 
-As of this entry: 8 crates, 127 tests passing, `cargo fmt --check` and
+- **Sub-project 3b, Part 1 — Wire unification & same-node wound-wait.**
+  `Request` collapsed to a single `Op { op_id, op_name, datum_ids,
+  payload }` variant — `Get`/`Put`/`Delete` retired as wire opcodes
+  (they're just trivially-registered ops now, no different in kind from
+  any domain op). Every op carries a client-generated `op_id` (UUIDv7,
+  now `Ord`) used for wound-wait priority. New `collation::NativeLock`:
+  each datum's native-home thread is the sole, permanent lock manager
+  for it (current holder + an op_id-ordered wait queue), never
+  delegating to whoever currently holds it — recall on an older
+  request, queue on a younger one, oldest-first grants on release.
+  `worker.rs` reworked so every thread tracks its own in-flight op
+  records (`still_needed`/`acquired`/original `datum_ids` order) and
+  drives collation via non-blocking messages (`Acquire`/
+  `AcquireGranted`/`Recall`/`Release`) to itself and its local peers —
+  no thread ever blocks waiting on another. `server.rs`'s dispatch
+  unifies single-datum and multi-datum routing: all-native runs
+  locally, all-one-other-node redirects, genuinely cross-node rejects
+  (that's Part 2). Proven end-to-end by `integration_wound_wait.rs`:
+  the classic two-op cycle (op1 needs `a,b`; op2 needs `b,a`, opposite
+  acquisition order) resolves without deadlock over real TCP on a
+  single 4-thread node.
+
+  Found and fixed two real concurrency bugs while stress-testing this
+  (both were flaky ~30% of the time before the fixes, not caught by a
+  single test run): (1) an op's acquired-datums list was ordered by
+  grant-arrival time instead of the caller's original order, causing
+  op functions to read/write the wrong positional ids when one grant
+  was a fast self-send and another a slower cross-thread round trip;
+  (2) releasing a datum only updated lock bookkeeping, never evicted
+  any cache entry, so a thread that had cached a value from an earlier
+  direct use could keep serving that stale value after granting the
+  datum away and getting it back, ignoring whatever the interim holder
+  wrote or deleted via storage.
+
+As of this entry: 8 crates, 120 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
 ## In progress
 
-- **Sub-project 3b — Cross-node transfer & wound-wait contention.** Not
-  yet planned. Needs: reusing the client protocol for cross-node datum
-  transfer (per the design doc), and a wound-wait scheme using
-  client-generated UUIDv7 ids to break contention livelock/deadlock
-  without a centralized transaction manager.
+- **Sub-project 3b, Part 2 — Peer-link & real cross-node acquisition.**
+  Not yet planned. Needs: the multiplexed server-to-server connection
+  layer (one persistent connection per node pair, correlation-id
+  routing so many local threads can share it), wiring `Acquire`/
+  `Recall` across real node boundaries, and the crash-detection/lock-
+  release mechanics already designed in the spec (proactive release on
+  gossip-confirmed node death, reactive release on a failed recall,
+  bounded acquire retry against a moved ring slot, failing an op back
+  to its client on exhausted retries).
 
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-

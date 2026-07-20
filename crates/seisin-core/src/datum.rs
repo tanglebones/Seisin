@@ -52,6 +52,9 @@ mod tests {
   fn ordering_matches_creation_order() {
     let first = DatumId::new();
     let second = DatumId::new();
-    assert!(first < second, "a later-created UUIDv7 id must sort greater");
+    assert!(
+      first < second,
+      "a later-created UUIDv7 id must sort greater"
+    );
   }
 }

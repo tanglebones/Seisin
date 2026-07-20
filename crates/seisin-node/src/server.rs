@@ -12,7 +12,9 @@ use std::thread;
 
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
-use seisin_protocol::{decode_request, encode_response, read_frame, write_frame, Request, Response};
+use seisin_protocol::{
+  decode_request, encode_response, read_frame, write_frame, Request, Response,
+};
 use seisin_ring::ring::Ring;
 
 use crate::pool::WorkerPool;
@@ -82,6 +84,7 @@ fn handle_connection(
 /// mechanism a single-datum request used before 3b, just generalized).
 /// If they're spread across more than one node, rejects — cross-node
 /// collation is a later sub-project.
+#[allow(clippy::too_many_arguments)]
 fn handle_op_request(
   self_node_id: NodeId,
   ring: &Arc<RwLock<Ring>>,
