@@ -67,6 +67,13 @@ pub(crate) enum WorkerMessage {
 struct OpRecord {
   op_name: String,
   payload: Vec<u8>,
+  /// The caller's original datum_ids, in the order it specified them —
+  /// preserved separately from `acquired` (below) because grants can
+  /// arrive in a different order (e.g. a same-thread self-grant beats a
+  /// cross-thread one), and an op function indexes its `ids` parameter
+  /// positionally, so invocation must use the caller's order, not
+  /// arrival order.
+  datum_ids: Vec<DatumId>,
   still_needed: Vec<DatumId>,
   acquired: Vec<DatumId>,
   reply: Sender<Result<Vec<u8>, String>>,
@@ -109,6 +116,7 @@ impl WorkerHandle {
               OpRecord {
                 op_name,
                 payload,
+                datum_ids: datum_ids.clone(),
                 still_needed: datum_ids.clone(),
                 acquired: Vec::new(),
                 reply,
@@ -181,6 +189,15 @@ impl WorkerHandle {
             }
           }
           WorkerMessage::Release { datum_id } => {
+            // Evict native home's own cache entry, if any — it may
+            // still hold a value cached from before the datum was
+            // handed away, now stale (whoever held it may have
+            // mutated or deleted it via storage, which this thread's
+            // cache was never told about). The next grantee (possibly
+            // this same thread again, via grant_front below) must
+            // cache-miss through to storage rather than see a stale
+            // hit.
+            cache.invalidate(datum_id);
             if let Some(lock) = native_locks.get_mut(&datum_id) {
               lock.release();
             }
@@ -274,9 +291,14 @@ fn try_run_if_ready(
   }
   let record = op_records.remove(&op_id).unwrap();
   let mut ctx = OpContext::new(cache);
-  let result = ops.invoke(&record.op_name, &mut ctx, &record.acquired, &record.payload);
+  let result = ops.invoke(&record.op_name, &mut ctx, &record.datum_ids, &record.payload);
   let _ = record.reply.send(result);
   for datum_id in record.acquired {
+    // This thread is done with the datum — evict its own cache entry
+    // (whether or not it was this datum's native home) so it never
+    // serves a stale value from a future use, then tell native home
+    // it's free to grant elsewhere.
+    cache.invalidate(datum_id);
     let (_, thread_id) = ring.read().unwrap().native(datum_id);
     let _ = peers[thread_id.0 as usize].send(WorkerMessage::Release { datum_id });
   }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use seisin_core::authority::NodeId;
@@ -8,8 +8,25 @@ use seisin_core::datum::DatumId;
 use seisin_core::store::InMemoryStore;
 use seisin_node::pool::WorkerPool;
 use seisin_node::server::serve;
+use seisin_ops::registry::OpRegistry;
 use seisin_protocol::{Request, Response};
 use seisin_ring::ring::Ring;
+
+fn build_registry() -> OpRegistry {
+  let mut ops = OpRegistry::new();
+  ops.register(
+    "put",
+    Box::new(|ctx, ids, payload| {
+      ctx.put(ids[0], payload.to_vec());
+      vec![]
+    }),
+  );
+  ops.register(
+    "get",
+    Box::new(|ctx, ids, _payload| ctx.get(ids[0]).unwrap_or_default()),
+  );
+  ops
+}
 
 fn start_two_node_cluster() -> (String, String) {
   let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -19,10 +36,7 @@ fn start_two_node_cluster() -> (String, String) {
 
   let node_a = NodeId(1);
   let node_b = NodeId(2);
-  let ring = Arc::new(std::sync::RwLock::new(Ring::from_members(&[
-    (node_a, 2),
-    (node_b, 2),
-  ])));
+  let ring = Arc::new(RwLock::new(Ring::from_members(&[(node_a, 2), (node_b, 2)])));
 
   let mut address_book = HashMap::new();
   address_book.insert(node_a, addr_a.clone());
@@ -32,12 +46,16 @@ fn start_two_node_cluster() -> (String, String) {
   let pool_a = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     2,
-    Arc::new(seisin_ops::registry::OpRegistry::new()),
+    Arc::new(build_registry()),
+    Arc::clone(&ring),
+    node_a,
   ));
   let pool_b = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     2,
-    Arc::new(seisin_ops::registry::OpRegistry::new()),
+    Arc::new(build_registry()),
+    Arc::clone(&ring),
+    node_b,
   ));
 
   {
@@ -65,19 +83,27 @@ fn put_and_get_route_correctly_across_two_nodes_regardless_of_entry_point() {
     // Always PUT via node A's address, regardless of who actually owns it.
     let put_resp = seisin_client::call(
       &addr_a,
-      Request::Put {
-        id,
-        content: content.clone(),
+      Request::Op {
+        op_id: DatumId::new(),
+        op_name: "put".to_string(),
+        datum_ids: vec![id],
+        payload: content.clone(),
       },
     )
     .unwrap();
-    assert_eq!(put_resp, Response::Ok);
+    assert_eq!(put_resp, Response::OpResult { payload: vec![] });
 
     // Always GET via node B's address.
-    let get_resp = seisin_client::call(&addr_b, Request::Get { id }).unwrap();
-    match get_resp {
-      Response::Value { content: got, .. } => assert_eq!(got, content),
-      other => panic!("expected Value, got {other:?}"),
-    }
+    let get_resp = seisin_client::call(
+      &addr_b,
+      Request::Op {
+        op_id: DatumId::new(),
+        op_name: "get".to_string(),
+        datum_ids: vec![id],
+        payload: vec![],
+      },
+    )
+    .unwrap();
+    assert_eq!(get_resp, Response::OpResult { payload: content });
   }
 }

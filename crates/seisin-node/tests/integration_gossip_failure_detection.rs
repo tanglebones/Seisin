@@ -13,6 +13,7 @@ use seisin_node::gossip_server::serve_gossip;
 use seisin_node::gossip_state::GossipState;
 use seisin_node::pool::WorkerPool;
 use seisin_node::server::serve;
+use seisin_ops::registry::OpRegistry;
 use seisin_protocol::{Request, Response};
 use seisin_ring::ring::Ring;
 
@@ -52,10 +53,20 @@ fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String)]) {
     }
   }
 
+  let mut ops = OpRegistry::new();
+  ops.register(
+    "put",
+    Box::new(|ctx, ids, payload| {
+      ctx.put(ids[0], payload.to_vec());
+      vec![]
+    }),
+  );
   let pool = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     this.1,
-    Arc::new(seisin_ops::registry::OpRegistry::new()),
+    Arc::new(ops),
+    Arc::clone(&ring),
+    node_id,
   ));
 
   {
@@ -139,16 +150,18 @@ fn a_node_that_stops_responding_on_gossip_is_eventually_removed_from_the_ring() 
     let id = DatumId::new();
     let response = seisin_client::call(
       &addr_a,
-      Request::Put {
-        id,
-        content: b"x".to_vec(),
+      Request::Op {
+        op_id: DatumId::new(),
+        op_name: "put".to_string(),
+        datum_ids: vec![id],
+        payload: b"x".to_vec(),
       },
     )
     .unwrap();
     assert_eq!(
       response,
-      Response::Ok,
-      "expected a direct Ok, not a Redirect, once node B is removed from the ring"
+      Response::OpResult { payload: vec![] },
+      "expected a direct OpResult, not a Redirect, once node B is removed from the ring"
     );
   }
 }

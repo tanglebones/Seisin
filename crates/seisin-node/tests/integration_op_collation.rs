@@ -36,11 +36,24 @@ fn start_single_node_server() -> String {
       content
     }),
   );
+  ops.register(
+    "put",
+    Box::new(|ctx, ids, payload| {
+      ctx.put(ids[0], payload.to_vec());
+      vec![]
+    }),
+  );
+  ops.register(
+    "get",
+    Box::new(|ctx, ids, _payload| ctx.get(ids[0]).unwrap_or_default()),
+  );
 
   let pool = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
     4,
     Arc::new(ops),
+    Arc::clone(&ring),
+    node_id,
   ));
 
   thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
@@ -56,9 +69,11 @@ fn an_op_collates_datums_natively_owned_by_different_local_threads() {
 
   seisin_client::call(
     &addr,
-    Request::Put {
-      id: from,
-      content: b"payload".to_vec(),
+    Request::Op {
+      op_id: DatumId::new(),
+      op_name: "put".to_string(),
+      datum_ids: vec![from],
+      payload: b"payload".to_vec(),
     },
   )
   .unwrap();
@@ -66,6 +81,7 @@ fn an_op_collates_datums_natively_owned_by_different_local_threads() {
   let response = seisin_client::call(
     &addr,
     Request::Op {
+      op_id: DatumId::new(),
       op_name: "move_content".to_string(),
       datum_ids: vec![from, to],
       payload: vec![],
@@ -84,12 +100,31 @@ fn an_op_collates_datums_natively_owned_by_different_local_threads() {
   // ack already proven in earlier sub-projects; this confirms the op
   // path exercises the same Cache/Store underneath).
   assert_eq!(
-    seisin_client::call(&addr, Request::Get { id: from }).unwrap(),
-    Response::NotFound
+    seisin_client::call(
+      &addr,
+      Request::Op {
+        op_id: DatumId::new(),
+        op_name: "get".to_string(),
+        datum_ids: vec![from],
+        payload: vec![],
+      }
+    )
+    .unwrap(),
+    Response::OpResult { payload: vec![] }
   );
-  match seisin_client::call(&addr, Request::Get { id: to }).unwrap() {
-    Response::Value { content, .. } => assert_eq!(content, b"payload"),
-    other => panic!("expected Value, got {other:?}"),
+  match seisin_client::call(
+    &addr,
+    Request::Op {
+      op_id: DatumId::new(),
+      op_name: "get".to_string(),
+      datum_ids: vec![to],
+      payload: vec![],
+    },
+  )
+  .unwrap()
+  {
+    Response::OpResult { payload } => assert_eq!(payload, b"payload"),
+    other => panic!("expected OpResult, got {other:?}"),
   }
 }
 
@@ -99,6 +134,7 @@ fn an_unknown_op_name_returns_an_op_error() {
   let response = seisin_client::call(
     &addr,
     Request::Op {
+      op_id: DatumId::new(),
       op_name: "does_not_exist".to_string(),
       datum_ids: vec![],
       payload: vec![],

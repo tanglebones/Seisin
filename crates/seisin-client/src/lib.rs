@@ -57,19 +57,28 @@ mod tests {
     addr
   }
 
+  fn sample_op() -> Request {
+    Request::Op {
+      op_id: DatumId::new(),
+      op_name: "noop".to_string(),
+      datum_ids: vec![DatumId::new()],
+      payload: vec![],
+    }
+  }
+
   #[test]
   fn returns_the_response_directly_when_there_is_no_redirect() {
-    let addr = start_fake_server(vec![], Response::Ok);
-    let response = call(&addr, Request::Get { id: DatumId::new() }).unwrap();
-    assert_eq!(response, Response::Ok);
+    let addr = start_fake_server(vec![], Response::OpResult { payload: vec![] });
+    let response = call(&addr, sample_op()).unwrap();
+    assert_eq!(response, Response::OpResult { payload: vec![] });
   }
 
   #[test]
   fn follows_a_single_redirect() {
-    let final_addr = start_fake_server(vec![], Response::Ok);
-    let first_addr = start_fake_server(vec![final_addr], Response::Ok);
-    let response = call(&first_addr, Request::Get { id: DatumId::new() }).unwrap();
-    assert_eq!(response, Response::Ok);
+    let final_addr = start_fake_server(vec![], Response::OpResult { payload: vec![] });
+    let first_addr = start_fake_server(vec![final_addr], Response::OpResult { payload: vec![] });
+    let response = call(&first_addr, sample_op()).unwrap();
+    assert_eq!(response, Response::OpResult { payload: vec![] });
   }
 
   #[test]
@@ -88,7 +97,7 @@ mod tests {
         let _ = write_frame(&mut stream, &encode_response(&response));
       }
     });
-    let result = call(&addr, Request::Get { id: DatumId::new() });
+    let result = call(&addr, sample_op());
     assert!(result.is_err());
   }
 }
