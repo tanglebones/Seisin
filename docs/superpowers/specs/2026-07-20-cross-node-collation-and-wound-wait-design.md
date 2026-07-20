@@ -66,67 +66,73 @@ the same thing. `Request::Op` is genuinely the only shape needed.
 
 ## Acquire & Wound-Wait Mechanics
 
-Two places hold state, and neither is a separate new "coordinator"
-component — both live inside the existing per-thread worker loop
-(`worker.rs`), which now plays a dual role for any given datum
-depending on context:
+Exactly one place holds state per datum: the **native-home thread**
+(`ring.native(datum_id) == (self_node, self_thread)`). It is the
+permanent, sole lock-manager for every datum it's native for — it
+never delegates that decision to whoever currently holds the datum.
+This is a deliberate simplification over an earlier draft of this
+design that had holders track their own wait-queues and hand datums
+directly to each other ("chained forwarding"); since acquiring a datum
+never actually moves content (see "No Content In Transfer Messages"
+below), there's nothing gained by distributing the lock bookkeeping —
+centralizing it at native home removes a whole class of
+stale-pointer/forwarding-chain complexity for free, with no change to
+the wound-wait guarantee.
 
-- **Native-home role** (only meaningful when `ring.native(datum_id) ==
-  (self_node, self_thread)`): a single **authority pointer** — `Idle`
-  or `AwayAt(node, thread)`. The native-home thread never makes
-  priority decisions; it only ever answers "who currently has this."
-- **Current-holder role** (whenever this thread's cache currently holds
-  the datum — as its native home, or because it collated it in from
-  elsewhere): tracks *which op_id it's holding the datum for*, plus a
-  **wait-queue** of other requesters (`(op_id, reply-channel)` pairs)
-  for that specific datum.
+Native home tracks, per datum it's native for:
+- `current_holder: Option<{ node, thread, op_id }>` — who currently has
+  permission, and for which op.
+- `waiters: VecDeque<{ op_id, reply-channel }>` — other requesters
+  blocked on this datum, oldest-first by construction (see below).
 
-An `Acquire { op_id: R, datum_id }` arriving anywhere is handled as:
+An `Acquire { op_id: R, datum_id }` arriving at native home is handled
+as:
 
-- **At native home, `Idle`**: grant immediately (`Granted` — no
-  content; see "No Content In Transfer Messages" below), flip the
-  pointer to `AwayAt(requester)`.
-- **At native home, `AwayAt(X)`**: reply with a redirect naming *both*
-  `X`'s node address and its `ThreadId` — unlike the existing
-  client-facing `Redirect` (a bare address, since the receiving node
-  re-derives the right thread via `ring.native()`), a datum that's
-  away from its native home can't be re-derived that way, so the
-  target thread must be named explicitly. This is a distinct response
-  shape from client `Redirect` for that reason — e.g. `Response::
-  AwayAt { address, thread_id }` — even though the *behavior* (caller
-  reconnects/resends elsewhere) is the same idea. The requester
-  re-sends the same `Acquire` directly to that `(address, thread_id)`.
-  (Native home's pointer can go stale if a datum moves directly
-  between two non-native holders via a recall — see "Chained
-  Forwarding" below — but self-heals the next time the datum genuinely
-  returns to native home.)
-- **At the actual current holder, not busy**: grant immediately (covers
-  the brief window right after a grant, before some op has actually
-  started using it).
-- **At the actual current holder, busy holding it for op_id `H`**:
-  - **`R < H` (requester older): recall wins now.** Evict locally,
-    reply `Granted` directly to `R` — not routed back through native
-    home first (a direct hand-off between holders; see "Chained
-    Forwarding"). The *wounded* op (`H`) loses only this one datum, not
-    everything it holds — it keeps whatever else it's already
-    acquired (its op record's `acquired` list is untouched apart from
-    removing this one datum, which moves back into `still_needed`),
-    and its own collation loop just re-issues `Acquire` for it again. No
-    backoff needed: `H` can never be the older side of a future
-    collision against `R` specifically (R already won), so an
-    immediate retry can't reopen the same cycle. This is what
-    guarantees forward progress overall — every live contention set
-    has a strictly-oldest op_id that never gets wounded by anyone, so
-    it always eventually acquires everything it needs and completes,
-    at which point it releases and unblocks whoever's still waiting on
-    it.
+- **`current_holder` is `None`**: grant immediately (`Granted` — no
+  content; see below), set `current_holder = Some({self_node or
+  requester's node, requester's thread, R})`.
+- **`current_holder = Some({node, thread, H})`**:
+  - **`R < H` (requester older): recall wins.** Native home sends a
+    one-way `Recall { datum_id, requesting_op_id: R }` to `(node,
+    thread)` and waits (asynchronously — see "Node/Thread
+    Architecture" for how this avoids blocking) for its ack. The
+    recalled holder evicts its cache entry for the datum and marks its
+    own op record as having lost it (moving it from `acquired` back
+    into `still_needed`, to be re-acquired later — see below), then
+    acks. Only once native home receives that ack does it grant to
+    `R` and update `current_holder`. Waiting for the ack (rather than
+    granting speculatively) matters: if `H`'s op has already finished
+    collating and is mid-invocation when the recall arrives, the
+    recall just queues behind that in the holder's own inbox and
+    resolves once the invocation completes and releases normally —
+    granting to `R` before that ack would let `R` and `H`'s still-live
+    invocation race on the same datum.
   - **`R > H` (requester younger): enqueue and wait.** `(R,
-    reply-channel)` joins this datum's wait-queue. No polling — the
-    reply-channel is only ever written to once, when the datum is
-    actually handed over. When `H` finishes with the datum (op
-    completes normally, or `H` is itself later recalled by someone
-    even older), the datum goes to the *oldest* queued waiter, if any,
-    before falling back to `Idle`.
+    reply-channel)` is inserted into `waiters` in `op_id` order (a
+    younger request can arrive after an older one is already
+    queued — e.g. a third op joining after a recall — so insertion
+    sorts by `op_id` rather than assuming arrival order is priority
+    order). No polling — the reply-channel is only ever written to
+    once, when the datum is actually granted.
+
+When `current_holder`'s op releases the datum (its op finishes
+normally, or it's recalled and acks), native home grants it to the
+front of `waiters` if non-empty (removing that entry and setting it as
+the new `current_holder`), or clears `current_holder` back to `None`
+otherwise.
+
+The *wounded* op (`H`, on a recall) loses only this one datum, not
+everything it holds — it keeps whatever else it's already acquired
+(its op record's `acquired` list is untouched apart from removing this
+one datum, which moves back into `still_needed`), and its own
+collation loop just re-issues `Acquire` for it again once it notices
+the loss. No backoff needed: `H` can never be the older side of a
+future collision against `R` specifically (`R` already won), so an
+immediate retry can't reopen the same cycle. This is what guarantees
+forward progress overall — every live contention set has a
+strictly-oldest op_id that never gets wounded by anyone, so it always
+eventually acquires everything it needs and completes, at which point
+it releases and unblocks whoever's still waiting on it.
 
 This is why the classic two-op cycle (op1 needs `a,b`; op2 needs `b,a`;
 each grabs one first) can't deadlock: whichever op is older always
@@ -137,30 +143,16 @@ op's *business logic* runs first, and none is needed.
 
 ### No Content In Transfer Messages
 
-`Acquire`'s grant and `Recall`'s release carry no datum content —
+`Acquire`'s grant and `Recall`'s ack carry no datum content —
 write-through-before-ack already guarantees anything mutated is
 durable in storage before its op's response is ever acknowledged, so
 releasing a datum is just "evict my cache entry, stop claiming it."
 Whoever is granted next simply cache-misses through to storage on
 first actual access, exactly like 3a's existing `evict_non_native`
 reload path. This is a real simplification over a design that ships
-bytes peer-to-peer on every hand-off.
-
-### Chained Forwarding
-
-A recall hands a datum directly from the old holder to the new
-requester without routing back through native home — native home's
-`AwayAt` pointer still names the *old* holder until the datum
-eventually returns there naturally (op completes with no one waiting,
-or gets recalled by someone even older who then finishes and releases
-toward native home). A third request arriving at native home in the
-meantime gets redirected to the stale old holder, which itself now
-needs to remember briefly "I gave this to X" so it can forward that
-third request onward, rather than only being able to say "I don't have
-it anymore." This is the same kind of best-effort, self-healing
-forwarding chain the system already leans on elsewhere (lazy crash
-reclaim, redirect-based client routing) rather than requiring instant
-global consistency on every hop.
+bytes peer-to-peer on every hand-off, and it's also what makes
+centralizing the lock at native home free of a data-movement cost:
+native home was never in the data path to begin with.
 
 ## Node/Thread Architecture
 
@@ -192,19 +184,22 @@ Flow for a client's `Request::Op`:
    already waiting on this exact thread) — 3b adds no new blocking
    here.
 3. The destination worker, for each not-yet-acquired datum, dispatches
-   an `Acquire` via a short-lived helper thread. **Same-node,
-   different-thread** targets go straight through an in-process
+   an `Acquire` straight to that datum's native home — always
+   resolved once via `ring.native()`, never redirected (native home
+   never delegates, so there's no chained lookup to follow). **Same-
+   node, different-thread** targets go straight through an in-process
    `WorkerHandle`-style channel (existing Rust types, no
    serialization). **Different-node** targets go through that node
-   pair's shared peer-link (see below). Either way, the helper thread
-   does the (possibly blocking, possibly queued-and-later-fulfilled)
-   call and posts the outcome back into the destination worker's *own*
-   inbox as a message once resolved — the worker's loop itself never
-   blocks.
-4. Grants, redirects, later-fulfilled wait-queue notifications, and
-   incoming recalls (of datums this worker currently holds for
-   someone else's op) all arrive as ordinary inbox messages and update
-   the relevant op record or per-datum bookkeeping.
+   pair's shared peer-link (see below). Either way, this is dispatched
+   via a short-lived helper thread that does the (possibly blocking,
+   possibly queued-and-later-fulfilled) call and posts the outcome
+   back into the destination worker's *own* inbox as a message once
+   resolved — the worker's loop itself never blocks.
+4. Grants, later-fulfilled wait-queue notifications, and incoming
+   recalls (of datums this worker currently holds for someone else's
+   op, arriving from whichever thread is native home for that datum)
+   all arrive as ordinary inbox messages and update the relevant op
+   record.
 5. Once an op record's `still_needed` is empty, run it (as in 3a),
    reply through its channel, then release every acquired datum back
    toward its native home (3a's existing anti-degeneration path,
@@ -234,12 +229,12 @@ A new module (e.g. `peer_link.rs`) per remote node provides this:
   incoming frames are a mix of responses to *our own* outgoing calls
   and fresh incoming requests from the peer. A response is matched by
   `correlation_id` against the shared `Mutex<HashMap<correlation_id,
-  Sender<Response>>>` and forwarded there. An incoming request (an
-  `Acquire` or `Recall`) carries an explicit target `ThreadId` — set
-  either by the sender already knowing which thread to reach (a prior
-  `AwayAt` redirect), or `native()`'s own resolution for a first-hop
-  request — which the reader uses to dispatch straight to that local
-  worker's inbox; the reply is later shipped back tagged with the same
+  Sender<Response>>>` and forwarded there. An incoming request
+  (`Acquire`, always aimed at whichever thread is native home per
+  `ring.native()`, or `Recall`, aimed at whichever thread the sender
+  was told holds the datum) carries an explicit target `ThreadId`,
+  which the reader uses to dispatch straight to that local worker's
+  inbox; the reply is later shipped back tagged with the same
   `correlation_id` the request arrived with.
 - **Making a call**: the short-lived helper thread (from the
   node/thread architecture above) mints a fresh `correlation_id`,
@@ -275,11 +270,9 @@ access). No new failure-handling concept is needed.
   isn't reset to everything) and successfully reacquire it once the
   older op releases.
 - **Wait-queue ordering**: multiple younger requests queued for the
-  same held datum are granted oldest-first when it's released.
-- **Chained forwarding**: a datum recalled directly from holder A to
-  holder B (without passing back through native home) is still
-  reachable by a third request that hits native home first (redirect
-  chain resolves correctly).
+  same held datum are granted oldest-first when it's released, even
+  when they arrive out of `op_id` order (insertion sorts by `op_id`,
+  not arrival time).
 - **Peer-link multiplexing**: many concurrent `Acquire` calls from
   different local threads to the same remote node, over the one shared
   connection, each getting routed back to the correct caller.
