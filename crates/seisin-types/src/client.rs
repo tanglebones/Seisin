@@ -53,7 +53,9 @@ pub fn write_typed_datum_client(
     Response::OpError { message } => bail!("read op {read_op_name:?} failed: {message}"),
     other => bail!("unexpected response from read op {read_op_name:?}: {other:?}"),
   };
-  let old_values = old_bytes.map(|bytes| decode_datum(def, &bytes)).transpose()?;
+  let old_values = old_bytes
+    .map(|bytes| decode_datum(def, &bytes))
+    .transpose()?;
 
   let mut datum_ids = vec![pk_id];
   for index in &def.indexes {

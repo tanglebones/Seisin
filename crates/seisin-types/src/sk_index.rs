@@ -119,7 +119,12 @@ mod tests {
   #[test]
   fn a_different_value_derives_a_different_key() {
     let a = sk_key("user", "name", &FieldValue::String("cliff".to_string())).unwrap();
-    let b = sk_key("user", "name", &FieldValue::String("someone_else".to_string())).unwrap();
+    let b = sk_key(
+      "user",
+      "name",
+      &FieldValue::String("someone_else".to_string()),
+    )
+    .unwrap();
     assert_ne!(a, b);
   }
 
@@ -175,7 +180,12 @@ mod tests {
   fn a_second_insert_of_a_different_pk_id_is_flagged_as_a_violation() {
     let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
     let mut ctx = OpContext::new(&mut cache);
-    let key = sk_key("user", "email", &FieldValue::String("a@example.com".to_string())).unwrap();
+    let key = sk_key(
+      "user",
+      "email",
+      &FieldValue::String("a@example.com".to_string()),
+    )
+    .unwrap();
     let first_pk = DatumId::new();
     let second_pk = DatumId::new();
 
@@ -192,12 +202,20 @@ mod tests {
   fn inserting_the_same_pk_id_twice_is_not_a_violation() {
     let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
     let mut ctx = OpContext::new(&mut cache);
-    let key = sk_key("user", "email", &FieldValue::String("a@example.com".to_string())).unwrap();
+    let key = sk_key(
+      "user",
+      "email",
+      &FieldValue::String("a@example.com".to_string()),
+    )
+    .unwrap();
     let pk_id = DatumId::new();
 
     insert_sk_entry(&mut ctx, key, pk_id, Some("resolve".to_string())).unwrap();
     let second = insert_sk_entry(&mut ctx, key, pk_id, Some("resolve".to_string())).unwrap();
-    assert!(second.is_none(), "re-inserting the same pk_id is not a duplicate");
+    assert!(
+      second.is_none(),
+      "re-inserting the same pk_id is not a duplicate"
+    );
   }
 
   #[test]

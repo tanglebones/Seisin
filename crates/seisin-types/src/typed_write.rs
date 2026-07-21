@@ -48,7 +48,10 @@ pub fn decode_write_result(bytes: &[u8]) -> Result<WriteTypedResult> {
       let conflict_op = String::from_utf8(bytes[21..21 + op_len].to_vec())
         .map_err(|_| anyhow::anyhow!("conflict_op was not valid utf8"))?;
       Ok(WriteTypedResult {
-        violation: Some(UniquenessViolation { sk_key, conflict_op }),
+        violation: Some(UniquenessViolation {
+          sk_key,
+          conflict_op,
+        }),
       })
     }
     tag => bail!("unknown write result tag: {tag}"),
@@ -143,10 +146,12 @@ mod tests {
   }
 
   fn unique_user_type() -> DatumTypeDef {
-    DatumTypeDef::new("user").field("email", FieldType::String).index(IndexDef::Sk {
-      field: "email".to_string(),
-      unique: Some(ConflictOp("resolve_duplicate_email".to_string())),
-    })
+    DatumTypeDef::new("user")
+      .field("email", FieldType::String)
+      .index(IndexDef::Sk {
+        field: "email".to_string(),
+        unique: Some(ConflictOp("resolve_duplicate_email".to_string())),
+      })
   }
 
   #[test]
@@ -181,11 +186,19 @@ mod tests {
     let first_values = vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)];
     write_typed_datum(&mut ctx, &def, pk_id, &first_values).unwrap();
 
-    let second_values = vec![FieldValue::String("clifford".to_string()), FieldValue::I64(41)];
+    let second_values = vec![
+      FieldValue::String("clifford".to_string()),
+      FieldValue::I64(41),
+    ];
     write_typed_datum(&mut ctx, &def, pk_id, &second_values).unwrap();
 
     let old_key = sk_key(&def.name, "name", &FieldValue::String("cliff".to_string())).unwrap();
-    let new_key = sk_key(&def.name, "name", &FieldValue::String("clifford".to_string())).unwrap();
+    let new_key = sk_key(
+      &def.name,
+      "name",
+      &FieldValue::String("clifford".to_string()),
+    )
+    .unwrap();
     let old_entries = seisin_core::sk::decode_sk_entries(&ctx.get(old_key).unwrap()).unwrap();
     let new_entries = seisin_core::sk::decode_sk_entries(&ctx.get(new_key).unwrap()).unwrap();
     assert_eq!(old_entries, vec![]);

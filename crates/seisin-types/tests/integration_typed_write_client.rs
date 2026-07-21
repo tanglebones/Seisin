@@ -10,11 +10,11 @@ use seisin_node::server::serve;
 use seisin_ops::context::OpContext;
 use seisin_ops::registry::OpRegistry;
 use seisin_ring::ring::Ring;
+use seisin_types::decode_datum;
 use seisin_types::field::FieldType;
 use seisin_types::field::FieldValue;
 use seisin_types::schema::{ConflictOp, DatumTypeDef, IndexDef};
 use seisin_types::typed_write::{encode_write_result, write_typed_datum};
-use seisin_types::decode_datum;
 
 fn user_type() -> DatumTypeDef {
   DatumTypeDef::new("user")
