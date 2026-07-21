@@ -113,20 +113,76 @@ commit and push immediately, since work sessions may end abruptly.
   proactively reclaims a lock it was holding or retries against a
   since-moved ring slot.
 
-As of this entry: 8 crates, 136 tests passing, `cargo fmt --check` and
+- **Sub-project 3b, Part 2b — Crash detection & lock release.** Closes
+  out Sub-project 3b entirely — the whole design doc
+  (`specs/2026-07-20-cross-node-collation-and-wound-wait-design.md`) is
+  now implemented. Three mechanisms, all reusing Part 1/2a's existing
+  infrastructure: (1) `NativeLock::handle_node_death` — proactive
+  release, wired into `gossip_state.rs::apply_ready_mutations`'s
+  existing `RingMutation::Leave` handling via a new
+  `WorkerPool::release_locks_held_by`/`WorkerMessage::ReleaseLocksHeldBy`
+  broadcast; (2) a reactive backstop — a cross-node `Recall` whose
+  callback fires with anything other than an explicit ack (a failed
+  call, or no peer-link connection at all) is now treated as an
+  immediate release rather than waiting on an ack that may never come;
+  (3) bounded acquire retry — `send_acquire` gained a `retries_left`
+  parameter (`MAX_ACQUIRE_RETRIES = 3`), re-resolving `ring.native()`
+  fresh on each retry so it naturally picks up wherever gossip has
+  since moved the slot, and `fail_op` abandons the whole op with
+  `OpError` on exhaustion, releasing everything it had already
+  acquired via the newly-factored-out `release_datums`. Proven
+  end-to-end by `integration_proactive_lock_release.rs` (a lock held by
+  a node that goes silent releases once gossip confirms it dead) and
+  `integration_crash_during_collation.rs` (a hand-scripted raw-socket
+  peer that gets granted a datum, then drops the connection exactly
+  when a competing older op's recall arrives; plus bounded-retry-then-
+  fail against a peer that was never reachable at all).
+
+  Found and fixed two real bugs while implementing and stress-testing
+  this (neither caught by a single passing run): (1)
+  `PeerLinkRegistry::get` panicked outright when no link to a peer had
+  ever been established, pre-empting the bounded-retry mechanism
+  before it could even run for the "never connected" case — fixed by
+  making `get` return `Option<Arc<PeerLink>>`, with all three call
+  sites (`Recall` dispatch, `send_acquire`, `release_datums`) treating
+  a missing link the same way they already treat a call that failed
+  after connecting; (2) a genuine hang, found only by running the new
+  crash tests 20+ times in a loop: `fail_op` could remove an op's
+  record while an *earlier* `Acquire` for a different datum in that
+  same op was still in flight (e.g. a same-node grant needing a slower
+  cross-thread round trip, racing a remote `Acquire` that exhausted its
+  retries first) — when that late grant finally arrived, it was
+  silently dropped, permanently orphaning the datum's lock with
+  nothing left to ever release it. Fixed by having the `AcquireGranted`
+  handler release the datum immediately whenever its op's record is
+  already gone.
+
+  Known limitations, carried forward unchanged from Part 2a (still not
+  this plan's scope): peer-links still only connect from the *static*
+  startup member list — a node admitted later via gossip has no
+  peer-link connection to it at all.
+
+As of this entry: 8 crates, 145 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
-## In progress
+## Up next — sequencing decision needed
 
-- **Sub-project 3b, Part 2b — Crash detection & lock release.** Not
-  yet planned. Needs: proactive lock release when gossip confirms a
-  node dead (extending the same ring-mutation hook that already
-  triggers cache eviction), a reactive backstop when a recall's
-  peer-link call errors out, bounded acquire retry against a moved
-  ring slot, and failing an op back to its client with `OpError` on
-  exhausted retries rather than hanging — all already designed in the
-  spec's "Crash Detection & Lock Release" section.
+Sub-project 3 (Collation & multi-datum ops, including all of 3b's parts)
+is now fully done — the entire
+`specs/2026-07-20-cross-node-collation-and-wound-wait-design.md` spec is
+implemented. Two directions are both viable next and neither has been
+chosen yet:
+
+- **Sub-project 4 — Storage tier**, next in the original sub-project
+  sequence (see below).
+- The **datum type system** or **deployment management system** design
+  work (see "Not started — from the 2026-07-20 design additions"
+  below) — both still only sketched at the design-doc level, not yet
+  broken into their own spec/plan cycle.
+
+This needs a decision from whoever picks the work back up, not a
+silent default.
 
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-
@@ -162,17 +218,13 @@ sub-project plans:
   designed at all yet — see the design doc's Open Questions for what's
   still undecided even at the rules level.
 
-## Sequencing decision (2026-07-23)
+## Prior sequencing decision (2026-07-23, now fulfilled)
 
-Proceeding with **Sub-project 3 (Collation & multi-datum ops)** next,
-per the original sequence, rather than designing the datum type system
-first. Rationale: collation operates at the `DatumId`/`AuthorityIdx`
-level (which thread runs an op touching multiple datums), not on typed
-content — the existing `Cache`/`Request`/`Response` model already treats
-content as opaque bytes, and nothing about wound-wait/foreign-pull/
-anti-degeneration needs to know about datum types, index kinds, or
-relational constraints. The type system and deployment system are both
-still being actively sketched (index kinds added 2026-07-23 with rk/tk
-mechanics explicitly deferred) and aren't yet concrete enough to plan
-against — better to let them keep accumulating design notes and revisit
-once they're ready for their own brainstorm → plan cycle.
+Chose to proceed with **Sub-project 3 (Collation & multi-datum ops)**
+next, per the original sequence, rather than designing the datum type
+system first — rationale: collation operates at the
+`DatumId`/`AuthorityIdx` level (which thread runs an op touching
+multiple datums), not on typed content, so nothing about wound-wait/
+foreign-pull/anti-degeneration needed the type system designed first.
+That work is now complete (see "Done" above); see "Up next" above for
+the sequencing decision that replaces this one.
