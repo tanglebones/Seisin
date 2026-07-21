@@ -179,7 +179,40 @@ commit and push immediately, since work sessions may end abruptly.
   it's the existing `DatumId`. Parts 2 (sk + uniqueness), 3 (rk), 4
   (tk), 5 (relational constraints) are separate, not-yet-started plans.
 
-As of this entry: 9 crates, 168 tests passing, `cargo fmt --check` and
+- **Datum Type System, Part 2 — sk index & uniqueness constraint.**
+  `DatumId::from_name` (new, `seisin-core`): deterministic UUIDv5-based
+  id derivation, since sk keys must resolve to the same datum_id every
+  time the same `(type, field, value)` is written, unlike `new()`'s
+  time-based randomness. `seisin-types::sk_index::sk_key` derives that
+  id (primitive field values only — `Array`/`Dict` rejected, no
+  canonical byte representation to key on).
+  `insert_sk_entry`/`remove_sk_entry` maintain an sk datum's entry list
+  via the existing `seisin-core::sk` encode/decode; `insert_sk_entry`
+  also performs the best-effort uniqueness check (a second distinct
+  pk_id in the list), returning a `UniquenessViolation` rather than
+  rejecting outright itself. `IndexDef::Sk { field, unique:
+  Option<ConflictOp> }` + `DatumTypeDef.indexes`/`.index(...)` extend
+  Part 1's schema. `write_typed_datum`/`delete_typed_datum` tie it
+  together: read the old value if present, move the sk entry between
+  old/new keys (or leave it if unchanged), surface any uniqueness
+  violation via `WriteTypedResult`. `write_typed_datum_client` is the
+  two-round-trip client-side orchestration the design doc's "sk Index"
+  section calls for (plain read to learn the old value, then the actual
+  write declaring every touched datum_id up front) — collation itself
+  needed no changes. Proven end-to-end by
+  `integration_typed_write_client.rs`: a second writer to an
+  already-taken unique value gets the violation signal back for a
+  follow-up call.
+
+  **Explicit scope decision, not a gap**: automatically invoking the
+  declared `ConflictOp` in-process was decided out of scope — there is
+  no nested-op-invocation mechanism anywhere in this framework
+  (`OpHandler`'s signature has no way to call another named op), and
+  adding one is a real, separate framework change. A detected violation
+  is surfaced as data; the client-side helper makes an ordinary
+  follow-up call instead of the framework dispatching one itself.
+
+As of this entry: 9 crates, 190 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
@@ -221,11 +254,11 @@ sub-project plans:
 
 - **Datum type system.** Fully designed in
   `specs/2026-07-21-datum-type-system-design.md` (schema, pk/sk/rk/tk,
-  uniqueness/relational constraint enforcement). Part 1 (schema
-  declaration & field encoding) is done — see "Done" above. Parts 2
-  (sk index + uniqueness constraint), 3 (rk — splay tree leaderboard),
-  4 (tk — bitemporal valid-time), and 5 (relational/FK constraint
-  enforcement) are separate, not-yet-started plans.
+  uniqueness/relational constraint enforcement). Parts 1 (schema
+  declaration & field encoding) and 2 (sk index + uniqueness
+  constraint) are done — see "Done" above. Parts 3 (rk — splay tree
+  leaderboard), 4 (tk — bitemporal valid-time), and 5 (relational/FK
+  constraint enforcement) are separate, not-yet-started plans.
 - **Framework/codegen shape.** Seisin's actual deliverable is base
   libraries a solution uses to define datum types + operations in code,
   compiling into a server executable and a paired client library. None
