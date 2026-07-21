@@ -166,16 +166,28 @@ As of this entry: 8 crates, 145 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
-## Sequencing decision (2026-07-21)
+## Sequencing decision (2026-07-21, revised same day)
 
 Sub-project 3 (Collation & multi-datum ops, including all of 3b's parts)
 is now fully done — the entire
 `specs/2026-07-20-cross-node-collation-and-wound-wait-design.md` spec is
-implemented. Chose **Sub-project 4 — Storage tier** next, per the
-original sub-project sequence, over designing the datum type system or
-deployment management system first (see "Not started — from the
-2026-07-20 design additions" below for those, still only sketched at
-the design-doc level).
+implemented. Initially chose **Sub-project 4 — Storage tier** next, per
+the original sub-project sequence, and began brainstorming Part A
+(storage role, wire protocol, capacity-weighted ring, write-through
+wiring — nothing implemented, no spec written).
+
+**Revised mid-brainstorm**: storing a datum also needs to update its
+type's pk/sk/rk/tk indexes, which are themselves persisted to disk —
+Storage Tier's disk format may depend on how indexes actually need to
+be structured/reconstructed (indexes are expected to be derivable from
+a durable journal or a scan of the datums themselves, so index writes
+likely don't need to be fsynced before ack the way datum content does,
+but this needs the type/index system actually designed to confirm).
+Switched to designing the **datum type system** (typed datum types,
+pk/sk/rk/tk index kinds, relational constraints) first, so Storage
+Tier's Part A can be designed with real knowledge of what it needs to
+persist rather than needing a later rework. Storage Tier Part A/B/C
+resume once the type system is designed.
 
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-
