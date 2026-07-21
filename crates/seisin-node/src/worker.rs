@@ -263,9 +263,31 @@ impl WorkerHandle {
             }
           }
           WorkerMessage::AcquireGranted { op_id, datum_id } => {
-            if let Some(record) = op_records.get_mut(&op_id) {
-              record.still_needed.retain(|id| *id != datum_id);
-              record.acquired.push(datum_id);
+            match op_records.get_mut(&op_id) {
+              Some(record) => {
+                record.still_needed.retain(|id| *id != datum_id);
+                record.acquired.push(datum_id);
+              }
+              // This op's record is already gone — it finished or was
+              // abandoned by `fail_op` while this grant (for a
+              // different datum in the same op) was still in flight,
+              // e.g. a same-node grant needing a slower cross-thread
+              // round trip racing a remote `Acquire` that exhausted
+              // its retries first. With no record left to track it,
+              // this datum would otherwise sit permanently held with
+              // nothing to ever release it — so release it right now
+              // instead.
+              None => {
+                release_datums(
+                  vec![datum_id],
+                  &mut cache,
+                  &ring,
+                  &peers,
+                  &peer_links,
+                  self_node_id,
+                );
+                continue;
+              }
             }
             try_run_if_ready(
               op_id,

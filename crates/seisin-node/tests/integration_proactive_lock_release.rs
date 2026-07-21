@@ -47,8 +47,7 @@ fn start_node(
   let ring_members: Vec<(NodeId, u32)> = members.iter().map(|m| (m.0, m.1)).collect();
   let ring = Arc::new(RwLock::new(Ring::from_members(&ring_members)));
 
-  let address_book: HashMap<NodeId, String> =
-    members.iter().map(|m| (m.0, m.2.clone())).collect();
+  let address_book: HashMap<NodeId, String> = members.iter().map(|m| (m.0, m.2.clone())).collect();
   let address_book = Arc::new(address_book);
 
   let peer_link_address_book: HashMap<NodeId, String> =
