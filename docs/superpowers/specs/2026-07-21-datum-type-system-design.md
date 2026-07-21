@@ -27,10 +27,12 @@ In scope: schema declaration and field encoding; automatic, framework-
 driven index maintenance via a new op-lifecycle phase (see "Automatic
 Index Maintenance & Op Lifecycle"); the pk, sk, rk, and tk index kinds,
 fully specified; uniqueness enforcement (synchronous, as part of that new
-op-lifecycle phase) and relational (FK) constraint enforcement
-(best-effort inline check + eventual authoritative check, both invoking a
-solution-declared conflict-resolution op). Out of scope, explicitly:
-transaction-time audit
+op-lifecycle phase) and relational (FK) constraint enforcement, which
+references a declared index and — when a resolution strategy is
+declared — allows a temporarily dangling reference rather than rejecting
+it outright, tracked for a periodic eventual scan that invokes a
+solution-declared conflict-resolution op only if the reference is still
+missing when it runs. Out of scope, explicitly: transaction-time audit
 logging (a separate, system-wide concern per the database guideline's own
 split of the two time axes — not part of this sub-project); the
 deployment/schema-evolution rollout system (already sketched separately in
@@ -378,37 +380,66 @@ non-goal), but it's substantially stronger than the original two-tier
 design: a genuine violation fails the whole op before anything commits,
 for any contention the index-update phase actually observes.
 
-**Relational (FK) constraints** don't have an owning "index" datum the
-same way sk does (a reference is just a field pointing at another type's
-pk_id, not a maintained structure), so they keep their own two-tier
-shape:
+**Relational (FK) constraints must reference a declared index** — not a
+bare `(type, field)` pair. This is what makes checking (and, more
+importantly, *re*-checking) a reference efficient rather than an
+arbitrary scan, and it's what lets a future compound/multi-field index
+support FKs that match on a prefix of a compound key without redesigning
+this shape:
 
 ```rust
+pub enum IndexRef {
+  Pk { type_name: String },                     // the default: references a bare pk_id
+  Sk { type_name: String, field: String },       // references a declared *unique* sk index
+}
+
 pub struct RelationalConstraintDef {
   field: String,
-  references_type: String,
-  on_violation: ConflictOp,
+  references: IndexRef,
+  /// If `Some`, a dangling reference is flagged and the write is still
+  /// allowed (see below) rather than rejected. If `None`, a dangling
+  /// reference is a hard synchronous rejection — the default/fallback
+  /// when a constraint hasn't opted into flagged handling.
+  resolution: Option<ConflictOp>,
 }
 ```
 
-1. **Best-effort synchronous check**, at write time — a plain existence
-   check (`ctx.get` on the referenced pk_id) before committing the write,
-   rejected synchronously if absent. Catches the common "reference to
-   something that never existed" case immediately. Not a full guarantee:
-   the referenced entity could be deleted concurrently with (or
-   immediately after) this check, which no cross-datum transaction
-   prevents.
-2. **Eventual, authoritative check** — a periodic background scan over
-   declared FK fields that finds dangling references (pointing to a
-   pk_id that no longer exists) and calls the constraint's declared
-   `ConflictOp` with the violating datum_id and the missing reference.
-   This remains genuinely "eventual" (unlike uniqueness, there's no
-   single owning thread a reference check could be synchronously
-   dispatched to without picking an arbitrary one) — Seisin's part is
-   detecting the violation and invoking the op; the *policy* for
-   resolving it (null out the reference, cascade-delete, flag-for-review,
-   whatever fits the solution) is entirely up to that op's
-   implementation, not prescribed here.
+**A missing reference is not automatically a hard rejection.** Real data
+sets legitimately need to insert entities out of order against
+pre-assigned ids — bulk/batch imports, and especially the database
+guideline's `_e_`-style *mandatory, mutual* 1:1 extension pattern (two
+rows that each FK back to the other, so neither can be written
+strictly before the other without the SQL-world's awkward
+deferred-constraint/CTE dance, which doesn't even work on every engine —
+see the `database` guideline's `_e_` section). Rather than requiring that
+dance, a constraint that declares a `resolution` strategy allows the
+write to proceed with a temporarily dangling reference:
+
+1. **Existence check, at write time** — via the referenced index (a
+   lightweight existence check dispatched to whichever thread owns the
+   referenced pk_id or sk key, not a full `Acquire`/collation — exact
+   wire-message shape is left to the implementation plan).
+   - Reference exists: proceed normally, nothing flagged.
+   - Reference missing, **no** `resolution` declared: reject the write
+     synchronously (the original hard-check behavior, still the default).
+   - Reference missing, `resolution` **is** declared: allow the write,
+     and record the dangling reference in a pending-FK tracking
+     structure (`fk_pending:{type}.{field}`, maintained the same way an
+     sk entry list is — through the same `IndexUpdate` dispatch/resident-
+     structure mechanism as any other index) so the eventual scan below
+     only ever has to check what's actually pending, never the whole
+     population.
+2. **Eventual, authoritative check** — a periodic scan over each
+   `fk_pending:{type}.{field}` structure: for every still-pending entry,
+   re-check whether the reference now exists. If it does, the entry is
+   just removed (resolved naturally — no violation, no op invocation). If
+   it's still missing, the constraint's declared `ConflictOp` is invoked
+   with the violating datum_id and the missing reference — the *policy*
+   for resolving it (null out the reference, cascade-delete,
+   flag-for-review, whatever fits the solution) is entirely up to that
+   op's implementation, not prescribed here. The resolution op is *only*
+   invoked from this scan, never synchronously at write time, even though
+   the write itself proceeds immediately.
 
 Full scheduling mechanics for the FK eventual/periodic scan (how often,
 what triggers it, whether it's driven by a dedicated background thread or
@@ -461,11 +492,14 @@ the common case.
   tests for the column-store encoding; a test confirming two different
   entities' tk indexes never contend (no shared lock/datum, no shared
   `IndexUpdate` target).
-- Constraint enforcement: a unit test proving the FK best-effort check
-  rejects a write referencing a pk_id that never existed; a unit test
-  proving the FK eventual check detects a dangling reference (created
-  via a concurrent delete the best-effort check couldn't have caught)
-  and invokes the declared `ConflictOp`.
+- Constraint enforcement: a unit test proving a write referencing a
+  never-existed pk_id is rejected synchronously when no `resolution` is
+  declared; a unit test proving the same write is *allowed* (and the
+  reference tracked in `fk_pending:{type}.{field}`) when a `resolution`
+  is declared; a test proving a pending entry is silently cleared once
+  the referenced entity is created before the scan runs; a test proving
+  the eventual scan invokes the declared `ConflictOp` for an entry still
+  missing when it runs.
 
 ## Open Questions Carried Forward
 
@@ -475,6 +509,11 @@ the common case.
   needs it.
 - **rk index sharding** — explicitly deferred (see "Known limitation"
   above under rk).
+- **Compound/multi-field indexes, and FKs matching a prefix of one** —
+  `IndexDef`/`IndexRef` are both scoped to a single field for now; the FK
+  design's "can be shared or part of a prefix if compound" framing
+  anticipates this but doesn't require building it yet. Deferred until a
+  real solution needs a compound key.
 - **Collation destination-thread preference** — whether `pool.rs`'s
   native-majority heuristic should learn to prefer an index's native
   thread over the pk datum's, as a throughput optimization — explicitly
