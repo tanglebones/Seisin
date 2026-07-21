@@ -6,4 +6,10 @@ edition = "2021"
 [dependencies]
 seisin-core = { path = "../seisin-core" }
 seisin-ops = { path = "../seisin-ops" }
+seisin-client = { path = "../seisin-client" }
+seisin-protocol = { path = "../seisin-protocol" }
 anyhow = "1"
+
+[dev-dependencies]
+seisin-node = { path = "../seisin-node" }
+seisin-ring = { path = "../seisin-ring" }
