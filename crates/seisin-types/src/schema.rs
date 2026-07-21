@@ -10,6 +10,7 @@ use crate::field::{value_matches_type, FieldType, FieldValue};
 pub struct DatumTypeDef {
   pub name: String,
   pub fields: Vec<(String, FieldType)>,
+  pub indexes: Vec<IndexDef>,
 }
 
 impl DatumTypeDef {
@@ -17,6 +18,7 @@ impl DatumTypeDef {
     Self {
       name: name.into(),
       fields: Vec::new(),
+      indexes: Vec::new(),
     }
   }
 
@@ -26,6 +28,28 @@ impl DatumTypeDef {
     self.fields.push((name.into(), ty));
     self
   }
+
+  /// Declares an index on this type — see `IndexDef`.
+  pub fn index(mut self, index: IndexDef) -> Self {
+    self.indexes.push(index);
+    self
+  }
+}
+
+/// Names a registered op (via `OpRegistry`, same mechanism as any domain
+/// op) to call when a constraint violation is detected — see the design
+/// doc's "Constraint Enforcement" section. Nothing in this crate invokes
+/// it automatically; it's data a caller (the client-side typed-write
+/// helper, in this plan) uses to make its own follow-up call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictOp(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexDef {
+  Sk {
+    field: String,
+    unique: Option<ConflictOp>,
+  },
 }
 
 /// Encodes `values` (one per field, in `def.fields`' declared order) into
@@ -114,6 +138,39 @@ mod tests {
     let def = user_type();
     let values = vec![FieldValue::String("cliff".to_string())]; // missing "age"
     assert!(encode_datum(&def, &values).is_err());
+  }
+
+  #[test]
+  fn builder_accumulates_indexes_in_declared_order() {
+    let def = DatumTypeDef::new("user")
+      .field("name", FieldType::String)
+      .index(IndexDef::Sk {
+        field: "name".to_string(),
+        unique: None,
+      });
+    assert_eq!(
+      def.indexes,
+      vec![IndexDef::Sk {
+        field: "name".to_string(),
+        unique: None,
+      }]
+    );
+  }
+
+  #[test]
+  fn a_unique_index_carries_its_conflict_op_name() {
+    let def = DatumTypeDef::new("user")
+      .field("email", FieldType::String)
+      .index(IndexDef::Sk {
+        field: "email".to_string(),
+        unique: Some(ConflictOp("resolve_duplicate_email".to_string())),
+      });
+    match &def.indexes[0] {
+      IndexDef::Sk {
+        unique: Some(op), ..
+      } => assert_eq!(op.0, "resolve_duplicate_email"),
+      other => panic!("expected a unique Sk index, got {other:?}"),
+    }
   }
 
   #[test]
