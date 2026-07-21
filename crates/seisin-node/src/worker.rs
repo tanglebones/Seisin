@@ -231,24 +231,34 @@ impl WorkerHandle {
                   reply: recall_reply,
                 });
               } else {
-                let link = peer_links.lock().unwrap().get(holder.node_id);
                 let self_sender = join_sender.clone();
-                link.call(
-                  holder.thread_id,
-                  seisin_protocol::Request::Recall { datum_id },
-                  Box::new(move |response| {
-                    // Either an explicit `Released` ack, or the call
-                    // failed outright (the peer-link disconnected,
-                    // meaning the holder is unreachable) — either way,
-                    // treat it as released rather than waiting on a
-                    // call that may never resolve. This is the
-                    // reactive backstop for the gap between an actual
-                    // crash and gossip confirming it (Task 3 handles
-                    // the confirmed case).
-                    let _ = response;
+                match peer_links.lock().unwrap().get(holder.node_id) {
+                  Some(link) => {
+                    link.call(
+                      holder.thread_id,
+                      seisin_protocol::Request::Recall { datum_id },
+                      Box::new(move |response| {
+                        // Either an explicit `Released` ack, or the
+                        // call failed outright (the peer-link
+                        // disconnected, meaning the holder is
+                        // unreachable) — either way, treat it as
+                        // released rather than waiting on a call that
+                        // may never resolve. This is the reactive
+                        // backstop for the gap between an actual crash
+                        // and gossip confirming it (Task 3 handles the
+                        // confirmed case).
+                        let _ = response;
+                        let _ = self_sender.send(WorkerMessage::Release { datum_id });
+                      }),
+                    );
+                  }
+                  // No link ever existed to this holder at all — same
+                  // conclusion as a call that failed after connecting:
+                  // treat it as released immediately.
+                  None => {
                     let _ = self_sender.send(WorkerMessage::Release { datum_id });
-                  }),
-                );
+                  }
+                }
               }
             }
           }
@@ -427,27 +437,41 @@ fn send_acquire(
       reply: AcquireReply::Local(requester_inbox),
     });
   } else {
-    let link = peer_links.lock().unwrap().get(native_node);
-    link.call(
-      native_thread,
-      seisin_protocol::Request::Acquire {
-        op_id,
-        datum_id,
-        requester_node: self_node_id,
-        requester_thread: self_thread_id,
-      },
-      Box::new(move |response| {
-        if matches!(response, seisin_protocol::Response::Granted) {
-          let _ = requester_inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
-        } else {
-          let _ = requester_inbox.send(WorkerMessage::AcquireFailed {
+    match peer_links.lock().unwrap().get(native_node) {
+      Some(link) => {
+        link.call(
+          native_thread,
+          seisin_protocol::Request::Acquire {
             op_id,
             datum_id,
-            retries_left,
-          });
-        }
-      }),
-    );
+            requester_node: self_node_id,
+            requester_thread: self_thread_id,
+          },
+          Box::new(move |response| {
+            if matches!(response, seisin_protocol::Response::Granted) {
+              let _ = requester_inbox.send(WorkerMessage::AcquireGranted { op_id, datum_id });
+            } else {
+              let _ = requester_inbox.send(WorkerMessage::AcquireFailed {
+                op_id,
+                datum_id,
+                retries_left,
+              });
+            }
+          }),
+        );
+      }
+      // No link ever existed to `native_node` at all — same
+      // conclusion as a call that failed after connecting: post
+      // AcquireFailed so the retry/give-up mechanics apply the same
+      // way regardless of which kind of unreachability this is.
+      None => {
+        let _ = requester_inbox.send(WorkerMessage::AcquireFailed {
+          op_id,
+          datum_id,
+          retries_left,
+        });
+      }
+    }
   }
 }
 
@@ -506,8 +530,11 @@ fn release_datums(
     let (native_node, thread_id) = ring.read().unwrap().native(datum_id);
     if native_node == self_node_id {
       let _ = peers[thread_id.0 as usize].send(WorkerMessage::Release { datum_id });
-    } else {
-      let link = peer_links.lock().unwrap().get(native_node);
+    } else if let Some(link) = peer_links.lock().unwrap().get(native_node) {
+      // Best-effort: no link to release to means native home is
+      // unreachable anyway, so there's nothing meaningful to do —
+      // it'll have already been (or will be) cleaned up via the
+      // proactive/reactive crash-handling paths instead.
       link.call(
         thread_id,
         seisin_protocol::Request::Release { datum_id },

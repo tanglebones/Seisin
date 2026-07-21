@@ -237,22 +237,16 @@ impl PeerLinkRegistry {
 }
 
 impl PeerLinkRegistry {
-  /// Returns the link to `node_id`.
-  ///
-  /// # Panics
-  /// Panics if no link to `node_id` exists — expected to normally be
-  /// dialed or accepted at startup (see `start`), but a peer that was
-  /// unreachable at dial time, or joined dynamically after this node
-  /// started, has no entry either. Either way, an `Acquire`/`Recall`
-  /// that hits this is a case this plan doesn't yet handle gracefully
-  /// — reconnection/backoff is Part 2b's crash-handling scope.
-  pub fn get(&self, node_id: NodeId) -> Arc<PeerLink> {
-    Arc::clone(
-      self
-        .links
-        .get(&node_id)
-        .unwrap_or_else(|| panic!("no peer-link connection to node {node_id:?}")),
-    )
+  /// Returns the link to `node_id`, or `None` if no link to it exists —
+  /// expected to normally be dialed or accepted at startup (see
+  /// `start`), but a peer that was unreachable at dial time, or joined
+  /// dynamically after this node started, has no entry either. Callers
+  /// (`worker.rs`'s `Acquire`/`Recall`/`Release` dispatch) treat a
+  /// missing link the same way they treat a call that failed after
+  /// connecting — Part 2b's bounded-retry and reactive-release
+  /// mechanisms don't care which of the two happened.
+  pub fn get(&self, node_id: NodeId) -> Option<Arc<PeerLink>> {
+    self.links.get(&node_id).map(Arc::clone)
   }
 }
 
@@ -440,11 +434,11 @@ mod tests {
     // Every pair connects, regardless of which side happened to dial:
     // a dials both b and c (1 < 2, 1 < 3); b dials c (2 < 3); c dials
     // no one (nothing in the set is greater than 3).
-    registry_a.lock().unwrap().get(node_b);
-    registry_a.lock().unwrap().get(node_c);
-    registry_b.lock().unwrap().get(node_a);
-    registry_b.lock().unwrap().get(node_c);
-    registry_c.lock().unwrap().get(node_a);
-    registry_c.lock().unwrap().get(node_b);
+    assert!(registry_a.lock().unwrap().get(node_b).is_some());
+    assert!(registry_a.lock().unwrap().get(node_c).is_some());
+    assert!(registry_b.lock().unwrap().get(node_a).is_some());
+    assert!(registry_b.lock().unwrap().get(node_c).is_some());
+    assert!(registry_c.lock().unwrap().get(node_a).is_some());
+    assert!(registry_c.lock().unwrap().get(node_b).is_some());
   }
 }
