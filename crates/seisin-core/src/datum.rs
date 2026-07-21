@@ -24,6 +24,15 @@ impl DatumId {
   pub fn as_bytes(&self) -> [u8; 16] {
     *self.0.as_bytes()
   }
+
+  /// Deterministically derives an id from `namespace` and `name` — the
+  /// same `(namespace, name)` pair always produces the same `DatumId`,
+  /// unlike `new()`'s time-based randomness. Used for keys that must
+  /// resolve to the same datum every time (sk/rk/tk index keys), backed
+  /// by UUIDv5 (the standard name-based UUID scheme).
+  pub fn from_name(namespace: &DatumId, name: &[u8]) -> Self {
+    DatumId(Uuid::new_v5(&namespace.0, name))
+  }
 }
 
 impl Default for DatumId {
@@ -56,5 +65,28 @@ mod tests {
       first < second,
       "a later-created UUIDv7 id must sort greater"
     );
+  }
+
+  #[test]
+  fn from_name_is_deterministic() {
+    let ns = DatumId::new();
+    let a = DatumId::from_name(&ns, b"sk:user.name:cliff");
+    let b = DatumId::from_name(&ns, b"sk:user.name:cliff");
+    assert_eq!(a, b);
+  }
+
+  #[test]
+  fn from_name_differs_for_different_names() {
+    let ns = DatumId::new();
+    let a = DatumId::from_name(&ns, b"sk:user.name:cliff");
+    let b = DatumId::from_name(&ns, b"sk:user.name:someone_else");
+    assert_ne!(a, b);
+  }
+
+  #[test]
+  fn from_name_differs_across_namespaces() {
+    let a = DatumId::from_name(&DatumId::new(), b"same name");
+    let b = DatumId::from_name(&DatumId::new(), b"same name");
+    assert_ne!(a, b);
   }
 }
