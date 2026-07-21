@@ -20,8 +20,10 @@ required except where explicitly noted below (none are).
 ## Scope
 
 In scope: schema declaration and field encoding; the pk, sk, rk, and tk
-index kinds, fully specified; relational constraints (eventual/advisory,
-per the original doc). Out of scope, explicitly: transaction-time audit
+index kinds, fully specified; uniqueness and relational (FK) constraint
+enforcement (best-effort inline check + eventual authoritative check
+invoking a solution-declared conflict-resolution op). Out of scope,
+explicitly: transaction-time audit
 logging (a separate, system-wide concern per the database guideline's own
 split of the two time axes — not part of this sub-project); the
 deployment/schema-evolution rollout system (already sketched separately in
@@ -63,10 +65,16 @@ pub struct DatumTypeDef {
 }
 
 pub enum IndexDef {
-  Sk { field: String },
+  Sk { field: String, unique: Option<ConflictOp> },
   Rk { field: String },  // field must be I64 or F64
   Tk { field: String },  // field can be any type; see "tk Index" below
 }
+
+/// Names a registered op (via `OpRegistry`, same mechanism as any domain
+/// op) to call when the eventual/authoritative constraint check finds a
+/// genuine violation the best-effort check missed. See "Constraint
+/// Enforcement" below.
+pub struct ConflictOp(pub String);
 ```
 
 Content encodes as a hand-rolled, length-prefixed tag-value sequence in
@@ -121,6 +129,20 @@ automatically today; this sub-project adds that.
   an entity "cliff" concurrently) resolves via the exact same
   wound-wait/collation machinery already built for any other regular
   datum — no new concurrency primitive needed.
+- **Uniqueness (`unique: Some(ConflictOp)`)**: before appending `(pk_id,
+  Native)` to `sk_new_key`'s entry list in step 2 above, the op checks
+  whether that list already holds an entry for a *different* pk_id — if
+  so, it rejects the write (returns an error) instead of inserting a
+  probable duplicate. This best-effort check is genuinely authoritative
+  for the common case (two writers racing on the same sk key resolve
+  through the same wound-wait collation as any other sk update, so
+  whichever runs second always sees the first's already-committed insert)
+  — but it is not a full guarantee: a crash of the owning thread/node
+  between this check passing and the op's write-through-before-ack
+  completing can still leave more than one entry behind after lazy
+  recovery, since there's no cross-op transaction making check-then-
+  commit atomic against a crash in between. See "Constraint Enforcement"
+  below for the eventual/authoritative backstop.
 
 ## rk Index (Ranked/Sampled — Leaderboards)
 
@@ -240,21 +262,65 @@ collapsed into one mechanism.
   advantage over rk's single global bottleneck: tk parallelizes for free,
   rk does not.
 
-## Relational Constraints
+## Constraint Enforcement (Uniqueness & Relational)
 
-Per the original design doc: enforcement is eventual/advisory, not a hard
-synchronous check (the ownership model doesn't support cheap
-cross-datum-type synchronous validation on every write). Minimal v1
-mechanism: a constraint declares a referencing field on one type pointing
-to another type's pk. Violations (a reference to a pk_id that doesn't
-exist, or that's been deleted) are surfaced via a background, periodic
-eventual-check op that scans referencing fields and logs violations — it
-never blocks or rejects a write. Full enforcement mechanics (retry
-policy, violation reporting surface, how "periodic" is scheduled) are left
-for a future pass once there's a real solution exercising this — the
-scope here is establishing that the constraint is *declared* in the type
-system and *eventually checked*, not designing a complete violation-
-handling pipeline speculatively.
+Neither uniqueness nor relational (FK) constraints can be a hard,
+synchronous guarantee in this ownership model — there's no cross-op
+transaction boundary spanning "check, then commit" (matches the original
+design doc's explicit non-goal of distributed transactions), so both
+share the same two-tier shape:
+
+1. **Best-effort synchronous check**, at write time — cheap, uses data
+   the op is already touching, catches the common case immediately, and
+   is genuinely authoritative for same-datum contention (which resolves
+   through existing wound-wait collation). It is not a full guarantee: a
+   crash of the owning thread/node between the check passing and
+   write-through-before-ack completing can still leave a real violation
+   behind.
+2. **Eventual, authoritative check** — a periodic background scan that is
+   the real source of truth. Any genuine violation it finds invokes a
+   **solution-declared conflict-resolution op** (`ConflictOp`, a name
+   registered the same way as any other domain op via `OpRegistry`) —
+   Seisin's part is detecting the violation and invoking the op; the
+   *policy* for resolving it (keep-oldest, merge, cascade-delete,
+   flag-for-review, whatever fits the solution) is entirely up to that
+   op's implementation, not prescribed here.
+
+**Uniqueness** (`IndexDef::Sk { unique: Some(ConflictOp), .. }`) — the
+best-effort check is described under "sk Index" above. The eventual check
+periodically scans sk indexes declared unique for any entry list with
+more than one entry, and calls the declared `ConflictOp` with the full
+list of conflicting `(DatumId, AuthorityIdx)` entries.
+
+**Relational (FK) constraints** — a constraint declares a referencing
+field on one type, the type it points to, and a `ConflictOp`:
+
+```rust
+pub struct RelationalConstraintDef {
+  field: String,
+  references_type: String,
+  on_violation: ConflictOp,
+}
+```
+
+- Best-effort check: at write time, a plain existence check (`ctx.get` on
+  the referenced pk_id) before committing the write — rejected
+  synchronously if absent, catching the common "reference to something
+  that never existed" case immediately. Not a full guarantee: the
+  referenced entity could be deleted concurrently with (or immediately
+  after) this check, which no cross-datum transaction prevents.
+- Eventual check: a periodic scan over declared FK fields finds dangling
+  references (pointing to a pk_id that no longer exists) and calls the
+  constraint's declared `ConflictOp` with the violating datum_id and the
+  missing reference — replacing any notion of passive logging with the
+  same detect-and-resolve-via-op mechanism uniqueness uses.
+
+Full scheduling mechanics for the eventual/periodic scan (how often, what
+triggers it, whether it's driven by a dedicated background thread or
+piggybacks on an existing loop) are left for the implementation plan —
+this spec establishes the enforcement *shape* (best-effort inline check +
+eventual authoritative check invoking a solution-owned resolution op),
+not a complete scheduler design.
 
 ## Testing Strategy
 
@@ -265,7 +331,9 @@ handling pipeline speculatively.
   changing the indexed value, update leaving it unchanged, delete);
   an integration test proving concurrent writers to the same sk key
   collate/wound-wait correctly (reusing the existing wound-wait
-  integration test pattern from Sub-project 3b).
+  integration test pattern from Sub-project 3b); a unit test proving the
+  uniqueness best-effort check rejects a second writer to the same
+  already-populated unique sk key.
 - rk: unit tests for the splay tree's insert/delete/rank-descent
   correctness against known sequences (matching the "known-answer test
   vectors, not fuzzing" convention favored elsewhere in this project);
@@ -276,9 +344,13 @@ handling pipeline speculatively.
   correction, and the reject-if-genuinely-ambiguous case); round-trip
   tests for the column-store encoding; a test confirming two different
   entities' tk indexes never contend (no shared lock/datum).
-- Relational constraints: a unit test proving the eventual-check op
-  detects a dangling reference without blocking the write that created
-  it.
+- Constraint enforcement: a unit test proving the FK best-effort check
+  rejects a write referencing a pk_id that never existed; a unit test
+  proving the eventual check detects a dangling reference (created via a
+  concurrent delete the best-effort check couldn't have caught) and
+  invokes the declared `ConflictOp`; the same shape repeated for the
+  uniqueness eventual check (more than one entry in a unique sk list
+  invokes its `ConflictOp`).
 
 ## Open Questions Carried Forward
 
@@ -288,7 +360,9 @@ handling pipeline speculatively.
   needs it.
 - **rk index sharding** — explicitly deferred (see "Known limitation"
   above under rk).
-- **Relational constraint violation-handling pipeline** — deferred beyond
-  "declared and eventually checked" (see "Relational Constraints" above).
+- **Eventual-check scheduling mechanics** — how often the periodic
+  uniqueness/FK scans run and what drives them (dedicated thread vs.
+  piggybacking on an existing loop) is left for the implementation plan
+  (see "Constraint Enforcement" above).
 - **Transaction-time audit mechanism** — explicitly out of scope for this
   sub-project; a separate, system-wide concern for a future pass.
