@@ -85,6 +85,23 @@ pub(crate) enum WorkerMessage {
   /// gossip's failure detector confirming a node dead — see
   /// `gossip_state.rs::apply_ready_mutations`.
   ReleaseLocksHeldBy(NodeId),
+  /// Sent to whichever thread natively owns `target`, applying one
+  /// update to that index's resident state. See the design doc's
+  /// "Automatic Index Maintenance & Op Lifecycle" section.
+  IndexUpdate {
+    target: DatumId,
+    op_id: DatumId,
+    index_kind: String,
+    payload: Vec<u8>,
+    reply: IndexUpdateReply,
+  },
+  /// Posted into the originating op's own thread inbox once a
+  /// dispatched `IndexUpdate` gets a reply.
+  IndexUpdateReplied {
+    op_id: DatumId,
+    target: DatumId,
+    violation: Option<String>,
+  },
 }
 
 /// Where an `Acquire`'s eventual grant should be delivered — a local
@@ -128,6 +145,33 @@ impl RecallReply {
   }
 }
 
+/// Where an `IndexUpdate`'s eventual reply should be delivered — same
+/// shape as `AcquireReply`/`RecallReply`, for the same reason.
+pub(crate) enum IndexUpdateReply {
+  Local(Sender<WorkerMessage>),
+  Remote(Arc<PeerLink>, u64),
+}
+
+impl IndexUpdateReply {
+  fn respond(self, op_id: DatumId, target: DatumId, violation: Option<String>) {
+    match self {
+      IndexUpdateReply::Local(inbox) => {
+        let _ = inbox.send(WorkerMessage::IndexUpdateReplied {
+          op_id,
+          target,
+          violation,
+        });
+      }
+      IndexUpdateReply::Remote(link, correlation_id) => {
+        link.respond(
+          correlation_id,
+          seisin_protocol::Response::IndexUpdateResult { violation },
+        );
+      }
+    }
+  }
+}
+
 struct OpRecord {
   op_name: String,
   payload: Vec<u8>,
@@ -160,12 +204,14 @@ impl WorkerHandle {
     ring: Arc<RwLock<Ring>>,
     self_node_id: NodeId,
     peer_links: Arc<StdMutex<PeerLinkRegistry>>,
+    index_handlers: Arc<crate::index_handler::IndexHandlerRegistry>,
   ) -> Self {
     let join_sender = sender.clone();
     let join = thread::spawn(move || {
       let mut cache = Cache::new(store);
       let mut native_locks: HashMap<DatumId, NativeLock> = HashMap::new();
       let mut op_records: HashMap<DatumId, OpRecord> = HashMap::new();
+      let mut index_cache: HashMap<DatumId, Vec<u8>> = HashMap::new();
 
       for message in receiver {
         match message {
@@ -382,6 +428,34 @@ impl WorkerHandle {
                 cache.invalidate(datum_id);
               }
             }
+          }
+          WorkerMessage::IndexUpdate {
+            target,
+            op_id,
+            index_kind,
+            payload,
+            reply,
+          } => {
+            let current = match index_cache.get(&target) {
+              Some(bytes) => Some(bytes.clone()),
+              None => cache.get(target),
+            };
+            match index_handlers.apply(&index_kind, current.as_deref(), &payload) {
+              Ok((new_bytes, violation)) => {
+                if violation.is_none() {
+                  index_cache.insert(target, new_bytes.clone());
+                  cache.put(target, new_bytes);
+                }
+                reply.respond(op_id, target, violation);
+              }
+              Err(message) => {
+                reply.respond(op_id, target, Some(message));
+              }
+            }
+          }
+          WorkerMessage::IndexUpdateReplied { .. } => {
+            // Wired up properly in Task 6 (the op-lifecycle rewrite);
+            // for now there's no op-record state to update yet.
           }
         }
       }
@@ -646,6 +720,7 @@ mod tests {
           Arc::clone(&ring),
           NodeId(1),
           Arc::clone(&peer_links),
+          Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
         )
       })
       .collect()
