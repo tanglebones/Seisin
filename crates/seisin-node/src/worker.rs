@@ -185,6 +185,21 @@ struct OpRecord {
   still_needed: Vec<DatumId>,
   acquired: Vec<DatumId>,
   reply: Sender<Result<Vec<u8>, String>>,
+  /// `None` until the op's business logic has run and scheduled at
+  /// least one index update; `Some` while waiting on those updates'
+  /// replies. See the design doc's "Automatic Index Maintenance & Op
+  /// Lifecycle" section.
+  index_update_state: Option<IndexUpdateState>,
+}
+
+struct IndexUpdateState {
+  staged_writes: Vec<(DatumId, Option<Vec<u8>>)>,
+  op_result: Vec<u8>,
+  pending: usize,
+  /// The first violation seen, if any — an op can have scheduled
+  /// several index updates; the whole op fails if *any* of them
+  /// reports one, but only one message is kept for the reply.
+  violation: Option<String>,
 }
 
 pub struct WorkerHandle {
@@ -231,6 +246,7 @@ impl WorkerHandle {
                 still_needed: datum_ids.clone(),
                 acquired: Vec::new(),
                 reply,
+                index_update_state: None,
               },
             );
             for datum_id in datum_ids {
@@ -255,6 +271,7 @@ impl WorkerHandle {
               &peers,
               &peer_links,
               self_node_id,
+              &join_sender,
             );
           }
           WorkerMessage::Acquire {
@@ -344,6 +361,7 @@ impl WorkerHandle {
               &peers,
               &peer_links,
               self_node_id,
+              &join_sender,
             );
           }
           WorkerMessage::AcquireFailed {
@@ -453,9 +471,43 @@ impl WorkerHandle {
               }
             }
           }
-          WorkerMessage::IndexUpdateReplied { .. } => {
-            // Wired up properly in Task 6 (the op-lifecycle rewrite);
-            // for now there's no op-record state to update yet.
+          WorkerMessage::IndexUpdateReplied {
+            op_id,
+            target,
+            violation,
+          } => {
+            let _ = target;
+            if let Some(record) = op_records.get_mut(&op_id) {
+              if let Some(state) = &mut record.index_update_state {
+                state.pending -= 1;
+                if violation.is_some() && state.violation.is_none() {
+                  state.violation = violation;
+                }
+                if state.pending == 0 {
+                  let record = op_records.remove(&op_id).unwrap();
+                  let state = record.index_update_state.unwrap();
+                  if let Some(message) = state.violation {
+                    let _ = record.reply.send(Err(message));
+                  } else {
+                    for (id, content) in state.staged_writes {
+                      match content {
+                        Some(bytes) => cache.put(id, bytes),
+                        None => cache.delete(id),
+                      }
+                    }
+                    let _ = record.reply.send(Ok(state.op_result));
+                  }
+                  release_datums(
+                    record.acquired,
+                    &mut cache,
+                    &ring,
+                    &peers,
+                    &peer_links,
+                    self_node_id,
+                  );
+                }
+              }
+            }
           }
         }
       }
@@ -574,6 +626,12 @@ fn send_acquire(
 /// If `op_id`'s record has nothing left to acquire, runs it, replies,
 /// then releases every acquired datum back toward its native home.
 #[allow(clippy::too_many_arguments)]
+/// If `op_id`'s record has nothing left to acquire and hasn't already
+/// entered its index-update phase, runs it. An op that scheduled no
+/// index updates commits and replies immediately, exactly as before;
+/// one that scheduled at least one dispatches them and waits — see
+/// `WorkerMessage::IndexUpdateReplied` for the commit-or-fail step.
+#[allow(clippy::too_many_arguments)]
 fn try_run_if_ready(
   op_id: DatumId,
   op_records: &mut HashMap<DatumId, OpRecord>,
@@ -583,14 +641,15 @@ fn try_run_if_ready(
   peers: &Arc<Vec<Sender<WorkerMessage>>>,
   peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
   self_node_id: NodeId,
+  join_sender: &Sender<WorkerMessage>,
 ) {
-  let ready = op_records
-    .get(&op_id)
-    .is_some_and(|record| record.still_needed.is_empty());
+  let ready = op_records.get(&op_id).is_some_and(|record| {
+    record.still_needed.is_empty() && record.index_update_state.is_none()
+  });
   if !ready {
     return;
   }
-  let record = op_records.remove(&op_id).unwrap();
+  let record = op_records.get_mut(&op_id).unwrap();
   let mut ctx = OpContext::new(cache);
   let result = ops.invoke(
     &record.op_name,
@@ -598,15 +657,131 @@ fn try_run_if_ready(
     &record.datum_ids,
     &record.payload,
   );
-  let _ = record.reply.send(result);
-  release_datums(
-    record.acquired,
-    cache,
-    ring,
-    peers,
-    peer_links,
-    self_node_id,
-  );
+  let staged_writes = ctx.take_staged_writes();
+  let pending_index_updates = ctx.take_pending_index_updates();
+
+  let op_result = match result {
+    Err(message) => {
+      let record = op_records.remove(&op_id).unwrap();
+      let _ = record.reply.send(Err(message));
+      release_datums(
+        record.acquired,
+        cache,
+        ring,
+        peers,
+        peer_links,
+        self_node_id,
+      );
+      return;
+    }
+    Ok(op_result) => op_result,
+  };
+
+  if pending_index_updates.is_empty() {
+    for (id, content) in staged_writes {
+      match content {
+        Some(bytes) => cache.put(id, bytes),
+        None => cache.delete(id),
+      }
+    }
+    let record = op_records.remove(&op_id).unwrap();
+    let _ = record.reply.send(Ok(op_result));
+    release_datums(
+      record.acquired,
+      cache,
+      ring,
+      peers,
+      peer_links,
+      self_node_id,
+    );
+    return;
+  }
+
+  let pending = pending_index_updates.len();
+  record.index_update_state = Some(IndexUpdateState {
+    staged_writes,
+    op_result,
+    pending,
+    violation: None,
+  });
+  for update in pending_index_updates {
+    dispatch_index_update(
+      ring,
+      peers,
+      peer_links,
+      self_node_id,
+      op_id,
+      update.target,
+      update.index_kind,
+      update.payload,
+      join_sender.clone(),
+    );
+  }
+}
+
+/// Sends an `IndexUpdate` for `target` on behalf of `op_id` to
+/// whichever thread `ring.native()` currently names — locally or
+/// cross-node, mirroring `send_acquire`'s same local/remote split. A
+/// missing peer-link, or a call that fails after connecting, is
+/// reported back as a violation (failing the whole op) rather than
+/// assumed successful — there's no retry here (unlike bounded acquire
+/// retry), a deliberate v1 simplification.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_index_update(
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
+  self_node_id: NodeId,
+  op_id: DatumId,
+  target: DatumId,
+  index_kind: String,
+  payload: Vec<u8>,
+  requester_inbox: Sender<WorkerMessage>,
+) {
+  let (native_node, native_thread) = ring.read().unwrap().native(target);
+  if native_node == self_node_id {
+    let _ = peers[native_thread.0 as usize].send(WorkerMessage::IndexUpdate {
+      target,
+      op_id,
+      index_kind,
+      payload,
+      reply: IndexUpdateReply::Local(requester_inbox),
+    });
+  } else {
+    match peer_links.lock().unwrap().get(native_node) {
+      Some(link) => {
+        link.call(
+          native_thread,
+          seisin_protocol::Request::IndexUpdate {
+            target,
+            op_id,
+            index_kind,
+            payload,
+          },
+          Box::new(move |response| {
+            let violation = match response {
+              seisin_protocol::Response::IndexUpdateResult { violation } => violation,
+              other => Some(format!(
+                "unexpected response applying index update to {target:?}: {other:?}"
+              )),
+            };
+            let _ = requester_inbox.send(WorkerMessage::IndexUpdateReplied {
+              op_id,
+              target,
+              violation,
+            });
+          }),
+        );
+      }
+      None => {
+        let _ = requester_inbox.send(WorkerMessage::IndexUpdateReplied {
+          op_id,
+          target,
+          violation: Some(format!("no peer-link connection to node {native_node:?}")),
+        });
+      }
+    }
+  }
 }
 
 /// Releases every datum in `datum_ids`, evicting this thread's own
@@ -695,9 +870,24 @@ mod tests {
     ring: Arc<RwLock<Ring>>,
     ops: OpRegistry,
   ) -> Vec<WorkerHandle> {
+    spawn_test_pool_with_index_handlers(
+      thread_count,
+      ring,
+      ops,
+      crate::index_handler::IndexHandlerRegistry::new(),
+    )
+  }
+
+  fn spawn_test_pool_with_index_handlers(
+    thread_count: u32,
+    ring: Arc<RwLock<Ring>>,
+    ops: OpRegistry,
+    index_handlers: crate::index_handler::IndexHandlerRegistry,
+  ) -> Vec<WorkerHandle> {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
     let ops = Arc::new(ops);
     let peer_links = empty_peer_links();
+    let index_handlers = Arc::new(index_handlers);
     let mut senders = Vec::with_capacity(thread_count as usize);
     let mut receivers = Vec::with_capacity(thread_count as usize);
     for _ in 0..thread_count {
@@ -720,7 +910,7 @@ mod tests {
           Arc::clone(&ring),
           NodeId(1),
           Arc::clone(&peer_links),
-          Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
+          Arc::clone(&index_handlers),
         )
       })
       .collect()
@@ -853,5 +1043,80 @@ mod tests {
     let result2 = thread2.join().unwrap();
     assert_eq!(result1, Ok(vec![]));
     assert_eq!(result2, Ok(vec![]));
+  }
+
+  #[test]
+  fn an_op_with_no_index_updates_commits_immediately_as_before() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "touch",
+      Box::new(|ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"touched".to_vec());
+        vec![]
+      }),
+    );
+    let handles = spawn_test_pool(1, ring, ops);
+    let id = DatumId::new();
+    let result = handles[0].run_op(DatumId::new(), "touch".to_string(), vec![id], vec![]);
+    assert_eq!(result, Ok(vec![]));
+  }
+
+  #[test]
+  fn an_op_that_schedules_an_index_update_waits_for_it_before_committing() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let index_target = DatumId::new();
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "touch_with_index",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"touched".to_vec());
+        ctx.schedule_index_update(index_target, "always_ok", vec![]);
+        vec![]
+      }),
+    );
+    let mut index_handlers = crate::index_handler::IndexHandlerRegistry::new();
+    index_handlers.register(
+      "always_ok",
+      Box::new(|_current, payload| (payload.to_vec(), None)),
+    );
+    let handles = spawn_test_pool_with_index_handlers(1, ring, ops, index_handlers);
+    let id = DatumId::new();
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "touch_with_index".to_string(),
+      vec![id],
+      vec![],
+    );
+    assert_eq!(result, Ok(vec![]));
+  }
+
+  #[test]
+  fn a_violation_from_a_scheduled_index_update_fails_the_whole_op_with_no_write() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let index_target = DatumId::new();
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "touch_with_rejected_index",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"should not be written".to_vec());
+        ctx.schedule_index_update(index_target, "always_reject", vec![]);
+        vec![]
+      }),
+    );
+    let mut index_handlers = crate::index_handler::IndexHandlerRegistry::new();
+    index_handlers.register(
+      "always_reject",
+      Box::new(|_current, payload| (payload.to_vec(), Some("rejected".to_string()))),
+    );
+    let handles = spawn_test_pool_with_index_handlers(1, ring, ops, index_handlers);
+    let id = DatumId::new();
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "touch_with_rejected_index".to_string(),
+      vec![id],
+      vec![],
+    );
+    assert_eq!(result, Err("rejected".to_string()));
   }
 }
