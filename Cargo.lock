@@ -208,11 +208,8 @@ name = "seisin-types"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "seisin-client",
  "seisin-core",
  "seisin-node",
- "seisin-ops",
- "seisin-protocol",
  "seisin-ring",
 ]
 
