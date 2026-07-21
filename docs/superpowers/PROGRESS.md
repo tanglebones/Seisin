@@ -166,23 +166,16 @@ As of this entry: 8 crates, 145 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
-## Up next — sequencing decision needed
+## Sequencing decision (2026-07-21)
 
 Sub-project 3 (Collation & multi-datum ops, including all of 3b's parts)
 is now fully done — the entire
 `specs/2026-07-20-cross-node-collation-and-wound-wait-design.md` spec is
-implemented. Two directions are both viable next and neither has been
-chosen yet:
-
-- **Sub-project 4 — Storage tier**, next in the original sub-project
-  sequence (see below).
-- The **datum type system** or **deployment management system** design
-  work (see "Not started — from the 2026-07-20 design additions"
-  below) — both still only sketched at the design-doc level, not yet
-  broken into their own spec/plan cycle.
-
-This needs a decision from whoever picks the work back up, not a
-silent default.
+implemented. Chose **Sub-project 4 — Storage tier** next, per the
+original sub-project sequence, over designing the datum type system or
+deployment management system first (see "Not started — from the
+2026-07-20 design additions" below for those, still only sketched at
+the design-doc level).
 
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier.** Storage-role servers, capacity-
