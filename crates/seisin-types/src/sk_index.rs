@@ -172,10 +172,7 @@ pub fn apply_sk_index_update(current: Option<&[u8]>, payload: &[u8]) -> (Vec<u8>
 /// Registers the `"sk"` kind's `IndexHandler` — call once at startup,
 /// alongside registering a solution's ops.
 pub fn register_sk_index_handler(registry: &mut IndexHandlerRegistry) {
-  registry.register(
-    "sk",
-    Box::new(|current, payload| apply_sk_index_update(current, payload)),
-  );
+  registry.register("sk", Box::new(apply_sk_index_update));
 }
 
 #[cfg(test)]

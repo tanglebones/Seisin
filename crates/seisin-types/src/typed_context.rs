@@ -103,7 +103,11 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
       }
       for index in &tracked.def.indexes {
         let IndexDef::Sk { field, unique } = index;
-        let Some(field_idx) = tracked.def.fields.iter().position(|(name, _)| name == field)
+        let Some(field_idx) = tracked
+          .def
+          .fields
+          .iter()
+          .position(|(name, _)| name == field)
         else {
           continue;
         };
@@ -222,9 +226,15 @@ mod tests {
     let old_key = sk_key("user", "name", &FieldValue::String("cliff".to_string())).unwrap();
     let new_key = sk_key("user", "name", &FieldValue::String("clifford".to_string())).unwrap();
     assert!(updates.iter().any(|u| u.target == old_key
-      && matches!(decode_sk_index_op(&u.payload).unwrap(), SkIndexOp::Remove { .. })));
+      && matches!(
+        decode_sk_index_op(&u.payload).unwrap(),
+        SkIndexOp::Remove { .. }
+      )));
     assert!(updates.iter().any(|u| u.target == new_key
-      && matches!(decode_sk_index_op(&u.payload).unwrap(), SkIndexOp::Insert { .. })));
+      && matches!(
+        decode_sk_index_op(&u.payload).unwrap(),
+        SkIndexOp::Insert { .. }
+      )));
   }
 
   #[test]

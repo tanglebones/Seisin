@@ -224,14 +224,13 @@ fn decode_index_update_request(buf: &[u8]) -> Result<Request> {
   }
   let target = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
   let op_id_offset = 1 + ID_LEN;
-  let op_id = DatumId::from_bytes(
-    buf[op_id_offset..op_id_offset + ID_LEN]
+  let op_id = DatumId::from_bytes(buf[op_id_offset..op_id_offset + ID_LEN].try_into().unwrap());
+  let kind_len_offset = op_id_offset + ID_LEN;
+  let kind_len = u32::from_le_bytes(
+    buf[kind_len_offset..kind_len_offset + 4]
       .try_into()
       .unwrap(),
-  );
-  let kind_len_offset = op_id_offset + ID_LEN;
-  let kind_len =
-    u32::from_le_bytes(buf[kind_len_offset..kind_len_offset + 4].try_into().unwrap()) as usize;
+  ) as usize;
   let kind_offset = kind_len_offset + 4;
   if buf.len() < kind_offset + kind_len {
     bail!("index update request too short for its index_kind");

@@ -212,9 +212,51 @@ commit and push immediately, since work sessions may end abruptly.
   is surfaced as data; the client-side helper makes an ordinary
   follow-up call instead of the framework dispatching one itself.
 
-As of this entry: 9 crates, 190 tests passing, `cargo fmt --check` and
-`cargo clippy --all-targets -- -D warnings` clean. All committed and
-pushed to `main`.
+- **Datum Type System, Part 2 (revised) — Automatic Index Maintenance &
+  Op Lifecycle.** Replaces Part 2's two-round-trip sk write path with a
+  three-phase op lifecycle so indexes can stay **resident** on their
+  owning thread instead of being rebuilt from bytes on every op: (1)
+  **execute** — the op handler's writes are staged in `OpContext`
+  (`staged: HashMap<DatumId, Option<Vec<u8>>>`, read-your-own-writes)
+  rather than written directly; (2) **index-update phase** — for every
+  changed indexed field, the executing thread dispatches an
+  `IndexUpdate` (`WorkerMessage::IndexUpdate` locally,
+  `Request::IndexUpdate`/`Response::IndexUpdateResult` cross-node) to
+  the index datum's owning thread, which applies it against a resident
+  per-thread cache (`HashMap<DatumId, Vec<u8>>` inside `WorkerHandle`,
+  loaded once on cold miss, kept live thereafter; still write-through to
+  disk on every update for now — avoiding that I/O is Storage Tier's
+  job, not this plan's) and checks constraints synchronously; (3)
+  **commit or fail** — once every dispatched reply is in, either the
+  staged writes commit and the client gets `OpResult`, or nothing is
+  written and the client gets `OpError`. `IndexHandlerRegistry`
+  (`seisin-node`, new) keeps this framework-level machinery type-agnostic
+  — `seisin-types` registers the actual `"sk"` `IndexHandler`
+  (`SkIndexOp::{Insert,Remove}`, byte-level `apply_sk_index_update`).
+  `OpRecord` gained `index_update_state: Option<IndexUpdateState>`
+  tracking pending replies; `try_run_if_ready` now dispatches instead of
+  committing immediately whenever an op scheduled updates, and
+  `WorkerMessage::IndexUpdateReplied` performs the actual commit-or-fail
+  once every reply is in. `TypedOpContext` (Drop-based) gives op authors
+  plain `get`/`set`/`delete` calls — its `Drop` impl diffs before/after
+  `FieldValue`s per declared sk index and calls `schedule_index_update`
+  automatically, so index maintenance is never hand-written per op.
+  Proven end-to-end by
+  `integration_automatic_index_maintenance.rs`: a second write of an
+  already-taken unique value fails the whole op via the real
+  cross-thread `IndexUpdate`/`IndexUpdateReplied` round trip (not a
+  shortcut), stress-tested 10x with no flakiness. Retired Part 2's old
+  `typed_write.rs`/`client.rs`/`integration_typed_write_client.rs`
+  two-round-trip design entirely — sk's client-visible behavior
+  (uniqueness rejection) is unchanged, but the mechanism underneath it
+  is not. Parts 3 (rk — splay tree leaderboard), 4 (tk — bitemporal
+  valid-time), and 5 (relational/FK constraint enforcement) build on
+  this same IndexUpdate/IndexHandler mechanism and are next, starting
+  with Part 3 (rk).
+
+As of this entry: 9 crates, 210 tests passing, `cargo fmt --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` clean. All
+committed and pushed to `main`.
 
 ## Sequencing decision (2026-07-21, revised same day)
 

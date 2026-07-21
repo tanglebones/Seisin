@@ -623,9 +623,6 @@ fn send_acquire(
   }
 }
 
-/// If `op_id`'s record has nothing left to acquire, runs it, replies,
-/// then releases every acquired datum back toward its native home.
-#[allow(clippy::too_many_arguments)]
 /// If `op_id`'s record has nothing left to acquire and hasn't already
 /// entered its index-update phase, runs it. An op that scheduled no
 /// index updates commits and replies immediately, exactly as before;
@@ -643,9 +640,9 @@ fn try_run_if_ready(
   self_node_id: NodeId,
   join_sender: &Sender<WorkerMessage>,
 ) {
-  let ready = op_records.get(&op_id).is_some_and(|record| {
-    record.still_needed.is_empty() && record.index_update_state.is_none()
-  });
+  let ready = op_records
+    .get(&op_id)
+    .is_some_and(|record| record.still_needed.is_empty() && record.index_update_state.is_none());
   if !ready {
     return;
   }
