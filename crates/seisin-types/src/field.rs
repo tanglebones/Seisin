@@ -77,12 +77,18 @@ mod tests {
 
   #[test]
   fn a_bool_value_matches_a_bool_type() {
-    assert!(value_matches_type(&FieldValue::Bool(true), &FieldType::Bool));
+    assert!(value_matches_type(
+      &FieldValue::Bool(true),
+      &FieldType::Bool
+    ));
   }
 
   #[test]
   fn a_bool_value_does_not_match_an_i64_type() {
-    assert!(!value_matches_type(&FieldValue::Bool(true), &FieldType::I64));
+    assert!(!value_matches_type(
+      &FieldValue::Bool(true),
+      &FieldType::I64
+    ));
   }
 
   #[test]

@@ -112,7 +112,11 @@ mod tests {
     let mut offset = 0;
     let decoded = decode_field_value(ty, &buf, &mut offset).unwrap();
     assert_eq!(&decoded, value);
-    assert_eq!(offset, buf.len(), "decode must consume exactly the encoded bytes");
+    assert_eq!(
+      offset,
+      buf.len(),
+      "decode must consume exactly the encoded bytes"
+    );
   }
 
   #[test]
@@ -146,7 +150,11 @@ mod tests {
   #[test]
   fn round_trips_an_array_of_i64() {
     let ty = FieldType::Array(Box::new(FieldType::I64));
-    let value = FieldValue::Array(vec![FieldValue::I64(1), FieldValue::I64(2), FieldValue::I64(3)]);
+    let value = FieldValue::Array(vec![
+      FieldValue::I64(1),
+      FieldValue::I64(2),
+      FieldValue::I64(3),
+    ]);
     round_trip(&ty, &value);
   }
 
@@ -173,7 +181,10 @@ mod tests {
       Box::new(FieldType::Bool),
     )));
     let value = FieldValue::Array(vec![
-      FieldValue::Dict(vec![(FieldValue::String("k".to_string()), FieldValue::Bool(true))]),
+      FieldValue::Dict(vec![(
+        FieldValue::String("k".to_string()),
+        FieldValue::Bool(true),
+      )]),
       FieldValue::Dict(vec![]),
     ]);
     round_trip(&ty, &value);

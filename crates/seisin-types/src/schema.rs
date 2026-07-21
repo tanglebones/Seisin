@@ -103,10 +103,7 @@ mod tests {
   #[test]
   fn round_trips_a_simple_datum() {
     let def = user_type();
-    let values = vec![
-      FieldValue::String("cliff".to_string()),
-      FieldValue::I64(41),
-    ];
+    let values = vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)];
     let encoded = encode_datum(&def, &values).unwrap();
     let decoded = decode_datum(&def, &encoded).unwrap();
     assert_eq!(decoded, values);
@@ -132,10 +129,7 @@ mod tests {
   #[test]
   fn decode_rejects_bytes_with_a_trailing_garbage() {
     let def = user_type();
-    let values = vec![
-      FieldValue::String("cliff".to_string()),
-      FieldValue::I64(41),
-    ];
+    let values = vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)];
     let mut encoded = encode_datum(&def, &values).unwrap();
     encoded.push(0xFF); // trailing byte no field consumes
     assert!(decode_datum(&def, &encoded).is_err());

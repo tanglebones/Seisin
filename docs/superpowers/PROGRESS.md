@@ -162,7 +162,24 @@ commit and push immediately, since work sessions may end abruptly.
   startup member list — a node admitted later via gossip has no
   peer-link connection to it at all.
 
-As of this entry: 8 crates, 145 tests passing, `cargo fmt --check` and
+- **Datum Type System, Part 1 — Schema declaration & field encoding.**
+  New crate `seisin-types` (`field.rs`, `encoding.rs`, `schema.rs`), per
+  `specs/2026-07-21-datum-type-system-design.md`. `FieldType`/
+  `PrimitiveFieldType`/`FieldValue` describe and hold a datum type's
+  field shapes; `value_matches_type` checks a value against a declared
+  type recursively (including `Dict` key restriction to primitives).
+  `encode_field_value`/`decode_field_value` are schema-driven — no
+  per-value type tags on the wire, since the declared `FieldType` at
+  each position (recursively, into `Array`/`Dict`) already tells the
+  decoder what to expect. `DatumTypeDef` (builder API: `.field(name,
+  ty)`, mirroring `OpRegistry`'s registration style rather than a
+  proc-macro/codegen pipeline) plus whole-datum `encode_datum`/
+  `decode_datum` validate field count and per-value type match before
+  encoding, and reject trailing undecoded bytes. pk needed no new code —
+  it's the existing `DatumId`. Parts 2 (sk + uniqueness), 3 (rk), 4
+  (tk), 5 (relational constraints) are separate, not-yet-started plans.
+
+As of this entry: 9 crates, 168 tests passing, `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean. All committed and
 pushed to `main`.
 
@@ -202,13 +219,13 @@ resume once the type system is designed.
 These are new design surface added to the doc but not yet broken into
 sub-project plans:
 
-- **Datum type system.** Typed, homogeneous datum types (Rust primitives/
-  arrays/dicts with primitive keys), secondary indexes declared as part
-  of a type, relational constraints (enforcement mechanism undecided —
-  see the design doc's Open Questions). Four index kinds per type: pk
-  (required, the datum_id itself), sk (secondary key, already mechanically
-  specified), rk (stochastically ranked, mechanics TBD), tk (temporal,
-  mechanics TBD) — rk/tk explicitly deferred for later detailing.
+- **Datum type system.** Fully designed in
+  `specs/2026-07-21-datum-type-system-design.md` (schema, pk/sk/rk/tk,
+  uniqueness/relational constraint enforcement). Part 1 (schema
+  declaration & field encoding) is done — see "Done" above. Parts 2
+  (sk index + uniqueness constraint), 3 (rk — splay tree leaderboard),
+  4 (tk — bitemporal valid-time), and 5 (relational/FK constraint
+  enforcement) are separate, not-yet-started plans.
 - **Framework/codegen shape.** Seisin's actual deliverable is base
   libraries a solution uses to define datum types + operations in code,
   compiling into a server executable and a paired client library. None
@@ -231,5 +248,6 @@ system first — rationale: collation operates at the
 `DatumId`/`AuthorityIdx` level (which thread runs an op touching
 multiple datums), not on typed content, so nothing about wound-wait/
 foreign-pull/anti-degeneration needed the type system designed first.
-That work is now complete (see "Done" above); see "Up next" above for
-the sequencing decision that replaces this one.
+That work is now complete (see "Done" above); see the "Sequencing
+decision (2026-07-21, revised same day)" section above for the
+sequencing decision that replaces this one.
