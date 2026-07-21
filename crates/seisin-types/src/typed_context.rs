@@ -1,0 +1,327 @@
+//! A typed accessor wrapping `OpContext`, used by a solution's op
+//! handler instead of raw `ctx.get`/`ctx.put`. Field-level changes are
+//! detected automatically on drop and turned into scheduled index
+//! updates — the op author never writes index-maintenance code by
+//! hand. See the design doc's "Automatic Index Maintenance & Op
+//! Lifecycle" section.
+
+use std::collections::HashMap;
+
+use seisin_core::datum::DatumId;
+use seisin_ops::context::OpContext;
+
+use crate::field::FieldValue;
+use crate::schema::{decode_datum, encode_datum, DatumTypeDef, IndexDef};
+use crate::sk_index::{encode_sk_index_op, sk_key, SkIndexOp};
+
+struct TrackedDatum {
+  def: DatumTypeDef,
+  before: Option<Vec<FieldValue>>,
+  after: Option<Vec<FieldValue>>,
+  touched: bool,
+}
+
+pub struct TypedOpContext<'a, 'b> {
+  ctx: &'b mut OpContext<'a>,
+  tracked: HashMap<DatumId, TrackedDatum>,
+}
+
+impl<'a, 'b> TypedOpContext<'a, 'b> {
+  pub fn new(ctx: &'b mut OpContext<'a>) -> Self {
+    Self {
+      ctx,
+      tracked: HashMap::new(),
+    }
+  }
+
+  /// Reads `pk_id`'s current typed value, decoding via `def`. Remembers
+  /// it as the "before" snapshot for diffing on drop, if `pk_id` hasn't
+  /// been tracked yet this op.
+  pub fn get(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Option<Vec<FieldValue>> {
+    let values = self
+      .ctx
+      .get(pk_id)
+      .and_then(|bytes| decode_datum(def, &bytes).ok());
+    self.tracked.entry(pk_id).or_insert_with(|| TrackedDatum {
+      def: def.clone(),
+      before: values.clone(),
+      after: values.clone(),
+      touched: false,
+    });
+    values
+  }
+
+  /// Writes `pk_id`'s new typed value. The byte write is staged
+  /// immediately via the underlying `OpContext`; index maintenance is
+  /// computed automatically on drop.
+  pub fn set(&mut self, pk_id: DatumId, def: &DatumTypeDef, values: Vec<FieldValue>) {
+    self.ensure_tracked(pk_id, def);
+    if let Ok(bytes) = encode_datum(def, &values) {
+      self.ctx.put(pk_id, bytes);
+    }
+    let entry = self.tracked.get_mut(&pk_id).unwrap();
+    entry.after = Some(values);
+    entry.touched = true;
+  }
+
+  /// Deletes `pk_id`. Same tracking/diffing as `set`, but with an
+  /// `after` of `None` — every declared sk index gets a remove
+  /// scheduled for whatever the "before" value was.
+  pub fn delete(&mut self, pk_id: DatumId, def: &DatumTypeDef) {
+    self.ensure_tracked(pk_id, def);
+    self.ctx.delete(pk_id);
+    let entry = self.tracked.get_mut(&pk_id).unwrap();
+    entry.after = None;
+    entry.touched = true;
+  }
+
+  fn ensure_tracked(&mut self, pk_id: DatumId, def: &DatumTypeDef) {
+    if self.tracked.contains_key(&pk_id) {
+      return;
+    }
+    let before = self
+      .ctx
+      .get(pk_id)
+      .and_then(|bytes| decode_datum(def, &bytes).ok());
+    self.tracked.insert(
+      pk_id,
+      TrackedDatum {
+        def: def.clone(),
+        before,
+        after: None,
+        touched: false,
+      },
+    );
+  }
+}
+
+impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
+  fn drop(&mut self) {
+    for (pk_id, tracked) in self.tracked.drain() {
+      if !tracked.touched {
+        continue;
+      }
+      for index in &tracked.def.indexes {
+        let IndexDef::Sk { field, unique } = index;
+        let Some(field_idx) = tracked.def.fields.iter().position(|(name, _)| name == field)
+        else {
+          continue;
+        };
+        let old_value = tracked.before.as_ref().map(|v| v[field_idx].clone());
+        let new_value = tracked.after.as_ref().map(|v| v[field_idx].clone());
+        if old_value == new_value {
+          continue;
+        }
+        if let Some(old_value) = &old_value {
+          if let Ok(old_key) = sk_key(&tracked.def.name, field, old_value) {
+            let payload = encode_sk_index_op(&SkIndexOp::Remove { pk_id });
+            self.ctx.schedule_index_update(old_key, "sk", payload);
+          }
+        }
+        if let Some(new_value) = &new_value {
+          if let Ok(new_key) = sk_key(&tracked.def.name, field, new_value) {
+            let conflict_op = unique.as_ref().map(|op| op.0.clone());
+            let payload = encode_sk_index_op(&SkIndexOp::Insert {
+              pk_id,
+              unique_conflict_op: conflict_op,
+            });
+            self.ctx.schedule_index_update(new_key, "sk", payload);
+          }
+        }
+      }
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::field::FieldType;
+  use crate::schema::{ConflictOp, DatumTypeDef, IndexDef};
+  use crate::sk_index::{decode_sk_index_op, sk_key, SkIndexOp};
+  use seisin_core::cache::Cache;
+  use seisin_core::store::InMemoryStore;
+  use seisin_ops::context::OpContext;
+  use std::sync::Arc;
+
+  fn user_type() -> DatumTypeDef {
+    DatumTypeDef::new("user")
+      .field("name", FieldType::String)
+      .field("age", FieldType::I64)
+      .index(IndexDef::Sk {
+        field: "name".to_string(),
+        unique: None,
+      })
+  }
+
+  #[test]
+  fn a_fresh_create_schedules_one_insert_and_no_remove() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let def = user_type();
+    let pk_id = DatumId::new();
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.set(
+        pk_id,
+        &def,
+        vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)],
+      );
+    } // tctx dropped here — diffing happens now
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].index_kind, "sk");
+    let expected_key = sk_key("user", "name", &FieldValue::String("cliff".to_string())).unwrap();
+    assert_eq!(updates[0].target, expected_key);
+    match decode_sk_index_op(&updates[0].payload).unwrap() {
+      SkIndexOp::Insert { pk_id: id, .. } => assert_eq!(id, pk_id),
+      other => panic!("expected an Insert op, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn updating_the_indexed_field_schedules_a_remove_and_an_insert() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = user_type();
+    let pk_id = DatumId::new();
+
+    // First write: establishes the pk datum's initial content directly
+    // via the underlying OpContext (simulating an earlier op).
+    {
+      let mut ctx = OpContext::new(&mut cache);
+      ctx.put(
+        pk_id,
+        crate::encode_datum(
+          &def,
+          &[FieldValue::String("cliff".to_string()), FieldValue::I64(41)],
+        )
+        .unwrap(),
+      );
+      for (id, content) in ctx.take_staged_writes() {
+        if let Some(bytes) = content {
+          cache.put(id, bytes);
+        }
+      }
+    }
+
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk_id, &def);
+      tctx.set(
+        pk_id,
+        &def,
+        vec![
+          FieldValue::String("clifford".to_string()),
+          FieldValue::I64(41),
+        ],
+      );
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 2);
+    let old_key = sk_key("user", "name", &FieldValue::String("cliff".to_string())).unwrap();
+    let new_key = sk_key("user", "name", &FieldValue::String("clifford".to_string())).unwrap();
+    assert!(updates.iter().any(|u| u.target == old_key
+      && matches!(decode_sk_index_op(&u.payload).unwrap(), SkIndexOp::Remove { .. })));
+    assert!(updates.iter().any(|u| u.target == new_key
+      && matches!(decode_sk_index_op(&u.payload).unwrap(), SkIndexOp::Insert { .. })));
+  }
+
+  #[test]
+  fn writing_the_same_indexed_value_again_schedules_nothing() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = user_type();
+    let pk_id = DatumId::new();
+    let values = vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)];
+    {
+      let mut ctx = OpContext::new(&mut cache);
+      ctx.put(pk_id, crate::encode_datum(&def, &values).unwrap());
+      for (id, content) in ctx.take_staged_writes() {
+        if let Some(bytes) = content {
+          cache.put(id, bytes);
+        }
+      }
+    }
+
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk_id, &def);
+      tctx.set(pk_id, &def, values);
+    }
+    assert_eq!(ctx.take_pending_index_updates().len(), 0);
+  }
+
+  #[test]
+  fn a_plain_get_with_no_set_schedules_nothing() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = user_type();
+    let pk_id = DatumId::new();
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk_id, &def);
+    }
+    assert_eq!(ctx.take_pending_index_updates().len(), 0);
+  }
+
+  #[test]
+  fn delete_schedules_a_remove_from_every_declared_sk_index() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = user_type();
+    let pk_id = DatumId::new();
+    let values = vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)];
+    {
+      let mut ctx = OpContext::new(&mut cache);
+      ctx.put(pk_id, crate::encode_datum(&def, &values).unwrap());
+      for (id, content) in ctx.take_staged_writes() {
+        if let Some(bytes) = content {
+          cache.put(id, bytes);
+        }
+      }
+    }
+
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk_id, &def);
+      tctx.delete(pk_id, &def);
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    let key = sk_key("user", "name", &FieldValue::String("cliff".to_string())).unwrap();
+    assert_eq!(updates[0].target, key);
+    assert!(matches!(
+      decode_sk_index_op(&updates[0].payload).unwrap(),
+      SkIndexOp::Remove { .. }
+    ));
+  }
+
+  #[test]
+  fn a_unique_index_carries_its_conflict_op_into_the_scheduled_insert() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let def = DatumTypeDef::new("user")
+      .field("email", FieldType::String)
+      .index(IndexDef::Sk {
+        field: "email".to_string(),
+        unique: Some(ConflictOp("resolve".to_string())),
+      });
+    let pk_id = DatumId::new();
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.set(
+        pk_id,
+        &def,
+        vec![FieldValue::String("a@example.com".to_string())],
+      );
+    }
+    let updates = ctx.take_pending_index_updates();
+    match decode_sk_index_op(&updates[0].payload).unwrap() {
+      SkIndexOp::Insert {
+        unique_conflict_op, ..
+      } => assert_eq!(unique_conflict_op, Some("resolve".to_string())),
+      other => panic!("expected an Insert op, got {other:?}"),
+    }
+  }
+}
