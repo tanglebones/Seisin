@@ -3,7 +3,10 @@
 //! writes. See the design doc's "sk Index" section.
 
 use anyhow::{bail, Result};
+use seisin_core::authority::AuthorityIdx;
 use seisin_core::datum::DatumId;
+use seisin_core::sk::{decode_sk_entries, encode_sk_entries};
+use seisin_ops::context::OpContext;
 
 use crate::field::FieldValue;
 
@@ -40,6 +43,65 @@ pub fn sk_key(type_name: &str, field_name: &str, value: &FieldValue) -> Result<D
     }
   }
   Ok(DatumId::from_name(&derived_id_namespace(), &name))
+}
+
+/// A detected uniqueness violation: `sk_key` now holds more than one
+/// distinct pk_id, and `conflict_op` names the op the caller declared
+/// for resolving it. Nothing in this crate invokes `conflict_op` — see
+/// the "Constraint Enforcement" section of the design doc and this
+/// plan's Global Constraints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniquenessViolation {
+  pub sk_key: DatumId,
+  pub conflict_op: String,
+}
+
+/// Appends `(pk_id, AuthorityIdx::Native)` to `sk_key`'s entry list if
+/// `pk_id` isn't already present (re-inserting the same pk_id is a
+/// no-op, not a duplicate). If `unique_conflict_op` is `Some`, checks
+/// whether the list already holds a *different* pk_id — if so, this is
+/// the best-effort uniqueness violation, reported (not rejected here;
+/// see `write_typed_datum` for where a caller actually decides to reject
+/// the write).
+pub fn insert_sk_entry(
+  ctx: &mut OpContext,
+  sk_key: DatumId,
+  pk_id: DatumId,
+  unique_conflict_op: Option<String>,
+) -> Result<Option<UniquenessViolation>> {
+  let mut entries = match ctx.get(sk_key) {
+    Some(bytes) => decode_sk_entries(&bytes)?,
+    None => Vec::new(),
+  };
+
+  if let Some(conflict_op) = &unique_conflict_op {
+    if entries.iter().any(|(id, _)| *id != pk_id) {
+      ctx.put(sk_key, encode_sk_entries(&entries));
+      return Ok(Some(UniquenessViolation {
+        sk_key,
+        conflict_op: conflict_op.clone(),
+      }));
+    }
+  }
+
+  if !entries.iter().any(|(id, _)| *id == pk_id) {
+    entries.push((pk_id, AuthorityIdx::Native));
+  }
+  ctx.put(sk_key, encode_sk_entries(&entries));
+  Ok(None)
+}
+
+/// Removes `pk_id`'s entry from `sk_key`'s list, if present. A missing
+/// `sk_key` datum (never written, or already empty) is a no-op.
+pub fn remove_sk_entry(ctx: &mut OpContext, sk_key: DatumId, pk_id: DatumId) {
+  let Some(bytes) = ctx.get(sk_key) else {
+    return;
+  };
+  let Ok(mut entries) = decode_sk_entries(&bytes) else {
+    return;
+  };
+  entries.retain(|(id, _)| *id != pk_id);
+  ctx.put(sk_key, encode_sk_entries(&entries));
 }
 
 #[cfg(test)]
@@ -87,5 +149,62 @@ mod tests {
   fn array_and_dict_values_are_rejected() {
     assert!(sk_key("user", "tags", &FieldValue::Array(vec![])).is_err());
     assert!(sk_key("user", "meta", &FieldValue::Dict(vec![])).is_err());
+  }
+
+  use seisin_core::cache::Cache;
+  use seisin_core::store::InMemoryStore;
+  use seisin_ops::context::OpContext;
+  use std::sync::Arc;
+
+  #[test]
+  fn insert_then_remove_round_trips_through_a_real_cache() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let key = sk_key("user", "name", &FieldValue::String("cliff".to_string())).unwrap();
+    let pk_id = DatumId::new();
+
+    let violation = insert_sk_entry(&mut ctx, key, pk_id, None).unwrap();
+    assert!(violation.is_none());
+
+    remove_sk_entry(&mut ctx, key, pk_id);
+    let bytes = ctx.get(key).unwrap();
+    assert_eq!(seisin_core::sk::decode_sk_entries(&bytes).unwrap(), vec![]);
+  }
+
+  #[test]
+  fn a_second_insert_of_a_different_pk_id_is_flagged_as_a_violation() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let key = sk_key("user", "email", &FieldValue::String("a@example.com".to_string())).unwrap();
+    let first_pk = DatumId::new();
+    let second_pk = DatumId::new();
+
+    let first = insert_sk_entry(&mut ctx, key, first_pk, Some("resolve".to_string())).unwrap();
+    assert!(first.is_none());
+
+    let second = insert_sk_entry(&mut ctx, key, second_pk, Some("resolve".to_string())).unwrap();
+    let violation = second.expect("a second distinct pk_id must be flagged");
+    assert_eq!(violation.sk_key, key);
+    assert_eq!(violation.conflict_op, "resolve");
+  }
+
+  #[test]
+  fn inserting_the_same_pk_id_twice_is_not_a_violation() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let key = sk_key("user", "email", &FieldValue::String("a@example.com".to_string())).unwrap();
+    let pk_id = DatumId::new();
+
+    insert_sk_entry(&mut ctx, key, pk_id, Some("resolve".to_string())).unwrap();
+    let second = insert_sk_entry(&mut ctx, key, pk_id, Some("resolve".to_string())).unwrap();
+    assert!(second.is_none(), "re-inserting the same pk_id is not a duplicate");
+  }
+
+  #[test]
+  fn remove_on_a_missing_key_is_a_no_op() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let key = sk_key("user", "name", &FieldValue::String("nobody".to_string())).unwrap();
+    remove_sk_entry(&mut ctx, key, DatumId::new()); // must not panic
   }
 }

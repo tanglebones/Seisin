@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 seisin-core = { path = "../seisin-core" }
+seisin-ops = { path = "../seisin-ops" }
 anyhow = "1"
