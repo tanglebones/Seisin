@@ -14,16 +14,23 @@ storage-format rework later.
 
 Everything here builds on Sub-projects 1-3 (fully implemented on `main`):
 the wire protocol, `OpRegistry`/`OpContext`, `NativeLock`/collation, and
-cross-node acquisition/wound-wait. No changes to those mechanisms are
-required except where explicitly noted below (none are).
+cross-node acquisition/wound-wait. Most of this spec needs no changes to
+those mechanisms — the one exception, added in this revision, is
+"Automatic Index Maintenance & Op Lifecycle" below, which extends
+`worker.rs`'s op-record tracking and the wire protocol with a new
+`IndexUpdate` message pair. Nothing about collation/wound-wait/crash
+recovery itself changes; a new phase is added to an op's own lifecycle.
 
 ## Scope
 
-In scope: schema declaration and field encoding; the pk, sk, rk, and tk
-index kinds, fully specified; uniqueness and relational (FK) constraint
-enforcement (best-effort inline check + eventual authoritative check
-invoking a solution-declared conflict-resolution op). Out of scope,
-explicitly: transaction-time audit
+In scope: schema declaration and field encoding; automatic, framework-
+driven index maintenance via a new op-lifecycle phase (see "Automatic
+Index Maintenance & Op Lifecycle"); the pk, sk, rk, and tk index kinds,
+fully specified; uniqueness enforcement (synchronous, as part of that new
+op-lifecycle phase) and relational (FK) constraint enforcement
+(best-effort inline check + eventual authoritative check, both invoking a
+solution-declared conflict-resolution op). Out of scope, explicitly:
+transaction-time audit
 logging (a separate, system-wide concern per the database guideline's own
 split of the two time axes — not part of this sub-project); the
 deployment/schema-evolution rollout system (already sketched separately in
@@ -92,6 +99,93 @@ its own storage), matching the database guideline's own framing of `_t_`
 tables directly. All other fields (non-tk) live in the plain datum content
 as normal.
 
+## Automatic Index Maintenance & Op Lifecycle (revised 2026-07-21)
+
+Supersedes the "two-round-trip, client-driven" update flow originally
+described under sk/rk/tk below — those sections' "Update flow" bullets
+now point here instead of describing their own bespoke flow. This is the
+actual mechanism every index kind's writes go through.
+
+**Motivation.** An index structure (especially rk's splay tree) must
+never be rebuilt from serialized bytes on every single update, and must
+never be collated onto a foreign thread the way a normal multi-datum op
+pulls other datums together — an index's residency is pinned to its own
+native-home thread, for as long as that thread runs, full stop.
+
+**Field-level change tracking, no codegen yet.** An op's registered
+handler operates through a typed accessor layer (`seisin-types`, built on
+top of the existing byte-level `OpContext`) rather than raw
+`ctx.get`/`ctx.put`. It reads/writes `FieldValue`s per `(datum_id,
+field)`, and the *framework* — not the op author — detects which fields
+actually changed by comparing what was read against what was written, so
+an op author never writes index-maintenance code by hand. (Ergonomics
+like `changeName(User u, String n) { u.name = n; }` are illustrative of
+the eventual codegen layer this could support, not something this
+increment builds — see "Framework/codegen shape" in `PROGRESS.md`.)
+
+**Writes are staged, not immediate.** A typed write during an op's
+business-logic phase does not commit to cache/storage right away — it's
+held in memory until the op's overall outcome, including every index
+update it triggers, is known.
+
+**Three op lifecycle phases**, extending the existing `OpRecord`/
+collation machinery (which already tracks in-flight `Acquire`s the same
+non-blocking way — see `worker.rs`):
+
+1. **Execute** — the op's handler runs, producing staged field changes;
+   nothing is written through yet.
+2. **Index update phase** — for every changed, indexed field, the
+   executing thread sends a new `IndexUpdate` message to whichever
+   thread natively owns that index datum:
+   - Locally: a new `WorkerMessage::IndexUpdate { target: DatumId, op_id:
+     DatumId, payload: Vec<u8> }` variant, following the exact
+     `Acquire`/`Recall`/`Release` pattern already established.
+   - Cross-node: a new `Request::IndexUpdate { target, op_id, payload }`
+     / `Response::IndexUpdateResult(Result<(), String>)` wire pair
+     (`payload` is opaque to the framework, exactly like `Request::Op`'s
+     payload — interpreted by whichever index-kind logic owns `target`,
+     which already knows what kind of index it is).
+   The op's own record tracks how many `IndexUpdate` replies it's still
+   waiting on, the same way it already tracks `still_needed` acquires —
+   the executing *thread* keeps processing other work in the meantime;
+   only this specific op isn't ready yet. The index-owning thread applies
+   the change to its resident, never-rebuilt-from-scratch in-memory
+   structure (loaded once on first access, kept live across every future
+   update on that thread) and checks any declared uniqueness/FK
+   constraint synchronously — it's local to that thread by construction
+   — before replying success or violation.
+3. **Commit or fail** — once every dispatched `IndexUpdate` reply is in:
+   if all succeeded, the staged write actually lands (`ctx.put`,
+   write-through-before-ack as already established) and the client gets
+   `OpResult`; if any reported a violation, nothing is written at all and
+   the client gets `OpError` — the whole op is discarded, not partially
+   applied.
+
+**Still best-effort, not a hard cross-op guarantee.** This makes
+checking synchronous and reliable *within* a single op's index-update
+phase — two ops racing to write the same new unique value both dispatch
+to the same index-owning thread, which processes them one at a time in
+message order, so that specific race resolves correctly. It does not
+provide full distributed-transaction atomicity (an explicit non-goal of
+this project already): a crash mid-sequence is handled by the existing
+crash-detection/lock-release machinery from Sub-project 3b Part 2b at the
+ownership level, not re-solved here.
+
+**Deliberately not in this increment's scope**: which thread an op gets
+*collated to* in the first place (native-majority heuristic, from
+Sub-project 3's `pool.rs`) still doesn't know to prefer an index's native
+thread over the pk datum's — a normal cross-node `IndexUpdate` dispatch
+works correctly regardless of where the main op happens to run, so
+revisiting that heuristic is a reasonable future throughput optimization,
+not a correctness requirement here.
+
+**Retrofit required.** Part 2 (sk index) shipped using the earlier
+two-round-trip, client-driven design — client pre-reads the old value,
+declares every sk datum_id up front, everything collated onto one
+thread. That implementation needs reworking onto this mechanism before
+rk (Part 3) is built on the same foundation; this is the first task of
+the next implementation plan, not a separate one.
+
 ## pk Index
 
 Trivial, unchanged: the datum_id itself is the primary key. No new
@@ -107,42 +201,23 @@ automatically today; this sub-project adds that.
   used by the design doc's own example, `sk:user.name:cliff`).
 - **Content**: a list of `(DatumId, AuthorityIdx)` pairs (unchanged from
   the existing `encode_sk_entries`/`decode_sk_entries`).
-- **Update flow — two round trips, client-driven.** Updating an sk-indexed
-  field requires removing the old entry from the old key's list, but the
-  old value isn't known until the pk datum is actually read — and
-  collation today requires an op to declare every `datum_id` it needs
-  *before* execution starts (see `worker.rs`'s `RunOp` handler sending an
-  `Acquire` for each declared id up front). Rather than extending
-  collation to support discovering a new required datum mid-op (a real
-  architectural change — op execution would need to pause and resume on a
-  new grant), the typed-write helper does this instead:
-  1. A plain read of the pk datum, to learn the current (soon-to-be-old)
-     field value and derive `sk_old_key`.
-  2. The actual write op, declaring `datum_ids: [pk_id, sk_new_key,
-     sk_old_key]` (omitting `sk_old_key` on a fresh create, or when the
-     value didn't change) — the op appends `(pk_id, Native)` to
-     `sk_new_key`'s entry list and removes `pk_id`'s entry from
-     `sk_old_key`'s list.
-  This costs an extra round trip only when an sk-indexed field is actually
-  changing, and keeps the collation/wound-wait model completely
-  untouched. Contention on a shared sk key (e.g. two writers both naming
-  an entity "cliff" concurrently) resolves via the exact same
-  wound-wait/collation machinery already built for any other regular
-  datum — no new concurrency primitive needed.
-- **Uniqueness (`unique: Some(ConflictOp)`)**: before appending `(pk_id,
-  Native)` to `sk_new_key`'s entry list in step 2 above, the op checks
-  whether that list already holds an entry for a *different* pk_id — if
-  so, it rejects the write (returns an error) instead of inserting a
-  probable duplicate. This best-effort check is genuinely authoritative
-  for the common case (two writers racing on the same sk key resolve
-  through the same wound-wait collation as any other sk update, so
-  whichever runs second always sees the first's already-committed insert)
-  — but it is not a full guarantee: a crash of the owning thread/node
-  between this check passing and the op's write-through-before-ack
-  completing can still leave more than one entry behind after lazy
-  recovery, since there's no cross-op transaction making check-then-
-  commit atomic against a crash in between. See "Constraint Enforcement"
-  below for the eventual/authoritative backstop.
+- **Update flow**: via the "Automatic Index Maintenance & Op Lifecycle"
+  mechanism above — the framework detects the indexed field changed,
+  dispatches an `IndexUpdate` to the old sk key's owning thread (removing
+  the entry, if the field had a prior value) and one to the new sk key's
+  owning thread (appending `(pk_id, Native)`), and only commits the pk
+  write once both replies are in.
+- **Uniqueness (`unique: Some(ConflictOp)`)**: when applying an insert to
+  a unique-flagged sk key, the owning thread checks whether the entry
+  list already holds an entry for a *different* pk_id — if so, it replies
+  with a violation instead of inserting a probable duplicate, which fails
+  the whole op per the lifecycle above (no pk write, no index change).
+  This is checked synchronously as part of the index-update phase, on the
+  thread that actually owns the sk key, so it's authoritative for any
+  contention on that specific key (the owning thread processes every
+  `IndexUpdate` for it one at a time). It is still not a full
+  cross-op guarantee — see the lifecycle section's "still best-effort"
+  note.
 
 ## rk Index (Ranked/Sampled — Leaderboards)
 
@@ -184,22 +259,27 @@ numeric field" need.
   directly without materializing the tree, for a lightweight query that
   doesn't need the full structure.
 - **Storage Tier dependency, noted here for when that sub-project's disk
-  engine is designed**: an insert/delete anywhere in this Vec logically
-  touches the whole structure, and Seisin's storage model otherwise treats
-  a datum's content as one opaque blob rewritten in full on every `put`.
-  For a large rk (or tk, see below) index, naively rewriting the entire
-  blob on every single update would mean genuinely expensive disk I/O per
-  write. This spec deliberately does **not** solve that here — it's a
-  disk-engine concern, not a content-model concern — but Storage Tier's
-  `DiskStore` needs an append-only-journal-with-periodic-compaction format
-  (or equivalent) for large, frequently-updated datums like this, rather
-  than whole-file rewrites, when that sub-project's disk format is
-  designed.
-- **Update flow**: same two-round-trip shape as sk (read old value if
-  updating, derive whether the rank position needs to move), but touching
-  only *one* datum (`rk:type.field`) rather than two, since there's no
-  value-keyed partitioning to move between — the update is a
-  remove-old-rank-key + insert-new-rank-key against the same structure.
+  engine is designed**: the "Automatic Index Maintenance" mechanism above
+  keeps this splay tree resident in memory on its owning thread, so
+  rebuilding it from bytes on every update is no longer a concern (it's
+  built once, on first access). What's still Storage Tier's problem: an
+  insert/delete anywhere in this structure logically touches the whole
+  sorted-Vec disk representation, and Seisin's storage model otherwise
+  treats a datum's content as one opaque blob rewritten in full on every
+  `put`. For a large rk (or tk, see below) index, naively rewriting the
+  entire blob on every single update would mean genuinely expensive disk
+  I/O per write — Storage Tier's `DiskStore` needs an
+  append-only-journal-with-periodic-compaction format (or equivalent) for
+  large, frequently-updated datums like this, rather than whole-file
+  rewrites, when that sub-project's disk format is designed. This spec
+  deliberately does not solve that part — it's a disk-engine concern, not
+  a content-model or in-memory-residency concern.
+- **Update flow**: via the "Automatic Index Maintenance & Op Lifecycle"
+  mechanism above — the framework detects the rk-indexed field changed
+  and dispatches a single `IndexUpdate` to `rk:type.field`'s owning
+  thread (remove the old rank_key entry if one existed, insert the new
+  one), touching only this one datum since there's no value-keyed
+  partitioning to move between (unlike sk).
 - **Query surface**: `top_n(n)` / `bottom_n(n)` (bounded in-order walk
   from an end — no splay needed, a plain tree walk respecting current
   shape); `percentile_sample(p, k)` (k evenly-spaced or weighted-random
@@ -251,21 +331,24 @@ collapsed into one mechanism.
   Storage Tier dependency applies (see rk's note above): a
   journal-with-compaction disk format avoids rewriting the whole history
   on every single correction.
-- **Overlap invariant**: enforced by the writing op itself, since there's
-  no database-level exclusion constraint available. A correction-upsert:
+- **Overlap invariant**: enforced by the index-owning thread itself, via
+  the "Automatic Index Maintenance & Op Lifecycle" mechanism above —
+  there's no database-level exclusion constraint available, so this is the
+  correction-upsert logic applied inside the `IndexUpdate` handler for a
+  tk key:
   1. Given `(pk_id, field, as_of, new_value)`, read the tk datum's own
-     content (already known deterministically from `pk_id` alone — no
-     external lookup needed, unlike sk's old-value problem).
+     resident content (its `tk:type.field:pk_id` id is deterministic from
+     `pk_id` alone — no old-value read needed to compute the target,
+     unlike sk).
   2. Find the entry whose range covers `as_of` (normally the currently-
      open one, `upper == None`, for a forward-dated correction; could be
      a past closed entry for a backdated correction) and set its `upper =
      as_of`.
   3. Insert the new entry `(as_of, previous_upper, new_value)` at the
      correct sorted position.
-  This is a **single-datum op** — `datum_ids: [tk:type.field:pk_id]` (or
-  including `pk_id` too, if the same op also touches other fields on the
-  entity) — no two-round-trip needed, since the tk key doesn't depend on
-  any value that must first be read.
+  Dispatched the same way as sk/rk: the framework detects the tk-indexed
+  field changed and sends one `IndexUpdate` to `tk:type.field:pk_id`'s
+  owning thread, which stays resident there like any other index.
 - **Query surface**: `as_of(pk_id, timestamp) -> Option<FieldValue>`
   (binary search the `lowers`/`uppers` columns for the covering range);
   `current(pk_id) -> Option<FieldValue>` (the entry with `upper == None`,
@@ -283,36 +366,22 @@ collapsed into one mechanism.
 
 ## Constraint Enforcement (Uniqueness & Relational)
 
-Neither uniqueness nor relational (FK) constraints can be a hard,
-synchronous guarantee in this ownership model — there's no cross-op
-transaction boundary spanning "check, then commit" (matches the original
-design doc's explicit non-goal of distributed transactions), so both
-share the same two-tier shape:
+**Revised alongside "Automatic Index Maintenance" above.** The primary
+enforcement mechanism for uniqueness is now the synchronous check inside
+the index-update phase (see "sk Index"'s Uniqueness bullet) — since every
+sk write is already dispatched to, and synchronously checked by, its
+owning thread before the whole op is allowed to commit, there's no
+separate "best-effort inline check, hope a background scan catches what
+it missed" story needed for uniqueness anymore. It's not a full
+cross-op/distributed-transaction guarantee (this project's explicit
+non-goal), but it's substantially stronger than the original two-tier
+design: a genuine violation fails the whole op before anything commits,
+for any contention the index-update phase actually observes.
 
-1. **Best-effort synchronous check**, at write time — cheap, uses data
-   the op is already touching, catches the common case immediately, and
-   is genuinely authoritative for same-datum contention (which resolves
-   through existing wound-wait collation). It is not a full guarantee: a
-   crash of the owning thread/node between the check passing and
-   write-through-before-ack completing can still leave a real violation
-   behind.
-2. **Eventual, authoritative check** — a periodic background scan that is
-   the real source of truth. Any genuine violation it finds invokes a
-   **solution-declared conflict-resolution op** (`ConflictOp`, a name
-   registered the same way as any other domain op via `OpRegistry`) —
-   Seisin's part is detecting the violation and invoking the op; the
-   *policy* for resolving it (keep-oldest, merge, cascade-delete,
-   flag-for-review, whatever fits the solution) is entirely up to that
-   op's implementation, not prescribed here.
-
-**Uniqueness** (`IndexDef::Sk { unique: Some(ConflictOp), .. }`) — the
-best-effort check is described under "sk Index" above. The eventual check
-periodically scans sk indexes declared unique for any entry list with
-more than one entry, and calls the declared `ConflictOp` with the full
-list of conflicting `(DatumId, AuthorityIdx)` entries.
-
-**Relational (FK) constraints** — a constraint declares a referencing
-field on one type, the type it points to, and a `ConflictOp`:
+**Relational (FK) constraints** don't have an owning "index" datum the
+same way sk does (a reference is just a field pointing at another type's
+pk_id, not a maintained structure), so they keep their own two-tier
+shape:
 
 ```rust
 pub struct RelationalConstraintDef {
@@ -322,54 +391,81 @@ pub struct RelationalConstraintDef {
 }
 ```
 
-- Best-effort check: at write time, a plain existence check (`ctx.get` on
-  the referenced pk_id) before committing the write — rejected
-  synchronously if absent, catching the common "reference to something
-  that never existed" case immediately. Not a full guarantee: the
-  referenced entity could be deleted concurrently with (or immediately
-  after) this check, which no cross-datum transaction prevents.
-- Eventual check: a periodic scan over declared FK fields finds dangling
-  references (pointing to a pk_id that no longer exists) and calls the
-  constraint's declared `ConflictOp` with the violating datum_id and the
-  missing reference — replacing any notion of passive logging with the
-  same detect-and-resolve-via-op mechanism uniqueness uses.
+1. **Best-effort synchronous check**, at write time — a plain existence
+   check (`ctx.get` on the referenced pk_id) before committing the write,
+   rejected synchronously if absent. Catches the common "reference to
+   something that never existed" case immediately. Not a full guarantee:
+   the referenced entity could be deleted concurrently with (or
+   immediately after) this check, which no cross-datum transaction
+   prevents.
+2. **Eventual, authoritative check** — a periodic background scan over
+   declared FK fields that finds dangling references (pointing to a
+   pk_id that no longer exists) and calls the constraint's declared
+   `ConflictOp` with the violating datum_id and the missing reference.
+   This remains genuinely "eventual" (unlike uniqueness, there's no
+   single owning thread a reference check could be synchronously
+   dispatched to without picking an arbitrary one) — Seisin's part is
+   detecting the violation and invoking the op; the *policy* for
+   resolving it (null out the reference, cascade-delete, flag-for-review,
+   whatever fits the solution) is entirely up to that op's
+   implementation, not prescribed here.
 
-Full scheduling mechanics for the eventual/periodic scan (how often, what
-triggers it, whether it's driven by a dedicated background thread or
+Full scheduling mechanics for the FK eventual/periodic scan (how often,
+what triggers it, whether it's driven by a dedicated background thread or
 piggybacks on an existing loop) are left for the implementation plan —
-this spec establishes the enforcement *shape* (best-effort inline check +
-eventual authoritative check invoking a solution-owned resolution op),
-not a complete scheduler design.
+this spec establishes the enforcement *shape*, not a complete scheduler
+design.
+
+**Open question carried forward from this revision**: whether a similar
+periodic defense-in-depth scan is still worth keeping for uniqueness too
+(covering the crash-mid-index-update-phase case the synchronous check
+can't observe) is left to the implementation plan to decide — the
+synchronous check is the primary mechanism either way, so this would only
+ever be a backstop, not required for the feature to work correctly in
+the common case.
 
 ## Testing Strategy
 
 - Schema/field encoding: round-trip tests per `FieldType` variant
   (including nested Array/Dict), matching the existing round-trip-test
   style used throughout (`seisin-protocol`, `seisin-core::sk`).
-- sk: unit tests for the two-round-trip update flow (create, update
-  changing the indexed value, update leaving it unchanged, delete);
-  an integration test proving concurrent writers to the same sk key
-  collate/wound-wait correctly (reusing the existing wound-wait
-  integration test pattern from Sub-project 3b); a unit test proving the
-  uniqueness best-effort check rejects a second writer to the same
-  already-populated unique sk key.
+- Op lifecycle: unit tests for the three-phase state machine in
+  isolation (execute → index update phase → commit/fail) — an op with
+  no indexed fields changed skips straight to commit; an op with one
+  changed indexed field waits for exactly one `IndexUpdate` reply before
+  committing; a reported violation results in no write at all (`ctx.get`
+  after the op still shows the pre-op state) and an `OpError` to the
+  client. An integration test proving the same across a real cross-node
+  `IndexUpdate` dispatch (index native to a different node than the main
+  op), reusing the peer-link integration-test patterns from Sub-project
+  3b.
+- sk: unit tests for the update flow (create, update changing the
+  indexed value, update leaving it unchanged, delete) via the new
+  lifecycle; an integration test proving concurrent writers to the same
+  sk key resolve correctly (the owning thread processes both
+  `IndexUpdate`s one at a time); a unit test proving the uniqueness
+  check rejects a second writer to the same already-populated unique sk
+  key and that the whole op's write is discarded, not partially applied.
 - rk: unit tests for the splay tree's insert/delete/rank-descent
   correctness against known sequences (matching the "known-answer test
   vectors, not fuzzing" convention favored elsewhere in this project);
   property-style tests confirming subtree-size invariants hold after
-  arbitrary insert/delete sequences; a round-trip test for the sorted-Vec
-  disk content format and O(n) rebuild.
+  arbitrary insert/delete sequences; a test proving the tree stays
+  resident across multiple updates dispatched to the same thread (built
+  once from bytes on first access, not rebuilt on the second update — the
+  whole point of keeping it resident, per "Automatic Index Maintenance"
+  above); a round-trip test for the sorted-Vec disk content format and
+  O(n) initial build.
 - tk: unit tests for the correction-upsert (forward correction, backdated
   correction, and the reject-if-genuinely-ambiguous case); round-trip
   tests for the column-store encoding; a test confirming two different
-  entities' tk indexes never contend (no shared lock/datum).
+  entities' tk indexes never contend (no shared lock/datum, no shared
+  `IndexUpdate` target).
 - Constraint enforcement: a unit test proving the FK best-effort check
   rejects a write referencing a pk_id that never existed; a unit test
-  proving the eventual check detects a dangling reference (created via a
-  concurrent delete the best-effort check couldn't have caught) and
-  invokes the declared `ConflictOp`; the same shape repeated for the
-  uniqueness eventual check (more than one entry in a unique sk list
-  invokes its `ConflictOp`).
+  proving the FK eventual check detects a dangling reference (created
+  via a concurrent delete the best-effort check couldn't have caught)
+  and invokes the declared `ConflictOp`.
 
 ## Open Questions Carried Forward
 
@@ -379,9 +475,23 @@ not a complete scheduler design.
   needs it.
 - **rk index sharding** — explicitly deferred (see "Known limitation"
   above under rk).
-- **Eventual-check scheduling mechanics** — how often the periodic
-  uniqueness/FK scans run and what drives them (dedicated thread vs.
-  piggybacking on an existing loop) is left for the implementation plan
-  (see "Constraint Enforcement" above).
+- **Collation destination-thread preference** — whether `pool.rs`'s
+  native-majority heuristic should learn to prefer an index's native
+  thread over the pk datum's, as a throughput optimization — explicitly
+  deferred (see "Automatic Index Maintenance"'s "Deliberately not in this
+  increment's scope" note).
+- **Resident index cache lifecycle** — whether/how a thread ever evicts a
+  resident index structure (analogous to the existing cache-eviction-on-
+  ring-mutation rule for regular datums) isn't nailed down here; left for
+  the implementation plan, which should at minimum confirm the existing
+  ring-mutation cache-eviction rule from Sub-project 2b extends naturally
+  to this new resident-index cache rather than silently exempting it.
+- **FK eventual-check scheduling mechanics** — how often the periodic FK
+  scan runs and what drives it (dedicated thread vs. piggybacking on an
+  existing loop) is left for the implementation plan (see "Constraint
+  Enforcement" above).
+- **Uniqueness defense-in-depth scan** — whether to add one at all, given
+  the synchronous check is now the primary mechanism — left for the
+  implementation plan (see "Constraint Enforcement" above).
 - **Transaction-time audit mechanism** — explicitly out of scope for this
   sub-project; a separate, system-wide concern for a future pass.
