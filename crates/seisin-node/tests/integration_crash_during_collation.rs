@@ -105,6 +105,7 @@ fn a_recall_against_a_peer_that_dies_mid_flight_still_releases_via_the_reactive_
     node_a,
     peer_link_listener_a,
     peer_link_address_book,
+    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
   ));
   let address_book = Arc::new(HashMap::new());
   thread::spawn(move || serve(listener_a, node_a, ring, address_book, pool));
@@ -180,6 +181,7 @@ fn start_node_a_with_unreachable_peer(
     node_a,
     peer_link_listener_a,
     peer_link_address_book,
+    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
   ));
 
   let serve_ring = Arc::clone(&ring);

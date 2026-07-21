@@ -57,6 +57,7 @@ fn start_two_node_cluster() -> (String, String, Arc<RwLock<Ring>>) {
     node_a,
     peer_link_listener_a,
     Arc::clone(&peer_link_address_book),
+    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
   ));
   let pool_b = Arc::new(WorkerPool::spawn(
     Arc::new(InMemoryStore::new()),
@@ -66,6 +67,7 @@ fn start_two_node_cluster() -> (String, String, Arc<RwLock<Ring>>) {
     node_b,
     peer_link_listener_b,
     peer_link_address_book,
+    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
   ));
 
   {

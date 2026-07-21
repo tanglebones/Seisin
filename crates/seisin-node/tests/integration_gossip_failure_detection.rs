@@ -74,6 +74,7 @@ fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String, String)]
     node_id,
     peer_link_listener,
     peer_link_address_book,
+    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
   ));
 
   {

@@ -38,6 +38,7 @@ impl WorkerPool {
     self_node_id: NodeId,
     peer_link_listener: TcpListener,
     peer_link_address_book: Arc<HashMap<NodeId, String>>,
+    index_handlers: Arc<crate::index_handler::IndexHandlerRegistry>,
   ) -> Self {
     let mut senders = Vec::with_capacity(thread_count as usize);
     let mut receivers = Vec::with_capacity(thread_count as usize);
@@ -78,6 +79,18 @@ impl WorkerPool {
           WorkerMessage::Release { datum_id }
         }
         seisin_protocol::Request::Op { .. } => return, // client-only; never sent over a peer-link
+        seisin_protocol::Request::IndexUpdate {
+          target,
+          op_id,
+          index_kind,
+          payload,
+        } => WorkerMessage::IndexUpdate {
+          target,
+          op_id,
+          index_kind,
+          payload,
+          reply: crate::worker::IndexUpdateReply::Remote(Arc::clone(&link), correlation_id),
+        },
       };
       let _ = dispatch_peers[target_thread.0 as usize].send(message);
     });
@@ -102,6 +115,7 @@ impl WorkerPool {
           Arc::clone(&ring),
           self_node_id,
           Arc::clone(&peer_links),
+          Arc::clone(&index_handlers),
         )
       })
       .collect();
@@ -181,6 +195,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
+      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
     )
   }
 
@@ -204,6 +219,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
+      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
     );
     let id = DatumId::new();
     let result = pool.run_op(
@@ -247,6 +263,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
+      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
     );
     let id = DatumId::new();
     pool
@@ -289,6 +306,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
+      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
     );
 
     let id = DatumId::new();

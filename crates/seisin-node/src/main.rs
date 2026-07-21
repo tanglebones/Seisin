@@ -109,6 +109,7 @@ fn main() -> Result<()> {
     self_node_id,
     peer_link_listener,
     peer_link_address_book,
+    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
   ));
 
   let client_listener =
