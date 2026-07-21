@@ -44,6 +44,17 @@ pub enum Request {
   /// it for correctness (this is fire-and-forget, same as the local
   /// case).
   Release { datum_id: DatumId },
+  /// Node-to-node only: applies one update to the index datum this
+  /// frame's peer-link envelope targets, on behalf of `op_id`. `payload`
+  /// is opaque to the framework — interpreted by whichever
+  /// `IndexHandler` is registered for `index_kind`. Never sent by a
+  /// client.
+  IndexUpdate {
+    target: DatumId,
+    op_id: DatumId,
+    index_kind: String,
+    payload: Vec<u8>,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,18 +73,26 @@ pub enum Response {
   Granted,
   /// Reply to an acknowledged `Recall`.
   Released,
+  /// Reply to an `IndexUpdate` — `violation` is `Some(message)` if the
+  /// update was rejected (e.g. a uniqueness constraint), in which case
+  /// the index's resident/stored state was left untouched.
+  IndexUpdateResult {
+    violation: Option<String>,
+  },
 }
 
 const OP_OP: u8 = 1;
 const OP_ACQUIRE: u8 = 2;
 const OP_RECALL: u8 = 3;
 const OP_RELEASE: u8 = 4;
+const OP_INDEX_UPDATE: u8 = 5;
 
 const RESP_REDIRECT: u8 = 1;
 const RESP_OP_RESULT: u8 = 2;
 const RESP_OP_ERROR: u8 = 3;
 const RESP_GRANTED: u8 = 4;
 const RESP_RELEASED: u8 = 5;
+const RESP_INDEX_UPDATE_RESULT: u8 = 6;
 
 const ID_LEN: usize = 16;
 
@@ -117,6 +136,20 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.push(OP_RELEASE);
       buf.extend_from_slice(&datum_id.as_bytes());
     }
+    Request::IndexUpdate {
+      target,
+      op_id,
+      index_kind,
+      payload,
+    } => {
+      buf.push(OP_INDEX_UPDATE);
+      buf.extend_from_slice(&target.as_bytes());
+      buf.extend_from_slice(&op_id.as_bytes());
+      let kind_bytes = index_kind.as_bytes();
+      buf.extend_from_slice(&(kind_bytes.len() as u32).to_le_bytes());
+      buf.extend_from_slice(kind_bytes);
+      buf.extend_from_slice(payload);
+    }
   }
   buf
 }
@@ -130,6 +163,7 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_ACQUIRE => decode_acquire_request(buf),
     OP_RECALL => decode_recall_request(buf),
     OP_RELEASE => decode_release_request(buf),
+    OP_INDEX_UPDATE => decode_index_update_request(buf),
     op => bail!("unknown request opcode: {op}"),
   }
 }
@@ -182,6 +216,35 @@ fn decode_release_request(buf: &[u8]) -> Result<Request> {
   }
   let datum_id = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
   Ok(Request::Release { datum_id })
+}
+
+fn decode_index_update_request(buf: &[u8]) -> Result<Request> {
+  if buf.len() < 1 + ID_LEN + ID_LEN + 4 {
+    bail!("index update request too short for its fixed fields");
+  }
+  let target = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
+  let op_id_offset = 1 + ID_LEN;
+  let op_id = DatumId::from_bytes(
+    buf[op_id_offset..op_id_offset + ID_LEN]
+      .try_into()
+      .unwrap(),
+  );
+  let kind_len_offset = op_id_offset + ID_LEN;
+  let kind_len =
+    u32::from_le_bytes(buf[kind_len_offset..kind_len_offset + 4].try_into().unwrap()) as usize;
+  let kind_offset = kind_len_offset + 4;
+  if buf.len() < kind_offset + kind_len {
+    bail!("index update request too short for its index_kind");
+  }
+  let index_kind = String::from_utf8(buf[kind_offset..kind_offset + kind_len].to_vec())
+    .context("index_kind was not valid utf8")?;
+  let payload = buf[kind_offset + kind_len..].to_vec();
+  Ok(Request::IndexUpdate {
+    target,
+    op_id,
+    index_kind,
+    payload,
+  })
 }
 
 fn decode_op_request(buf: &[u8]) -> Result<Request> {
@@ -245,6 +308,16 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
     }
     Response::Granted => buf.push(RESP_GRANTED),
     Response::Released => buf.push(RESP_RELEASED),
+    Response::IndexUpdateResult { violation } => {
+      buf.push(RESP_INDEX_UPDATE_RESULT);
+      match violation {
+        None => buf.push(0),
+        Some(message) => {
+          buf.push(1);
+          buf.extend_from_slice(message.as_bytes());
+        }
+      }
+    }
   }
   buf
 }
@@ -283,6 +356,20 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
     }
     RESP_GRANTED => Ok(Response::Granted),
     RESP_RELEASED => Ok(Response::Released),
+    RESP_INDEX_UPDATE_RESULT => {
+      if buf.len() < 2 {
+        bail!("index update result too short for its flag byte");
+      }
+      let violation = match buf[1] {
+        0 => None,
+        1 => Some(
+          String::from_utf8(buf[2..].to_vec())
+            .context("index update violation message was not valid utf8")?,
+        ),
+        flag => bail!("unknown index update result flag: {flag}"),
+      };
+      Ok(Response::IndexUpdateResult { violation })
+    }
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -564,5 +651,45 @@ mod tests {
     });
     buf[8] = 99;
     assert!(decode_envelope(&buf).is_err());
+  }
+
+  #[test]
+  fn round_trips_index_update_request() {
+    let req = Request::IndexUpdate {
+      target: DatumId::new(),
+      op_id: DatumId::new(),
+      index_kind: "sk".to_string(),
+      payload: vec![1, 2, 3],
+    };
+    let encoded = encode_request(&req);
+    assert_eq!(decode_request(&encoded).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_index_update_request_with_empty_payload() {
+    let req = Request::IndexUpdate {
+      target: DatumId::new(),
+      op_id: DatumId::new(),
+      index_kind: "sk".to_string(),
+      payload: vec![],
+    };
+    let encoded = encode_request(&req);
+    assert_eq!(decode_request(&encoded).unwrap(), req);
+  }
+
+  #[test]
+  fn round_trips_index_update_result_without_violation() {
+    let resp = Response::IndexUpdateResult { violation: None };
+    let encoded = encode_response(&resp);
+    assert_eq!(decode_response(&encoded).unwrap(), resp);
+  }
+
+  #[test]
+  fn round_trips_index_update_result_with_violation() {
+    let resp = Response::IndexUpdateResult {
+      violation: Some("duplicate value".to_string()),
+    };
+    let encoded = encode_response(&resp);
+    assert_eq!(decode_response(&encoded).unwrap(), resp);
   }
 }
