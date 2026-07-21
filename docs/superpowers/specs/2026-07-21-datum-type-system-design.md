@@ -183,6 +183,18 @@ numeric field" need.
   each triggering splay rotations). The sorted array can also be sampled
   directly without materializing the tree, for a lightweight query that
   doesn't need the full structure.
+- **Storage Tier dependency, noted here for when that sub-project's disk
+  engine is designed**: an insert/delete anywhere in this Vec logically
+  touches the whole structure, and Seisin's storage model otherwise treats
+  a datum's content as one opaque blob rewritten in full on every `put`.
+  For a large rk (or tk, see below) index, naively rewriting the entire
+  blob on every single update would mean genuinely expensive disk I/O per
+  write. This spec deliberately does **not** solve that here — it's a
+  disk-engine concern, not a content-model concern — but Storage Tier's
+  `DiskStore` needs an append-only-journal-with-periodic-compaction format
+  (or equivalent) for large, frequently-updated datums like this, rather
+  than whole-file rewrites, when that sub-project's disk format is
+  designed.
 - **Update flow**: same two-round-trip shape as sk (read old value if
   updating, derive whether the rank position needs to move), but touching
   only *one* datum (`rk:type.field`) rather than two, since there's no
@@ -231,7 +243,14 @@ collapsed into one mechanism.
   ("what was in effect between X and Y") scan the bound columns without
   needing to pull values along — a genuinely different access pattern
   from rk's rank-lookup, which is why rk and tk don't share a storage
-  engine despite both being "ordered by a comparable key."
+  engine despite both being "ordered by a comparable key." Per-entity
+  scoping naturally bounds a tk datum's size to one entity's own
+  correction history (not the type's whole population), so the whole-blob
+  -rewrite-per-update concern noted under rk is far less severe here —
+  but for an entity with a very long correction history, the same
+  Storage Tier dependency applies (see rk's note above): a
+  journal-with-compaction disk format avoids rewriting the whole history
+  on every single correction.
 - **Overlap invariant**: enforced by the writing op itself, since there's
   no database-level exclusion constraint available. A correction-upsert:
   1. Given `(pk_id, field, as_of, new_value)`, read the tk datum's own
