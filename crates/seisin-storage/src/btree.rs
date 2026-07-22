@@ -126,6 +126,75 @@ impl BPlusTree {
   pub fn is_empty(&self) -> bool {
     self.total_count == 0
   }
+
+  pub fn scan_forward_bounded(&mut self, n: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if n == 0 {
+      return Ok(Vec::new());
+    }
+    let mut page_id = self.leftmost_leaf_id()?;
+    let mut results = Vec::with_capacity(n.min(self.total_count as usize));
+    while page_id != NULL_PAGE && results.len() < n {
+      let node = self.read_leaf(page_id)?;
+      for entry in &node.entries {
+        if results.len() >= n {
+          break;
+        }
+        results.push(entry.clone());
+      }
+      page_id = node.next;
+    }
+    Ok(results)
+  }
+
+  pub fn scan_backward_bounded(&mut self, n: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if n == 0 {
+      return Ok(Vec::new());
+    }
+    let mut page_id = self.rightmost_leaf_id()?;
+    let mut results = Vec::with_capacity(n.min(self.total_count as usize));
+    while page_id != NULL_PAGE && results.len() < n {
+      let node = self.read_leaf(page_id)?;
+      for entry in node.entries.iter().rev() {
+        if results.len() >= n {
+          break;
+        }
+        results.push(entry.clone());
+      }
+      page_id = node.prev;
+    }
+    Ok(results)
+  }
+
+  fn leftmost_leaf_id(&mut self) -> Result<PageId> {
+    let mut page_id = self.root_page_id;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => return Ok(page_id),
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          page_id = match node.entries.first() {
+            Some((_, child, _)) => *child,
+            None => node.rightmost_child,
+          };
+        }
+      }
+    }
+  }
+
+  fn rightmost_leaf_id(&mut self) -> Result<PageId> {
+    let mut page_id = self.root_page_id;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => return Ok(page_id),
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          page_id = node.rightmost_child;
+        }
+      }
+    }
+  }
 }
 
 enum InsertOutcome {
@@ -470,5 +539,79 @@ mod tests {
       .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     assert_eq!(all, expected);
+  }
+
+  #[test]
+  fn scan_forward_bounded_returns_the_smallest_n_entries_in_ascending_order() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    let mut keys: Vec<u64> = (0..300).collect();
+    keys.reverse();
+    for i in &keys {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    let result = tree.scan_forward_bounded(5).unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..5u64)
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
+      .collect();
+    assert_eq!(result, expected);
+  }
+
+  #[test]
+  fn scan_backward_bounded_returns_the_largest_n_entries_in_descending_order() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in 0..300u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    let result = tree.scan_backward_bounded(5).unwrap();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (295..300u64)
+      .rev()
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
+      .collect();
+    assert_eq!(result, expected);
+  }
+
+  #[test]
+  fn scan_forward_bounded_with_n_larger_than_len_returns_everything() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in 0..3u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    let result = tree.scan_forward_bounded(1000).unwrap();
+    assert_eq!(result.len(), 3);
+  }
+
+  #[test]
+  fn scan_forward_bounded_on_an_empty_tree_returns_nothing() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    assert_eq!(tree.scan_forward_bounded(10).unwrap(), vec![]);
+    assert_eq!(tree.scan_backward_bounded(10).unwrap(), vec![]);
+  }
+
+  #[test]
+  fn scan_bounded_with_n_zero_returns_nothing() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
+    assert_eq!(tree.scan_forward_bounded(0).unwrap(), vec![]);
+    assert_eq!(tree.scan_backward_bounded(0).unwrap(), vec![]);
+  }
+
+  #[test]
+  fn scan_forward_bounded_spans_multiple_leaves_via_sibling_links() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    // 300 entries with max_leaf_entries=254 forces at least one split,
+    // so this exercises walking across a leaf sibling link.
+    for i in 0..300u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    let result = tree.scan_forward_bounded(260).unwrap();
+    assert_eq!(result.len(), 260);
+    assert_eq!(result[0].0, 0u64.to_be_bytes().to_vec());
+    assert_eq!(result[259].0, 259u64.to_be_bytes().to_vec());
   }
 }
