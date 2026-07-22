@@ -56,14 +56,26 @@ complementary technique for "roughly the median" but are unsuitable as a
   explicit scope decision this session). A real consequence: since nothing
   is ever freed, page allocation is a simple monotonically-growing counter
   — no free-list needed at all for v1.
-- **Fixed 4096-byte pages** (standard OS page alignment) in a single file
-  per tree instance — one file per declared index (e.g. one file per
-  `rk:{type}.{field}`).
-- **Page 0 is a superblock**: magic bytes + format version + `key_size` +
-  `value_size` + root page id + total entry count. `open()` validates the
-  superblock and returns an error (never a panic, never a silent misread)
-  if it doesn't check out — the caller decides whether to treat that as
-  "rebuild from a full datum scan" (see Durability below).
+- **Configurable page size, a power of 2, minimum 4096 bytes** — chosen at
+  tree-creation time and fixed for the tree's lifetime (stored in the
+  superblock, validated on `open`). 4096 matches the traditional OS page
+  boundary, but modern storage hardware (SSDs with larger native
+  erase-block/program-page sizes, NVMe devices) often performs better with
+  larger pages; hardcoding 4096 would leave real throughput on the table.
+  `create` takes an explicit `page_size` argument rather than defaulting
+  silently, so a caller who hasn't decided yet has to either pass 4096 or
+  make a real choice. **Auto-detection and a benchmark tool for the
+  operator to determine the optimal page size on actual deployment
+  hardware are explicitly deferred** — out of scope for this crate's v1 as
+  long as `page_size` is configurable now; see "Open Questions Carried
+  Forward" below.
+- **Page 0 is a superblock**: magic bytes + format version + `page_size` +
+  `key_size` + `value_size` + root page id + total entry count. `open()`
+  validates the superblock (including that `page_size` matches what the
+  file was actually created with) and returns an error (never a panic,
+  never a silent misread) if it doesn't check out — the caller decides
+  whether to treat that as "rebuild from a full datum scan" (see
+  Durability below).
 - **Leaf pages are sibling-linked** (prev/next page id) for bounded
   forward/backward scans without touching the whole tree.
 - **Internal pages carry a subtree-entry-count alongside each child
@@ -73,8 +85,11 @@ complementary technique for "roughly the median" but are unsuitable as a
 
 ## Operations
 
-- `create(path, key_size, value_size)` / `open(path)` — `open` validates
-  the superblock and returns `Result`, not a panic, on mismatch/corruption.
+- `create(path, key_size, value_size, page_size)` — `page_size` must be a
+  power of 2, `>= 4096`; rejected with an error otherwise (never silently
+  rounded). `open(path)` — validates the superblock (including that
+  `page_size` matches) and returns `Result`, not a panic, on
+  mismatch/corruption.
 - `insert(key: &[u8], value: &[u8]) -> Result<()>` — upsert; same key
   overwrites its value in place.
 - `len() -> usize` — total entry count (tracked in the superblock/root, no
@@ -119,6 +134,12 @@ wrong data forever.
   Property-style tests inserting many entries in random order and
   verifying the tree's in-order traversal is sorted, entry count matches,
   and every inserted key is retrievable via a scan.
+- `create` rejects a non-power-of-2 `page_size` and rejects `page_size <
+  4096`; `open` rejects a file whose stored `page_size` doesn't match
+  what's expected (a corrupted or mismatched-build-config file). Functional
+  tests (correctness, not performance) run against at least two distinct
+  valid page sizes (e.g. 4096 and 16384) to confirm the format and every
+  operation are page-size-agnostic, not implicitly hardcoded to one value.
 - No integration test against `seisin-node`/ring/gossip in this
   sub-project — this crate has no dependency on them, and none of its
   consumers (rk's `IndexKind`, node-function placement) exist yet.
@@ -143,3 +164,11 @@ plan:
   not build one) and whether sk or tk should eventually migrate onto this
   same counted B+Tree engine — both explicitly deferred, decided later
   against the research doc on each one's own access pattern.
+- **Page-size auto-detection and an operator-facing benchmark tool** —
+  explicitly deferred. `page_size` is configurable now (a required
+  argument to `create`, validated as a power of 2 `>= 4096`), which is the
+  part that must land in this plan; detecting a good default from the
+  actual deployment hardware (OS page size, filesystem block size, SSD
+  erase-block size) and a benchmark utility an operator can run to measure
+  throughput/latency across candidate page sizes on their real hardware
+  are both future work, tracked here rather than built now.
