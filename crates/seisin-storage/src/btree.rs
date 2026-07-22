@@ -42,8 +42,15 @@ impl BPlusTree {
     }
     let mut store = PageStore::create(path, page_size)?;
     let root_id: PageId = 1;
-    let empty_leaf = LeafNode { prev: NULL_PAGE, next: NULL_PAGE, entries: vec![] };
-    store.write_page(root_id, &encode_leaf(&empty_leaf, page_size, key_size, value_size))?;
+    let empty_leaf = LeafNode {
+      prev: NULL_PAGE,
+      next: NULL_PAGE,
+      entries: vec![],
+    };
+    store.write_page(
+      root_id,
+      &encode_leaf(&empty_leaf, page_size, key_size, value_size),
+    )?;
     let mut tree = Self {
       store,
       page_size,
@@ -217,7 +224,10 @@ impl BPlusTree {
         PageType::Leaf => {
           let node = decode_leaf(&bytes, self.key_size, self.value_size)?;
           if rank >= node.entries.len() {
-            bail!("rank {rank} out of bounds for a leaf with {} entries", node.entries.len());
+            bail!(
+              "rank {rank} out of bounds for a leaf with {} entries",
+              node.entries.len()
+            );
           }
           return Ok(node.entries[rank].clone());
         }
@@ -249,7 +259,11 @@ impl BPlusTree {
     self.total_count = 0;
     if sorted.is_empty() {
       let root_id = self.allocate_page();
-      let empty_leaf = LeafNode { prev: NULL_PAGE, next: NULL_PAGE, entries: vec![] };
+      let empty_leaf = LeafNode {
+        prev: NULL_PAGE,
+        next: NULL_PAGE,
+        entries: vec![],
+      };
       self.write_leaf(root_id, &empty_leaf)?;
       self.root_page_id = root_id;
       self.write_superblock()?;
@@ -266,8 +280,16 @@ impl BPlusTree {
     }
     for (i, chunk) in leaf_chunks.iter().enumerate() {
       let prev = if i == 0 { NULL_PAGE } else { leaf_ids[i - 1] };
-      let next = if i + 1 < leaf_ids.len() { leaf_ids[i + 1] } else { NULL_PAGE };
-      let node = LeafNode { prev, next, entries: chunk.to_vec() };
+      let next = if i + 1 < leaf_ids.len() {
+        leaf_ids[i + 1]
+      } else {
+        NULL_PAGE
+      };
+      let node = LeafNode {
+        prev,
+        next,
+        entries: chunk.to_vec(),
+      };
       self.write_leaf(leaf_ids[i], &node)?;
     }
     self.total_count = sorted.len() as u64;
@@ -319,17 +341,32 @@ impl BPlusTree {
 }
 
 enum InsertOutcome {
-  NoSplit { is_new: bool },
-  Split { is_new: bool, separator_key: Vec<u8>, new_page_id: PageId, new_page_count: u64 },
+  NoSplit {
+    is_new: bool,
+  },
+  Split {
+    is_new: bool,
+    separator_key: Vec<u8>,
+    new_page_id: PageId,
+    new_page_count: u64,
+  },
 }
 
 impl BPlusTree {
   pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
     if key.len() != self.key_size as usize {
-      bail!("key must be exactly {} bytes, got {}", self.key_size, key.len());
+      bail!(
+        "key must be exactly {} bytes, got {}",
+        self.key_size,
+        key.len()
+      );
     }
     if value.len() != self.value_size as usize {
-      bail!("value must be exactly {} bytes, got {}", self.value_size, value.len());
+      bail!(
+        "value must be exactly {} bytes, got {}",
+        self.value_size,
+        value.len()
+      );
     }
     let root = self.root_page_id;
     match self.insert_into(root, key, value)? {
@@ -338,7 +375,12 @@ impl BPlusTree {
           self.total_count += 1;
         }
       }
-      InsertOutcome::Split { is_new, separator_key, new_page_id, new_page_count } => {
+      InsertOutcome::Split {
+        is_new,
+        separator_key,
+        new_page_id,
+        new_page_count,
+      } => {
         let old_root_count = self.total_count + if is_new { 1 } else { 0 } - new_page_count;
         let new_root_id = self.allocate_page();
         let new_root = InternalNode {
@@ -365,7 +407,12 @@ impl BPlusTree {
     }
   }
 
-  fn insert_into_internal(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
+  fn insert_into_internal(
+    &mut self,
+    page_id: PageId,
+    key: &[u8],
+    value: &[u8],
+  ) -> Result<InsertOutcome> {
     let mut node = self.read_internal(page_id)?;
     let child_idx = node.entries.iter().position(|(k, _, _)| key < k.as_slice());
     let child_id = match child_idx {
@@ -384,7 +431,12 @@ impl BPlusTree {
         }
         Ok(InsertOutcome::NoSplit { is_new })
       }
-      InsertOutcome::Split { is_new, separator_key, new_page_id, new_page_count } => {
+      InsertOutcome::Split {
+        is_new,
+        separator_key,
+        new_page_id,
+        new_page_count,
+      } => {
         match child_idx {
           Some(i) => {
             // child_id (the smaller-key half, unchanged page id) now
@@ -393,14 +445,18 @@ impl BPlusTree {
             let old_separator = node.entries[i].0.clone();
             let adjusted_count = node.entries[i].2 + if is_new { 1 } else { 0 } - new_page_count;
             node.entries[i] = (separator_key, child_id, adjusted_count);
-            node.entries.insert(i + 1, (old_separator, new_page_id, new_page_count));
+            node
+              .entries
+              .insert(i + 1, (old_separator, new_page_id, new_page_count));
           }
           None => {
             // the rightmost child split: it keeps the smaller keys and
             // becomes a regular bounded entry; new_page_id becomes the
             // new rightmost.
             let adjusted_count = node.rightmost_count + if is_new { 1 } else { 0 } - new_page_count;
-            node.entries.push((separator_key, node.rightmost_child, adjusted_count));
+            node
+              .entries
+              .push((separator_key, node.rightmost_child, adjusted_count));
             node.rightmost_child = new_page_id;
             node.rightmost_count = new_page_count;
           }
@@ -437,9 +493,17 @@ impl BPlusTree {
     }
   }
 
-  fn insert_into_leaf(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
+  fn insert_into_leaf(
+    &mut self,
+    page_id: PageId,
+    key: &[u8],
+    value: &[u8],
+  ) -> Result<InsertOutcome> {
     let mut node = self.read_leaf(page_id)?;
-    let is_new = match node.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+    let is_new = match node
+      .entries
+      .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+    {
       Ok(i) => {
         node.entries[i].1 = value.to_vec();
         false
@@ -460,7 +524,11 @@ impl BPlusTree {
     let new_page_count = right_entries.len() as u64;
     let old_next = node.next;
     node.next = new_page_id;
-    let new_node = LeafNode { prev: page_id, next: old_next, entries: right_entries };
+    let new_node = LeafNode {
+      prev: page_id,
+      next: old_next,
+      entries: right_entries,
+    };
     if old_next != NULL_PAGE {
       let mut next_node = self.read_leaf(old_next)?;
       next_node.prev = new_page_id;
@@ -468,7 +536,12 @@ impl BPlusTree {
     }
     self.write_leaf(page_id, &node)?;
     self.write_leaf(new_page_id, &new_node)?;
-    Ok(InsertOutcome::Split { is_new, separator_key, new_page_id, new_page_count })
+    Ok(InsertOutcome::Split {
+      is_new,
+      separator_key,
+      new_page_id,
+      new_page_count,
+    })
   }
 }
 
@@ -539,7 +612,10 @@ mod tests {
     assert_eq!(tree.len(), 2);
     let mut all = tree.all_entries_for_test().unwrap();
     all.sort();
-    assert_eq!(all, vec![(vec![1; 8], vec![10; 8]), (vec![2; 8], vec![20; 8])]);
+    assert_eq!(
+      all,
+      vec![(vec![1; 8], vec![10; 8]), (vec![2; 8], vec![20; 8])]
+    );
   }
 
   #[test]
@@ -641,8 +717,14 @@ mod tests {
     let mut all = tree.all_entries_for_test().unwrap();
     all.sort();
     assert_eq!(all.len(), 300);
-    assert_eq!(all[0], (0u64.to_be_bytes().to_vec(), 0u64.to_be_bytes().to_vec()));
-    assert_eq!(all[299], (299u64.to_be_bytes().to_vec(), 299u64.to_be_bytes().to_vec()));
+    assert_eq!(
+      all[0],
+      (0u64.to_be_bytes().to_vec(), 0u64.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+      all[299],
+      (299u64.to_be_bytes().to_vec(), 299u64.to_be_bytes().to_vec())
+    );
   }
 
   #[test]
@@ -716,7 +798,9 @@ mod tests {
   fn scan_bounded_with_n_zero_returns_nothing() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
+    tree
+      .insert(&1u64.to_be_bytes(), &1u64.to_be_bytes())
+      .unwrap();
     assert_eq!(tree.scan_forward_bounded(0).unwrap(), vec![]);
     assert_eq!(tree.scan_backward_bounded(0).unwrap(), vec![]);
   }
@@ -763,7 +847,9 @@ mod tests {
   fn sample_by_rank_with_k_zero_returns_nothing() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
+    tree
+      .insert(&1u64.to_be_bytes(), &1u64.to_be_bytes())
+      .unwrap();
     assert_eq!(tree.sample_by_rank(0).unwrap(), vec![]);
   }
 
@@ -808,7 +894,9 @@ mod tests {
   fn rebuild_from_an_empty_iterator_produces_an_empty_tree() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
+    tree
+      .insert(&1u64.to_be_bytes(), &1u64.to_be_bytes())
+      .unwrap();
     tree.rebuild_from(std::iter::empty()).unwrap();
     assert_eq!(tree.len(), 0);
     assert_eq!(tree.all_entries_for_test().unwrap(), vec![]);
@@ -822,7 +910,9 @@ mod tests {
       .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     tree.rebuild_from(entries.into_iter()).unwrap();
-    tree.insert(&999u64.to_be_bytes(), &999u64.to_be_bytes()).unwrap();
+    tree
+      .insert(&999u64.to_be_bytes(), &999u64.to_be_bytes())
+      .unwrap();
     assert_eq!(tree.len(), 301);
     let top = tree.scan_backward_bounded(1).unwrap();
     assert_eq!(top[0].0, 999u64.to_be_bytes().to_vec());

@@ -58,7 +58,11 @@ pub fn decode_leaf(bytes: &[u8], key_size: u32, value_size: u32) -> Result<LeafN
     entries.push((key, value));
     offset += record_len;
   }
-  Ok(LeafNode { prev, next, entries })
+  Ok(LeafNode {
+    prev,
+    next,
+    entries,
+  })
 }
 
 pub(crate) const INTERNAL_PAGE_TYPE: u8 = 1;
@@ -114,11 +118,19 @@ pub fn decode_internal(bytes: &[u8], key_size: u32) -> Result<InternalNode> {
     let key = bytes[offset..offset + key_size as usize].to_vec();
     let child_offset = offset + key_size as usize;
     let child = u64::from_le_bytes(bytes[child_offset..child_offset + 8].try_into().unwrap());
-    let count = u64::from_le_bytes(bytes[child_offset + 8..child_offset + 16].try_into().unwrap());
+    let count = u64::from_le_bytes(
+      bytes[child_offset + 8..child_offset + 16]
+        .try_into()
+        .unwrap(),
+    );
     entries.push((key, child, count));
     offset += record_len;
   }
-  Ok(InternalNode { entries, rightmost_child, rightmost_count })
+  Ok(InternalNode {
+    entries,
+    rightmost_child,
+    rightmost_count,
+  })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +153,11 @@ mod tests {
 
   #[test]
   fn round_trips_an_empty_leaf() {
-    let node = LeafNode { prev: 0, next: 0, entries: vec![] };
+    let node = LeafNode {
+      prev: 0,
+      next: 0,
+      entries: vec![],
+    };
     let encoded = encode_leaf(&node, 4096, 8, 8);
     assert_eq!(decode_leaf(&encoded, 8, 8).unwrap(), node);
   }
@@ -178,7 +194,11 @@ mod tests {
 
   #[test]
   fn round_trips_an_internal_node_with_no_entries() {
-    let node = InternalNode { entries: vec![], rightmost_child: 9, rightmost_count: 3 };
+    let node = InternalNode {
+      entries: vec![],
+      rightmost_child: 9,
+      rightmost_count: 3,
+    };
     let encoded = encode_internal(&node, 4096, 8);
     assert_eq!(decode_internal(&encoded, 8).unwrap(), node);
   }
@@ -209,9 +229,25 @@ mod tests {
 
   #[test]
   fn page_type_identifies_leaf_and_internal_pages() {
-    let leaf_bytes = encode_leaf(&LeafNode { prev: 0, next: 0, entries: vec![] }, 4096, 8, 8);
-    let internal_bytes =
-      encode_internal(&InternalNode { entries: vec![], rightmost_child: 1, rightmost_count: 0 }, 4096, 8);
+    let leaf_bytes = encode_leaf(
+      &LeafNode {
+        prev: 0,
+        next: 0,
+        entries: vec![],
+      },
+      4096,
+      8,
+      8,
+    );
+    let internal_bytes = encode_internal(
+      &InternalNode {
+        entries: vec![],
+        rightmost_child: 1,
+        rightmost_count: 0,
+      },
+      4096,
+      8,
+    );
     assert_eq!(page_type(&leaf_bytes).unwrap(), PageType::Leaf);
     assert_eq!(page_type(&internal_bytes).unwrap(), PageType::Internal);
   }

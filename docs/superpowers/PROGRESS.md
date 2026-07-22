@@ -254,7 +254,47 @@ commit and push immediately, since work sessions may end abruptly.
   this same IndexUpdate/IndexHandler mechanism and are next, starting
   with Part 3 (rk).
 
-As of this entry: 9 crates, 210 tests passing, `cargo fmt --check` and
+- **Index Storage Engine — counted B+Tree for rk.** While starting Part 3
+  (rk), the originally-planned in-memory splay tree design was reopened:
+  the index-maintenance mechanism's `IndexHandler` contract only holds
+  bytes across calls, giving a real splay tree object no actual benefit
+  over simpler structures — and separately, rk's index shouldn't ever be
+  fully materialized in memory at all. Research
+  (`research/2026-07-22-index-storage-engine-choice.md`) confirmed a
+  counted (order-statistics-augmented) B+Tree is the right structure for
+  this workload — LSM-trees are architecturally hostile to rank queries,
+  hash/radix have no ordering, quantile sketches are complementary at
+  best. New standalone crate `seisin-storage`
+  (`docs/superpowers/specs/2026-07-22-index-storage-engine-design.md`):
+  generic byte-keyed, disk-backed counted B+Tree with zero dependency on
+  `DatumId`/ring/gossip/node concepts. Fixed-size keys/values chosen at
+  tree-creation time; configurable page size (a power of 2, `>= 4096`,
+  validated in a superblock) rather than hardcoded, since page-size
+  auto-detection/benchmarking are deferred but configurability isn't;
+  insert-only/upsert (no delete, so no free-list needed); sibling-linked
+  leaf pages for bounded forward/backward scans; subtree-entry-counts on
+  internal pages for O(log n) rank-based lookup backing middle-sampling.
+  No WAL/fsync/crash-safety machinery — `open()` validates the superblock
+  and returns `Result` (never panics) on mismatch, and `rebuild_from`
+  wipes and bulk-loads from a caller-supplied iterator (the caller's job
+  to re-derive entries from a full datum scan, matching this project's
+  established reasoning for why index writes don't need to be fsynced
+  before an op acks). Proven page-size-agnostic by running the same
+  functional test logic at two distinct valid page sizes (4096, 16384).
+  A real algorithmic bug (internal-node split's separator/child
+  assignment was backwards in one branch) and a real test-design bug
+  (`to_le_bytes()`'s byte-lexicographic order diverges from numeric order
+  past 256, not a B+Tree bug) were both caught and fixed during
+  execution, not left latent. Explicitly out of scope, deferred to
+  separate later plans: rk's own `IndexKind` logic built on this engine,
+  node-function/placement wiring (which node's disk holds a given index's
+  file — a node-role model, decided during this same brainstorm, that
+  reopens gossip/sequencer machinery), page-size auto-detection, and an
+  operator-facing page-size benchmark tool. pk/sk/tk each get their own
+  storage-engine decision later against the same research, not assumed to
+  need this same engine.
+
+As of this entry: 10 crates, 261 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
