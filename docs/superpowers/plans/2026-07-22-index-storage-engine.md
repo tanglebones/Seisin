@@ -1239,11 +1239,16 @@ Add to `btree.rs`'s `mod tests` block:
 
   #[test]
   fn a_split_tree_survives_reopening() {
+    // Keys use to_be_bytes(), not to_le_bytes(): byte-lexicographic
+    // order (what the tree sorts by) only matches numeric order for
+    // big-endian encodings once values reach 256 and need more than one
+    // significant byte — this bites any test inserting 256+ distinct
+    // u64 keys and expecting numeric-sorted output.
     let tmp = NamedTempFile::new().unwrap();
     {
       let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
       for i in 0..300u64 {
-        tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+        tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
       }
     }
     let mut tree = BPlusTree::open(tmp.path()).unwrap();
@@ -1251,8 +1256,8 @@ Add to `btree.rs`'s `mod tests` block:
     let mut all = tree.all_entries_for_test().unwrap();
     all.sort();
     assert_eq!(all.len(), 300);
-    assert_eq!(all[0], (0u64.to_le_bytes().to_vec(), 0u64.to_le_bytes().to_vec()));
-    assert_eq!(all[299], (299u64.to_le_bytes().to_vec(), 299u64.to_le_bytes().to_vec()));
+    assert_eq!(all[0], (0u64.to_be_bytes().to_vec(), 0u64.to_be_bytes().to_vec()));
+    assert_eq!(all[299], (299u64.to_be_bytes().to_vec(), 299u64.to_be_bytes().to_vec()));
   }
 
   #[test]
@@ -1265,18 +1270,18 @@ Add to `btree.rs`'s `mod tests` block:
     // test inputs over nondeterministic ones.
     keys.reverse();
     for i in &keys {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
     }
     let mut all = tree.all_entries_for_test().unwrap();
     all.sort();
     let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
-      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     assert_eq!(all, expected);
   }
 ```
 
-**Note:** the last two tests above were originally drafted under Task 6 but moved here — they require this task's `insert_into`/`insert_into_internal` dispatch (routing an insert through an already-internal root) to pass at all; see Task 6's Step 1 note.
+**Note:** the last two tests above were originally drafted under Task 6 but moved here — they require this task's `insert_into`/`insert_into_internal` dispatch (routing an insert through an already-internal root) to pass at all; see Task 6's Step 1 note. They also fix a test-design bug caught during execution: the original draft used `to_le_bytes()`, which produced a genuinely corrupted-*looking* but actually just wrongly-compared result once keys passed 256 (byte-lexicographic order — what `Vec<u8>` sorts by, and what the tree itself compares by — diverges from numeric order for little-endian multi-byte encodings once more than one byte is significant). This is not a B+Tree bug; it only affects test key construction. The same issue recurs in later tasks' tests whenever a test inserts 256 or more distinct `u64` keys — those are written below already using `to_be_bytes()`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1478,16 +1483,18 @@ Add to `btree.rs`'s `mod tests` block:
 ```rust
   #[test]
   fn scan_forward_bounded_returns_the_smallest_n_entries_in_ascending_order() {
+    // to_be_bytes(), not to_le_bytes(): see Task 7's note on
+    // byte-lexicographic vs numeric ordering once keys reach 256.
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
     let mut keys: Vec<u64> = (0..300).collect();
     keys.reverse();
     for i in &keys {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
     }
     let result = tree.scan_forward_bounded(5).unwrap();
     let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..5u64)
-      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     assert_eq!(result, expected);
   }
@@ -1497,12 +1504,12 @@ Add to `btree.rs`'s `mod tests` block:
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
     for i in 0..300u64 {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
     }
     let result = tree.scan_backward_bounded(5).unwrap();
     let expected: Vec<(Vec<u8>, Vec<u8>)> = (295..300u64)
       .rev()
-      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     assert_eq!(result, expected);
   }
@@ -1512,7 +1519,7 @@ Add to `btree.rs`'s `mod tests` block:
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
     for i in 0..3u64 {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
     }
     let result = tree.scan_forward_bounded(1000).unwrap();
     assert_eq!(result.len(), 3);
@@ -1530,7 +1537,7 @@ Add to `btree.rs`'s `mod tests` block:
   fn scan_bounded_with_n_zero_returns_nothing() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    tree.insert(&1u64.to_le_bytes(), &1u64.to_le_bytes()).unwrap();
+    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
     assert_eq!(tree.scan_forward_bounded(0).unwrap(), vec![]);
     assert_eq!(tree.scan_backward_bounded(0).unwrap(), vec![]);
   }
@@ -1542,12 +1549,12 @@ Add to `btree.rs`'s `mod tests` block:
     // 300 entries with max_leaf_entries=254 forces at least one split,
     // so this exercises walking across a leaf sibling link.
     for i in 0..300u64 {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
     }
     let result = tree.scan_forward_bounded(260).unwrap();
     assert_eq!(result.len(), 260);
-    assert_eq!(result[0].0, 0u64.to_le_bytes().to_vec());
-    assert_eq!(result[259].0, 259u64.to_le_bytes().to_vec());
+    assert_eq!(result[0].0, 0u64.to_be_bytes().to_vec());
+    assert_eq!(result[259].0, 259u64.to_be_bytes().to_vec());
   }
 ```
 
@@ -1661,17 +1668,19 @@ Add to `btree.rs`'s `mod tests` block:
 ```rust
   #[test]
   fn sample_by_rank_returns_entries_at_the_expected_evenly_spaced_ranks() {
+    // to_be_bytes(): see Task 7's note on byte-lexicographic vs numeric
+    // ordering once keys reach 256.
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
     for i in 0..300u64 {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
     }
     // ranks = i * 300 / 5 for i in 0..5 => 0, 60, 120, 180, 240
     let result = tree.sample_by_rank(5).unwrap();
     let expected_ranks = [0u64, 60, 120, 180, 240];
     assert_eq!(result.len(), 5);
     for (entry, rank) in result.iter().zip(expected_ranks.iter()) {
-      assert_eq!(entry.0, rank.to_le_bytes().to_vec());
+      assert_eq!(entry.0, rank.to_be_bytes().to_vec());
     }
   }
 
@@ -1686,7 +1695,7 @@ Add to `btree.rs`'s `mod tests` block:
   fn sample_by_rank_with_k_zero_returns_nothing() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    tree.insert(&1u64.to_le_bytes(), &1u64.to_le_bytes()).unwrap();
+    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
     assert_eq!(tree.sample_by_rank(0).unwrap(), vec![]);
   }
 
@@ -1796,10 +1805,12 @@ Add to `btree.rs`'s `mod tests` block:
 ```rust
   #[test]
   fn rebuild_from_produces_a_tree_equivalent_to_sequential_inserts() {
+    // to_be_bytes(): see Task 7's note on byte-lexicographic vs numeric
+    // ordering once keys reach 256.
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
     let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
-      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     // Feed rebuild_from in a shuffled (reversed) order — it must sort
     // internally rather than assume sorted input.
@@ -1816,7 +1827,7 @@ Add to `btree.rs`'s `mod tests` block:
   fn rebuild_from_an_empty_iterator_produces_an_empty_tree() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    tree.insert(&1u64.to_le_bytes(), &1u64.to_le_bytes()).unwrap();
+    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
     tree.rebuild_from(std::iter::empty()).unwrap();
     assert_eq!(tree.len(), 0);
     assert_eq!(tree.all_entries_for_test().unwrap(), vec![]);
@@ -1827,13 +1838,13 @@ Add to `btree.rs`'s `mod tests` block:
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
     let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
-      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
       .collect();
     tree.rebuild_from(entries.into_iter()).unwrap();
-    tree.insert(&999u64.to_le_bytes(), &999u64.to_le_bytes()).unwrap();
+    tree.insert(&999u64.to_be_bytes(), &999u64.to_be_bytes()).unwrap();
     assert_eq!(tree.len(), 301);
     let top = tree.scan_backward_bounded(1).unwrap();
-    assert_eq!(top[0].0, 999u64.to_le_bytes().to_vec());
+    assert_eq!(top[0].0, 999u64.to_be_bytes().to_vec());
     let sample = tree.sample_by_rank(3).unwrap();
     assert_eq!(sample.len(), 3);
   }
@@ -1844,7 +1855,7 @@ Add to `btree.rs`'s `mod tests` block:
     {
       let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
       let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
-        .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+        .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
         .collect();
       tree.rebuild_from(entries.into_iter()).unwrap();
     }
@@ -1979,38 +1990,41 @@ use seisin_storage::btree::BPlusTree;
 use tempfile::NamedTempFile;
 
 fn exercise_a_tree_at(page_size: u32) {
+  // to_be_bytes(), not to_le_bytes(): byte-lexicographic order (what the
+  // tree sorts by) only matches numeric order for big-endian encodings
+  // once keys reach 256 — see Task 7's note.
   let tmp = NamedTempFile::new().unwrap();
   let mut tree = BPlusTree::create(tmp.path(), 8, 8, page_size).unwrap();
   let mut keys: Vec<u64> = (0..500).collect();
   keys.reverse();
   for i in &keys {
-    tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+    tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
   }
   assert_eq!(tree.len(), 500);
 
   let forward = tree.scan_forward_bounded(10).unwrap();
   let expected_forward: Vec<(Vec<u8>, Vec<u8>)> =
-    (0..10u64).map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec())).collect();
+    (0..10u64).map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec())).collect();
   assert_eq!(forward, expected_forward);
 
   let backward = tree.scan_backward_bounded(10).unwrap();
   let expected_backward: Vec<(Vec<u8>, Vec<u8>)> = (490..500u64)
     .rev()
-    .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+    .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
     .collect();
   assert_eq!(backward, expected_backward);
 
   let sampled = tree.sample_by_rank(5).unwrap();
   assert_eq!(sampled.len(), 5);
-  assert_eq!(sampled[0].0, 0u64.to_le_bytes().to_vec());
+  assert_eq!(sampled[0].0, 0u64.to_be_bytes().to_vec());
 
   // Overwrite an existing key: len() must not grow.
-  tree.insert(&250u64.to_le_bytes(), &999u64.to_le_bytes()).unwrap();
+  tree.insert(&250u64.to_be_bytes(), &999u64.to_be_bytes()).unwrap();
   assert_eq!(tree.len(), 500);
 
   // rebuild_from round-trips at this page size too.
   let all_entries: Vec<(Vec<u8>, Vec<u8>)> = (0..500u64)
-    .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+    .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
     .collect();
   tree.rebuild_from(all_entries.clone().into_iter()).unwrap();
   assert_eq!(tree.len(), 500);

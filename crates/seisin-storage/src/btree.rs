@@ -142,7 +142,7 @@ impl BPlusTree {
       bail!("value must be exactly {} bytes, got {}", self.value_size, value.len());
     }
     let root = self.root_page_id;
-    match self.insert_into_leaf(root, key, value)? {
+    match self.insert_into(root, key, value)? {
       InsertOutcome::NoSplit { is_new } => {
         if is_new {
           self.total_count += 1;
@@ -165,6 +165,86 @@ impl BPlusTree {
     }
     self.write_superblock()?;
     Ok(())
+  }
+
+  fn insert_into(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
+    let bytes = self.store.read_page(page_id)?;
+    match page_type(&bytes)? {
+      PageType::Leaf => self.insert_into_leaf(page_id, key, value),
+      PageType::Internal => self.insert_into_internal(page_id, key, value),
+    }
+  }
+
+  fn insert_into_internal(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
+    let mut node = self.read_internal(page_id)?;
+    let child_idx = node.entries.iter().position(|(k, _, _)| key < k.as_slice());
+    let child_id = match child_idx {
+      Some(i) => node.entries[i].1,
+      None => node.rightmost_child,
+    };
+    let result = self.insert_into(child_id, key, value)?;
+    match result {
+      InsertOutcome::NoSplit { is_new } => {
+        if is_new {
+          match child_idx {
+            Some(i) => node.entries[i].2 += 1,
+            None => node.rightmost_count += 1,
+          }
+          self.write_internal(page_id, &node)?;
+        }
+        Ok(InsertOutcome::NoSplit { is_new })
+      }
+      InsertOutcome::Split { is_new, separator_key, new_page_id, new_page_count } => {
+        match child_idx {
+          Some(i) => {
+            // child_id (the smaller-key half, unchanged page id) now
+            // gets the NEW, smaller separator; new_page_id (the
+            // larger-key half) takes over child_id's OLD separator.
+            let old_separator = node.entries[i].0.clone();
+            let adjusted_count = node.entries[i].2 + if is_new { 1 } else { 0 } - new_page_count;
+            node.entries[i] = (separator_key, child_id, adjusted_count);
+            node.entries.insert(i + 1, (old_separator, new_page_id, new_page_count));
+          }
+          None => {
+            // the rightmost child split: it keeps the smaller keys and
+            // becomes a regular bounded entry; new_page_id becomes the
+            // new rightmost.
+            let adjusted_count = node.rightmost_count + if is_new { 1 } else { 0 } - new_page_count;
+            node.entries.push((separator_key, node.rightmost_child, adjusted_count));
+            node.rightmost_child = new_page_id;
+            node.rightmost_count = new_page_count;
+          }
+        }
+        if node.entries.len() <= self.max_internal_entries {
+          self.write_internal(page_id, &node)?;
+          return Ok(InsertOutcome::NoSplit { is_new });
+        }
+        let mid = node.entries.len() / 2;
+        let promoted_key = node.entries[mid].0.clone();
+        let promoted_child = node.entries[mid].1;
+        let promoted_count = node.entries[mid].2;
+        let right_entries = node.entries.split_off(mid + 1);
+        node.entries.truncate(mid);
+        let new_page_id2 = self.allocate_page();
+        let new_internal_count: u64 =
+          right_entries.iter().map(|(_, _, c)| *c).sum::<u64>() + node.rightmost_count;
+        let new_node = InternalNode {
+          entries: right_entries,
+          rightmost_child: node.rightmost_child,
+          rightmost_count: node.rightmost_count,
+        };
+        node.rightmost_child = promoted_child;
+        node.rightmost_count = promoted_count;
+        self.write_internal(page_id, &node)?;
+        self.write_internal(new_page_id2, &new_node)?;
+        Ok(InsertOutcome::Split {
+          is_new,
+          separator_key: promoted_key,
+          new_page_id: new_page_id2,
+          new_page_count: new_internal_count,
+        })
+      }
+    }
   }
 
   fn insert_into_leaf(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
@@ -308,4 +388,87 @@ mod tests {
     assert_eq!(all, expected);
   }
 
+  #[test]
+  fn a_deep_tree_with_small_capacity_pages_stays_correct_across_many_splits() {
+    let tmp = NamedTempFile::new().unwrap();
+    // key_size=value_size=1000 on a 4096-byte page gives max_leaf_entries=2
+    // and max_internal_entries=(4096-32)/(1000+16)=4 — a handful of inserts
+    // is enough to force splits several levels deep.
+    let mut tree = BPlusTree::create(tmp.path(), 1000, 1000, 4096).unwrap();
+    let mut keys: Vec<u64> = (0..200).collect();
+    keys.reverse(); // deterministic non-ascending insertion order
+    for i in &keys {
+      let mut key = vec![0u8; 1000];
+      key[0..8].copy_from_slice(&i.to_le_bytes());
+      let mut value = vec![0u8; 1000];
+      value[0..8].copy_from_slice(&i.to_le_bytes());
+      tree.insert(&key, &value).unwrap();
+    }
+    assert_eq!(tree.len(), 200);
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    for (i, (key, value)) in all.iter().enumerate() {
+      let mut expected_key = vec![0u8; 1000];
+      expected_key[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+      assert_eq!(key, &expected_key);
+      assert_eq!(value, &expected_key); // value mirrors key in this test
+    }
+  }
+
+  #[test]
+  fn upserting_an_existing_key_in_a_deep_tree_does_not_change_len() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 1000, 1000, 4096).unwrap();
+    for i in 0..200u64 {
+      let mut key = vec![0u8; 1000];
+      key[0..8].copy_from_slice(&i.to_le_bytes());
+      tree.insert(&key, &vec![1u8; 1000]).unwrap();
+    }
+    let mut key = vec![0u8; 1000];
+    key[0..8].copy_from_slice(&50u64.to_le_bytes());
+    tree.insert(&key, &vec![2u8; 1000]).unwrap();
+    assert_eq!(tree.len(), 200);
+    let all = tree.all_entries_for_test().unwrap();
+    let updated = all.iter().find(|(k, _)| k == &key).unwrap();
+    assert_eq!(updated.1, vec![2u8; 1000]);
+  }
+
+  #[test]
+  fn a_split_tree_survives_reopening() {
+    // Keys use to_be_bytes(), not to_le_bytes(): byte-lexicographic
+    // order (what the tree sorts by) only matches numeric order for
+    // big-endian encodings once values reach 256 and need more than one
+    // significant byte.
+    let tmp = NamedTempFile::new().unwrap();
+    {
+      let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+      for i in 0..300u64 {
+        tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+      }
+    }
+    let mut tree = BPlusTree::open(tmp.path()).unwrap();
+    assert_eq!(tree.len(), 300);
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    assert_eq!(all.len(), 300);
+    assert_eq!(all[0], (0u64.to_be_bytes().to_vec(), 0u64.to_be_bytes().to_vec()));
+    assert_eq!(all[299], (299u64.to_be_bytes().to_vec(), 299u64.to_be_bytes().to_vec()));
+  }
+
+  #[test]
+  fn inserting_out_of_order_still_produces_a_correctly_sorted_tree() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    let mut keys: Vec<u64> = (0..300).collect();
+    keys.reverse();
+    for i in &keys {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
+      .collect();
+    assert_eq!(all, expected);
+  }
 }
