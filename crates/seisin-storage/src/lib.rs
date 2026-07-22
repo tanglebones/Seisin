@@ -1,3 +1,4 @@
+pub mod node;
 pub mod page_store;
 pub mod superblock;
 
