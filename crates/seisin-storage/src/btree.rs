@@ -119,6 +119,21 @@ impl BPlusTree {
     self.store.write_page(id, &bytes)
   }
 
+  pub fn len(&self) -> usize {
+    self.total_count as usize
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.total_count == 0
+  }
+}
+
+enum InsertOutcome {
+  NoSplit { is_new: bool },
+  Split { is_new: bool, separator_key: Vec<u8>, new_page_id: PageId, new_page_count: u64 },
+}
+
+impl BPlusTree {
   pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
     if key.len() != self.key_size as usize {
       bail!("key must be exactly {} bytes, got {}", self.key_size, key.len());
@@ -127,7 +142,33 @@ impl BPlusTree {
       bail!("value must be exactly {} bytes, got {}", self.value_size, value.len());
     }
     let root = self.root_page_id;
-    let mut node = self.read_leaf(root)?;
+    match self.insert_into_leaf(root, key, value)? {
+      InsertOutcome::NoSplit { is_new } => {
+        if is_new {
+          self.total_count += 1;
+        }
+      }
+      InsertOutcome::Split { is_new, separator_key, new_page_id, new_page_count } => {
+        let old_root_count = self.total_count + if is_new { 1 } else { 0 } - new_page_count;
+        let new_root_id = self.allocate_page();
+        let new_root = InternalNode {
+          entries: vec![(separator_key, root, old_root_count)],
+          rightmost_child: new_page_id,
+          rightmost_count: new_page_count,
+        };
+        self.write_internal(new_root_id, &new_root)?;
+        self.root_page_id = new_root_id;
+        if is_new {
+          self.total_count += 1;
+        }
+      }
+    }
+    self.write_superblock()?;
+    Ok(())
+  }
+
+  fn insert_into_leaf(&mut self, page_id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
+    let mut node = self.read_leaf(page_id)?;
     let is_new = match node.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
       Ok(i) => {
         node.entries[i].1 = value.to_vec();
@@ -138,23 +179,26 @@ impl BPlusTree {
         true
       }
     };
-    if node.entries.len() > self.max_leaf_entries {
-      bail!("leaf overflow: splitting is not implemented yet (Task 6)");
+    if node.entries.len() <= self.max_leaf_entries {
+      self.write_leaf(page_id, &node)?;
+      return Ok(InsertOutcome::NoSplit { is_new });
     }
-    self.write_leaf(root, &node)?;
-    if is_new {
-      self.total_count += 1;
+    let mid = node.entries.len() / 2;
+    let right_entries = node.entries.split_off(mid);
+    let new_page_id = self.allocate_page();
+    let separator_key = right_entries[0].0.clone();
+    let new_page_count = right_entries.len() as u64;
+    let old_next = node.next;
+    node.next = new_page_id;
+    let new_node = LeafNode { prev: page_id, next: old_next, entries: right_entries };
+    if old_next != NULL_PAGE {
+      let mut next_node = self.read_leaf(old_next)?;
+      next_node.prev = new_page_id;
+      self.write_leaf(old_next, &next_node)?;
     }
-    self.write_superblock()?;
-    Ok(())
-  }
-
-  pub fn len(&self) -> usize {
-    self.total_count as usize
-  }
-
-  pub fn is_empty(&self) -> bool {
-    self.total_count == 0
+    self.write_leaf(page_id, &node)?;
+    self.write_leaf(new_page_id, &new_node)?;
+    Ok(InsertOutcome::Split { is_new, separator_key, new_page_id, new_page_count })
   }
 }
 
@@ -248,14 +292,20 @@ mod tests {
   }
 
   #[test]
-  fn overflowing_a_single_leaf_before_splitting_is_implemented_returns_an_error() {
+  fn overflowing_a_single_leaf_splits_into_two_leaves_and_a_new_internal_root() {
     let tmp = NamedTempFile::new().unwrap();
     let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    // (4096 - 32) / 16 = 254 entries fit; the 255th must fail until Task 6.
-    for i in 0..254u64 {
+    // (4096 - 32) / 16 = 254 fit in one leaf; insert one more to force a split.
+    for i in 0..255u64 {
       tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
     }
-    let result = tree.insert(&254u64.to_le_bytes(), &254u64.to_le_bytes());
-    assert!(result.is_err());
+    assert_eq!(tree.len(), 255);
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..255u64)
+      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .collect();
+    assert_eq!(all, expected);
   }
+
 }

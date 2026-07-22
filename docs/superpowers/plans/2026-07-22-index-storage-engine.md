@@ -1040,11 +1040,11 @@ git commit -m "feat: add BPlusTree create/open and single-leaf insert"
 
 Entries semantics reminder (see Task 4): a split's reported `separator_key` is always the **smallest key of `new_page_id`** — the parent (or, in this task, `insert`'s own root-split handling) treats the original page id as the smaller-key half and `new_page_id` as the larger-key half.
 
-- [ ] **Step 1: Remove Task 5's now-superseded overflow test, write this task's failing tests**
+- [ ] **Step 1: Remove Task 5's now-superseded overflow test, write this task's failing test**
 
 Remove `overflowing_a_single_leaf_before_splitting_is_implemented_returns_an_error` from `btree.rs`'s test module (Task 6 makes this pass instead of error, so the old assertion is now wrong, not just outdated).
 
-Add these tests to the same `mod tests` block:
+Add this test to the same `mod tests` block:
 
 ```rust
   #[test]
@@ -1063,50 +1063,14 @@ Add these tests to the same `mod tests` block:
       .collect();
     assert_eq!(all, expected);
   }
-
-  #[test]
-  fn a_split_tree_survives_reopening() {
-    let tmp = NamedTempFile::new().unwrap();
-    {
-      let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-      for i in 0..300u64 {
-        tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
-      }
-    }
-    let mut tree = BPlusTree::open(tmp.path()).unwrap();
-    assert_eq!(tree.len(), 300);
-    let mut all = tree.all_entries_for_test().unwrap();
-    all.sort();
-    assert_eq!(all.len(), 300);
-    assert_eq!(all[0], (0u64.to_le_bytes().to_vec(), 0u64.to_le_bytes().to_vec()));
-    assert_eq!(all[299], (299u64.to_le_bytes().to_vec(), 299u64.to_le_bytes().to_vec()));
-  }
-
-  #[test]
-  fn inserting_out_of_order_still_produces_a_correctly_sorted_tree() {
-    let tmp = NamedTempFile::new().unwrap();
-    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
-    let mut keys: Vec<u64> = (0..300).collect();
-    // A fixed, deterministic shuffle (reverse order) rather than real
-    // randomness, per this project's preference for seeded/deterministic
-    // test inputs over nondeterministic ones.
-    keys.reverse();
-    for i in &keys {
-      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
-    }
-    let mut all = tree.all_entries_for_test().unwrap();
-    all.sort();
-    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
-      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
-      .collect();
-    assert_eq!(all, expected);
-  }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+**Note on scope (discovered during execution, corrected here):** a test inserting enough entries to trigger a *second* split (e.g. 300 entries) cannot pass yet even after this task's implementation — once the root becomes an internal page (after the first split), `insert`'s call path in this task still calls `insert_into_leaf` directly on whatever `root_page_id` is, which fails immediately on an internal page's bytes. Routing an insert through an already-internal root requires Task 7's `insert_into`/`insert_into_internal` dispatch. The two multi-split tests originally planned here (`a_split_tree_survives_reopening`, `inserting_out_of_order_still_produces_a_correctly_sorted_tree`) belong in Task 7 instead, where the dispatch logic that makes them possible actually lands — see Task 7's Step 1.
+
+- [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p seisin-storage --lib btree::`
-Expected: FAIL — `overflowing_a_single_leaf_splits_into_two_leaves_and_a_new_internal_root` and the two others fail (current `insert` errors on overflow instead of splitting).
+Expected: FAIL — `overflowing_a_single_leaf_splits_into_two_leaves_and_a_new_internal_root` fails (current `insert` errors on overflow instead of splitting).
 
 - [ ] **Step 3: Implement leaf splitting**
 
@@ -1198,12 +1162,12 @@ impl BPlusTree {
 
 This replaces the old `insert` and the `len`/`is_empty` pair stays the same (repeated here so the block above is a complete, drop-in replacement for everything from `pub fn insert` through the end of the non-test `impl BPlusTree` block written in Task 5).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 3: Run the tests to verify they pass**
 
 Run: `cargo test -p seisin-storage --lib btree::`
-Expected: PASS (8 tests: the 5 remaining from Task 5 plus this task's 3 new ones).
+Expected: PASS (6 tests: the 5 remaining from Task 5 plus this task's 1 new one).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add crates/seisin-storage/src/btree.rs
@@ -1272,12 +1236,52 @@ Add to `btree.rs`'s `mod tests` block:
     let updated = all.iter().find(|(k, _)| k == &key).unwrap();
     assert_eq!(updated.1, vec![2u8; 1000]);
   }
+
+  #[test]
+  fn a_split_tree_survives_reopening() {
+    let tmp = NamedTempFile::new().unwrap();
+    {
+      let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+      for i in 0..300u64 {
+        tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+      }
+    }
+    let mut tree = BPlusTree::open(tmp.path()).unwrap();
+    assert_eq!(tree.len(), 300);
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    assert_eq!(all.len(), 300);
+    assert_eq!(all[0], (0u64.to_le_bytes().to_vec(), 0u64.to_le_bytes().to_vec()));
+    assert_eq!(all[299], (299u64.to_le_bytes().to_vec(), 299u64.to_le_bytes().to_vec()));
+  }
+
+  #[test]
+  fn inserting_out_of_order_still_produces_a_correctly_sorted_tree() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    let mut keys: Vec<u64> = (0..300).collect();
+    // A fixed, deterministic shuffle (reverse order) rather than real
+    // randomness, per this project's preference for seeded/deterministic
+    // test inputs over nondeterministic ones.
+    keys.reverse();
+    for i in &keys {
+      tree.insert(&i.to_le_bytes(), &i.to_le_bytes()).unwrap();
+    }
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
+      .map(|i| (i.to_le_bytes().to_vec(), i.to_le_bytes().to_vec()))
+      .collect();
+    assert_eq!(all, expected);
+  }
 ```
+
+**Note:** the last two tests above were originally drafted under Task 6 but moved here — they require this task's `insert_into`/`insert_into_internal` dispatch (routing an insert through an already-internal root) to pass at all; see Task 6's Step 1 note.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p seisin-storage --lib btree::`
-Expected: FAIL — both new tests panic (root's leaf-only `insert` path calls `insert_into_leaf` on whatever `root_page_id` is, but once the root becomes internal after a first split, calling leaf-decode logic on an internal page's bytes fails page-type validation).
+Expected: FAIL — all four new tests panic (root's leaf-only `insert` path calls `insert_into_leaf` on whatever `root_page_id` is, but once the root becomes internal after a first split, calling leaf-decode logic on an internal page's bytes fails page-type validation).
 
 - [ ] **Step 3: Implement internal splitting and the leaf/internal dispatch**
 
