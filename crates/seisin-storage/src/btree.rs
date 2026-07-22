@@ -240,6 +240,82 @@ impl BPlusTree {
       }
     }
   }
+
+  pub fn rebuild_from(&mut self, entries: impl Iterator<Item = (Vec<u8>, Vec<u8>)>) -> Result<()> {
+    let mut sorted: Vec<(Vec<u8>, Vec<u8>)> = entries.collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    self.store.truncate()?;
+    self.next_page_id = 1;
+    self.total_count = 0;
+    if sorted.is_empty() {
+      let root_id = self.allocate_page();
+      let empty_leaf = LeafNode { prev: NULL_PAGE, next: NULL_PAGE, entries: vec![] };
+      self.write_leaf(root_id, &empty_leaf)?;
+      self.root_page_id = root_id;
+      self.write_superblock()?;
+      return Ok(());
+    }
+    let leaf_chunk_size = self.max_leaf_entries.max(1);
+    let leaf_chunks: Vec<&[(Vec<u8>, Vec<u8>)]> = sorted.chunks(leaf_chunk_size).collect();
+    let mut level: Vec<(Vec<u8>, PageId, u64)> = Vec::with_capacity(leaf_chunks.len());
+    let mut leaf_ids = Vec::with_capacity(leaf_chunks.len());
+    for chunk in &leaf_chunks {
+      let id = self.allocate_page();
+      leaf_ids.push(id);
+      level.push((chunk[0].0.clone(), id, chunk.len() as u64));
+    }
+    for (i, chunk) in leaf_chunks.iter().enumerate() {
+      let prev = if i == 0 { NULL_PAGE } else { leaf_ids[i - 1] };
+      let next = if i + 1 < leaf_ids.len() { leaf_ids[i + 1] } else { NULL_PAGE };
+      let node = LeafNode { prev, next, entries: chunk.to_vec() };
+      self.write_leaf(leaf_ids[i], &node)?;
+    }
+    self.total_count = sorted.len() as u64;
+    self.root_page_id = if level.len() == 1 {
+      level[0].1
+    } else {
+      self.build_internal_levels(level)?
+    };
+    self.write_superblock()?;
+    Ok(())
+  }
+
+  /// Builds internal levels bottom-up from `level` (a sequence of
+  /// `(smallest_key_in_subtree, child_page_id, count)` triples covering
+  /// the whole key range in ascending order) until exactly one page
+  /// remains, returning its id as the new root.
+  fn build_internal_levels(&mut self, mut level: Vec<(Vec<u8>, PageId, u64)>) -> Result<PageId> {
+    while level.len() > 1 {
+      let group_size = self.max_internal_entries + 1; // each internal page holds this many children
+      let mut next_level = Vec::new();
+      let mut i = 0;
+      while i < level.len() {
+        let end = (i + group_size).min(level.len());
+        let group = &level[i..end];
+        // The last child in the group becomes this page's rightmost
+        // child (no upper bound needed within the page); every other
+        // child gets an entry whose separator is the NEXT child's
+        // smallest key (the exclusive upper bound for that child).
+        let mut entries: Vec<(Vec<u8>, PageId, u64)> = Vec::with_capacity(group.len() - 1);
+        for j in 0..group.len() - 1 {
+          entries.push((group[j + 1].0.clone(), group[j].1, group[j].2));
+        }
+        let rightmost = group.last().unwrap();
+        let total_count: u64 = entries.iter().map(|(_, _, c)| *c).sum::<u64>() + rightmost.2;
+        let page_id = self.allocate_page();
+        let node = InternalNode {
+          entries,
+          rightmost_child: rightmost.1,
+          rightmost_count: rightmost.2,
+        };
+        self.write_internal(page_id, &node)?;
+        next_level.push((group[0].0.clone(), page_id, total_count));
+        i = end;
+      }
+      level = next_level;
+    }
+    Ok(level[0].1)
+  }
 }
 
 enum InsertOutcome {
@@ -708,5 +784,66 @@ mod tests {
       expected_key[0..8].copy_from_slice(&rank.to_le_bytes());
       assert_eq!(entry.0, expected_key);
     }
+  }
+
+  #[test]
+  fn rebuild_from_produces_a_tree_equivalent_to_sequential_inserts() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
+      .collect();
+    // Feed rebuild_from in a shuffled (reversed) order — it must sort
+    // internally rather than assume sorted input.
+    let mut shuffled = entries.clone();
+    shuffled.reverse();
+    tree.rebuild_from(shuffled.into_iter()).unwrap();
+    assert_eq!(tree.len(), 300);
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    assert_eq!(all, entries);
+  }
+
+  #[test]
+  fn rebuild_from_an_empty_iterator_produces_an_empty_tree() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
+    tree.rebuild_from(std::iter::empty()).unwrap();
+    assert_eq!(tree.len(), 0);
+    assert_eq!(tree.all_entries_for_test().unwrap(), vec![]);
+  }
+
+  #[test]
+  fn rebuild_from_leaves_a_usable_tree_that_still_supports_insert_and_scans() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
+      .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
+      .collect();
+    tree.rebuild_from(entries.into_iter()).unwrap();
+    tree.insert(&999u64.to_be_bytes(), &999u64.to_be_bytes()).unwrap();
+    assert_eq!(tree.len(), 301);
+    let top = tree.scan_backward_bounded(1).unwrap();
+    assert_eq!(top[0].0, 999u64.to_be_bytes().to_vec());
+    let sample = tree.sample_by_rank(3).unwrap();
+    assert_eq!(sample.len(), 3);
+  }
+
+  #[test]
+  fn rebuild_from_survives_reopening() {
+    let tmp = NamedTempFile::new().unwrap();
+    {
+      let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+      let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..300u64)
+        .map(|i| (i.to_be_bytes().to_vec(), i.to_be_bytes().to_vec()))
+        .collect();
+      tree.rebuild_from(entries.into_iter()).unwrap();
+    }
+    let mut tree = BPlusTree::open(tmp.path()).unwrap();
+    assert_eq!(tree.len(), 300);
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    assert_eq!(all.len(), 300);
   }
 }
