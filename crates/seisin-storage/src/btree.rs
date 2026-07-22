@@ -195,6 +195,51 @@ impl BPlusTree {
       }
     }
   }
+
+  pub fn sample_by_rank(&mut self, k: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let total = self.total_count as usize;
+    if total == 0 || k == 0 {
+      return Ok(Vec::new());
+    }
+    let mut results = Vec::with_capacity(k);
+    for i in 0..k {
+      let rank = (i * total) / k;
+      results.push(self.entry_at_rank(rank)?);
+    }
+    Ok(results)
+  }
+
+  fn entry_at_rank(&mut self, mut rank: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut page_id = self.root_page_id;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => {
+          let node = decode_leaf(&bytes, self.key_size, self.value_size)?;
+          if rank >= node.entries.len() {
+            bail!("rank {rank} out of bounds for a leaf with {} entries", node.entries.len());
+          }
+          return Ok(node.entries[rank].clone());
+        }
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          let mut descended = false;
+          for (_, child, count) in &node.entries {
+            let count = *count as usize;
+            if rank < count {
+              page_id = *child;
+              descended = true;
+              break;
+            }
+            rank -= count;
+          }
+          if !descended {
+            page_id = node.rightmost_child;
+          }
+        }
+      }
+    }
+  }
 }
 
 enum InsertOutcome {
@@ -613,5 +658,55 @@ mod tests {
     assert_eq!(result.len(), 260);
     assert_eq!(result[0].0, 0u64.to_be_bytes().to_vec());
     assert_eq!(result[259].0, 259u64.to_be_bytes().to_vec());
+  }
+
+  #[test]
+  fn sample_by_rank_returns_entries_at_the_expected_evenly_spaced_ranks() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in 0..300u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    // ranks = i * 300 / 5 for i in 0..5 => 0, 60, 120, 180, 240
+    let result = tree.sample_by_rank(5).unwrap();
+    let expected_ranks = [0u64, 60, 120, 180, 240];
+    assert_eq!(result.len(), 5);
+    for (entry, rank) in result.iter().zip(expected_ranks.iter()) {
+      assert_eq!(entry.0, rank.to_be_bytes().to_vec());
+    }
+  }
+
+  #[test]
+  fn sample_by_rank_on_an_empty_tree_returns_nothing() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    assert_eq!(tree.sample_by_rank(5).unwrap(), vec![]);
+  }
+
+  #[test]
+  fn sample_by_rank_with_k_zero_returns_nothing() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    tree.insert(&1u64.to_be_bytes(), &1u64.to_be_bytes()).unwrap();
+    assert_eq!(tree.sample_by_rank(0).unwrap(), vec![]);
+  }
+
+  #[test]
+  fn sample_by_rank_works_across_a_multi_level_tree() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 1000, 1000, 4096).unwrap();
+    for i in 0..200u64 {
+      let mut key = vec![0u8; 1000];
+      key[0..8].copy_from_slice(&i.to_le_bytes());
+      tree.insert(&key, &key).unwrap();
+    }
+    let result = tree.sample_by_rank(4).unwrap();
+    let expected_ranks = [0u64, 50, 100, 150];
+    assert_eq!(result.len(), 4);
+    for (entry, rank) in result.iter().zip(expected_ranks.iter()) {
+      let mut expected_key = vec![0u8; 1000];
+      expected_key[0..8].copy_from_slice(&rank.to_le_bytes());
+      assert_eq!(entry.0, expected_key);
+    }
   }
 }
