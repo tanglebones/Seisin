@@ -7,9 +7,11 @@ edition = "2021"
 seisin-core = { path = "../seisin-core" }
 seisin-node = { path = "../seisin-node" }
 seisin-ops = { path = "../seisin-ops" }
+seisin-protocol = { path = "../seisin-protocol" }
+seisin-storage = { path = "../seisin-storage" }
 anyhow = "1"
 
 [dev-dependencies]
 seisin-ring = { path = "../seisin-ring" }
 seisin-client = { path = "../seisin-client" }
-seisin-protocol = { path = "../seisin-protocol" }
+tempfile = "3"

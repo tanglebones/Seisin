@@ -18,7 +18,7 @@ use crate::field::FieldValue;
 /// one, not to partition anything. `DatumId::from_bytes` isn't `const
 /// fn`, so this is a plain function (cheap — it's just constructing a
 /// 16-byte value) rather than a `const`.
-fn derived_id_namespace() -> DatumId {
+pub(crate) fn derived_id_namespace() -> DatumId {
   DatumId::from_bytes([
     0x5e, 0x15, 0x1a, 0x00, 0xd1, 0xd5, 0x4e, 0x1d, 0x9a, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
   ])
