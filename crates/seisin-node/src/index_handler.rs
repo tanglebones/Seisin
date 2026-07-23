@@ -39,6 +39,15 @@ pub struct IndexApplyOutcome {
 /// bytes per update.
 pub trait ResidentIndex: Send {
   fn apply(&mut self, payload: &[u8]) -> IndexApplyOutcome;
+
+  /// Answers a read-only query against the resident structure. `query`
+  /// and the returned bytes are opaque to the framework — the kind's
+  /// own codec (living outside `seisin-node`) defines both. Kinds that
+  /// have no query surface (sk) keep this default.
+  fn query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+    let _ = query;
+    Err("this index kind supports no queries".to_string())
+  }
 }
 
 /// A registered index kind: knows how to build its resident structure
@@ -118,6 +127,19 @@ mod tests {
         bytes: stored.unwrap_or_default(),
       }))
     }
+  }
+
+  #[test]
+  fn query_default_impl_reports_the_kind_supports_no_queries() {
+    let mut registry = IndexKindRegistry::new();
+    registry.register("append", Box::new(AppendKind));
+    let resident = registry
+      .get("append")
+      .unwrap()
+      .open(DatumId::new(), None)
+      .unwrap();
+    let err = resident.query(b"anything").unwrap_err();
+    assert!(err.contains("no queries"), "{err}");
   }
 
   #[test]
