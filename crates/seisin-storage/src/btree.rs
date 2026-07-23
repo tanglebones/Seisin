@@ -545,6 +545,88 @@ impl BPlusTree {
   }
 }
 
+impl BPlusTree {
+  /// Removes `key` if present, returning whether it was found. Fixes
+  /// every ancestor internal node's subtree count on the way down (so
+  /// rank descent and sampling stay correct) via a presence check
+  /// first, then a decrementing descent — counts are only touched when
+  /// the key is known to exist. Does NOT merge or rebalance an
+  /// underfull page afterward: pages can go sparse (even empty) over a
+  /// delete-heavy history — never incorrect, just less space-efficient;
+  /// an accepted, documented limitation revisited only if a real
+  /// workload shows it matters.
+  pub fn remove(&mut self, key: &[u8]) -> Result<bool> {
+    if key.len() != self.key_size as usize {
+      bail!(
+        "key must be exactly {} bytes, got {}",
+        self.key_size,
+        key.len()
+      );
+    }
+    if !self.contains(key)? {
+      return Ok(false);
+    }
+    let mut page_id = self.root_page_id;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => {
+          let mut node = decode_leaf(&bytes, self.key_size, self.value_size)?;
+          if let Ok(i) = node.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+            node.entries.remove(i);
+            self.write_leaf(page_id, &node)?;
+          }
+          break;
+        }
+        PageType::Internal => {
+          let mut node = decode_internal(&bytes, self.key_size)?;
+          let child_idx = node.entries.iter().position(|(k, _, _)| key < k.as_slice());
+          let next = match child_idx {
+            Some(i) => {
+              node.entries[i].2 -= 1;
+              node.entries[i].1
+            }
+            None => {
+              node.rightmost_count -= 1;
+              node.rightmost_child
+            }
+          };
+          self.write_internal(page_id, &node)?;
+          page_id = next;
+        }
+      }
+    }
+    self.total_count -= 1;
+    self.write_superblock()?;
+    Ok(true)
+  }
+
+  fn contains(&mut self, key: &[u8]) -> Result<bool> {
+    let mut page_id = self.root_page_id;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => {
+          let node = decode_leaf(&bytes, self.key_size, self.value_size)?;
+          return Ok(
+            node
+              .entries
+              .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+              .is_ok(),
+          );
+        }
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          page_id = match node.entries.iter().find(|(k, _, _)| key < k.as_slice()) {
+            Some((_, child, _)) => *child,
+            None => node.rightmost_child,
+          };
+        }
+      }
+    }
+  }
+}
+
 #[cfg(test)]
 impl BPlusTree {
   /// Full in-order traversal via recursive descent — test-only, used to
@@ -870,6 +952,118 @@ mod tests {
       expected_key[0..8].copy_from_slice(&rank.to_le_bytes());
       assert_eq!(entry.0, expected_key);
     }
+  }
+
+  #[test]
+  fn remove_deletes_an_existing_key_and_returns_true() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in 0..10u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    assert!(tree.remove(&5u64.to_be_bytes()).unwrap());
+    assert_eq!(tree.len(), 9);
+    let all = tree.all_entries_for_test().unwrap();
+    assert!(!all.iter().any(|(k, _)| k == &5u64.to_be_bytes().to_vec()));
+  }
+
+  #[test]
+  fn remove_on_a_missing_key_is_a_noop_returning_false() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    tree
+      .insert(&1u64.to_be_bytes(), &1u64.to_be_bytes())
+      .unwrap();
+    assert!(!tree.remove(&2u64.to_be_bytes()).unwrap());
+    assert_eq!(tree.len(), 1);
+  }
+
+  #[test]
+  fn remove_rejects_a_wrong_sized_key() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    assert!(tree.remove(&[1u8; 4]).is_err());
+  }
+
+  #[test]
+  fn remove_keeps_rank_descent_correct_across_a_multi_level_tree() {
+    let tmp = NamedTempFile::new().unwrap();
+    // key/value_size 1000 on 4096-byte pages: max_leaf_entries=2 — a
+    // multi-level tree from a handful of inserts (same trick as the
+    // deep-tree insert test above).
+    let mut tree = BPlusTree::create(tmp.path(), 1000, 1000, 4096).unwrap();
+    let make = |i: u64| {
+      let mut k = vec![0u8; 1000];
+      k[0..8].copy_from_slice(&i.to_be_bytes());
+      k
+    };
+    for i in 0..50u64 {
+      tree.insert(&make(i), &make(i)).unwrap();
+    }
+    // Remove every even key; odd keys remain at ranks 0..25.
+    for i in (0..50u64).step_by(2) {
+      assert!(tree.remove(&make(i)).unwrap());
+    }
+    assert_eq!(tree.len(), 25);
+    let sample = tree.sample_by_rank(5).unwrap();
+    // ranks 0,5,10,15,20 over remaining keys 1,3,5,... => key = 2*rank+1
+    let expected: Vec<u64> = [0u64, 5, 10, 15, 20].iter().map(|r| 2 * r + 1).collect();
+    for (entry, want) in sample.iter().zip(expected.iter()) {
+      assert_eq!(entry.0, make(*want));
+    }
+    let bottom = tree.scan_forward_bounded(3).unwrap();
+    assert_eq!(bottom[0].0, make(1));
+    assert_eq!(bottom[2].0, make(5));
+    let top = tree.scan_backward_bounded(1).unwrap();
+    assert_eq!(top[0].0, make(49));
+  }
+
+  #[test]
+  fn interleaved_inserts_and_removes_stay_consistent() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    // Deterministic pseudo-random walk (hand-rolled LCG, no rand dep):
+    // mirror every operation into a BTreeMap and compare at the end.
+    let mut model = std::collections::BTreeMap::new();
+    let mut state = 0x2545F4914F6CDD1Du64;
+    for _ in 0..2000 {
+      state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+      let key = ((state >> 33) % 500).to_be_bytes();
+      if (state >> 20) & 1 == 0 {
+        tree.insert(&key, &key).unwrap();
+        model.insert(key.to_vec(), key.to_vec());
+      } else {
+        let expected = model.remove(&key.to_vec()).is_some();
+        assert_eq!(tree.remove(&key).unwrap(), expected);
+      }
+    }
+    assert_eq!(tree.len(), model.len());
+    let mut all = tree.all_entries_for_test().unwrap();
+    all.sort();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+    assert_eq!(all, expected);
+  }
+
+  #[test]
+  fn a_tree_with_removes_survives_reopening() {
+    let tmp = NamedTempFile::new().unwrap();
+    {
+      let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+      for i in 0..300u64 {
+        tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+      }
+      for i in 100..200u64 {
+        assert!(tree.remove(&i.to_be_bytes()).unwrap());
+      }
+    }
+    let mut tree = BPlusTree::open(tmp.path()).unwrap();
+    assert_eq!(tree.len(), 200);
+    assert_eq!(
+      tree.scan_backward_bounded(1).unwrap()[0].0,
+      299u64.to_be_bytes().to_vec()
+    );
   }
 
   #[test]
