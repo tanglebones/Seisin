@@ -49,7 +49,22 @@ impl DatumTypeDef {
   }
 
   /// Declares an index on this type — see `IndexDef`.
+  ///
+  /// # Panics
+  /// Panics if an `Rk` index names an undeclared or non-numeric field —
+  /// a solution's schema declaration bug, caught at process start (the
+  /// same policy as `NodeConfig::self_address`'s documented panic).
   pub fn index(mut self, index: IndexDef) -> Self {
+    if let IndexDef::Rk { field } = &index {
+      let declared = self.fields.iter().find(|(name, _)| name == field);
+      match declared {
+        Some((_, FieldType::I64)) | Some((_, FieldType::F64)) => {}
+        other => panic!(
+          "rk index field {:?} on type {:?} must be a declared I64 or F64 field, found {:?}",
+          field, self.name, other
+        ),
+      }
+    }
     self.indexes.push(index);
     self
   }
@@ -69,6 +84,9 @@ pub enum IndexDef {
     field: String,
     unique: Option<ConflictOp>,
   },
+  /// One global ranked structure per `type.field` (leaderboards). The
+  /// field must be declared, and numeric — enforced at declaration.
+  Rk { field: String },
 }
 
 /// Encodes `values` (one per field, in `def.fields`' declared order) into
@@ -206,6 +224,34 @@ mod tests {
       } => assert_eq!(op.0, "resolve_duplicate_email"),
       other => panic!("expected a unique Sk index, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn an_rk_index_on_a_numeric_field_is_accepted() {
+    let def = DatumTypeDef::new("player")
+      .field("score", FieldType::I64)
+      .index(IndexDef::Rk {
+        field: "score".to_string(),
+      });
+    assert_eq!(def.indexes.len(), 1);
+  }
+
+  #[test]
+  #[should_panic(expected = "rk index field")]
+  fn an_rk_index_on_a_string_field_panics_at_declaration() {
+    DatumTypeDef::new("player")
+      .field("name", FieldType::String)
+      .index(IndexDef::Rk {
+        field: "name".to_string(),
+      });
+  }
+
+  #[test]
+  #[should_panic(expected = "rk index field")]
+  fn an_rk_index_on_an_undeclared_field_panics_at_declaration() {
+    DatumTypeDef::new("player").index(IndexDef::Rk {
+      field: "score".to_string(),
+    });
   }
 
   #[test]

@@ -12,6 +12,7 @@ use seisin_core::datum::DatumId;
 use seisin_ops::context::OpContext;
 
 use crate::field::FieldValue;
+use crate::rk_index::{encode_rank_key, encode_rk_index_op, rk_key, RkIndexOp};
 use crate::schema::{decode_datum, encode_datum, DatumTypeDef, IndexDef};
 use crate::sk_index::{encode_sk_index_op, sk_key, SkIndexOp};
 
@@ -116,34 +117,66 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
         continue;
       }
       for index in &tracked.def.indexes {
-        let IndexDef::Sk { field, unique } = index;
-        let Some(field_idx) = tracked
-          .def
-          .fields
-          .iter()
-          .position(|(name, _)| name == field)
-        else {
-          continue;
-        };
-        let old_value = tracked.before.as_ref().map(|v| v[field_idx].clone());
-        let new_value = tracked.after.as_ref().map(|v| v[field_idx].clone());
-        if old_value == new_value {
-          continue;
-        }
-        if let Some(old_value) = &old_value {
-          if let Ok(old_key) = sk_key(&tracked.def.name, field, old_value) {
-            let payload = encode_sk_index_op(&SkIndexOp::Remove { pk_id });
-            self.ctx.schedule_index_update(old_key, "sk", payload);
+        match index {
+          IndexDef::Sk { field, unique } => {
+            let Some(field_idx) = tracked
+              .def
+              .fields
+              .iter()
+              .position(|(name, _)| name == field)
+            else {
+              continue;
+            };
+            let old_value = tracked.before.as_ref().map(|v| v[field_idx].clone());
+            let new_value = tracked.after.as_ref().map(|v| v[field_idx].clone());
+            if old_value == new_value {
+              continue;
+            }
+            if let Some(old_value) = &old_value {
+              if let Ok(old_key) = sk_key(&tracked.def.name, field, old_value) {
+                let payload = encode_sk_index_op(&SkIndexOp::Remove { pk_id });
+                self.ctx.schedule_index_update(old_key, "sk", payload);
+              }
+            }
+            if let Some(new_value) = &new_value {
+              if let Ok(new_key) = sk_key(&tracked.def.name, field, new_value) {
+                let conflict_op = unique.as_ref().map(|op| op.0.clone());
+                let payload = encode_sk_index_op(&SkIndexOp::Insert {
+                  pk_id,
+                  unique_conflict_op: conflict_op,
+                });
+                self.ctx.schedule_index_update(new_key, "sk", payload);
+              }
+            }
           }
-        }
-        if let Some(new_value) = &new_value {
-          if let Ok(new_key) = sk_key(&tracked.def.name, field, new_value) {
-            let conflict_op = unique.as_ref().map(|op| op.0.clone());
-            let payload = encode_sk_index_op(&SkIndexOp::Insert {
+          IndexDef::Rk { field } => {
+            let Some(field_idx) = tracked
+              .def
+              .fields
+              .iter()
+              .position(|(name, _)| name == field)
+            else {
+              continue;
+            };
+            let old_value = tracked.before.as_ref().map(|v| v[field_idx].clone());
+            let new_value = tracked.after.as_ref().map(|v| v[field_idx].clone());
+            if old_value == new_value {
+              continue;
+            }
+            // Declaration-time validation (schema.rs) guarantees the
+            // field is numeric, so encode_rank_key cannot fail here.
+            let old_rank_key = old_value.as_ref().and_then(|v| encode_rank_key(v).ok());
+            let new_rank_key = new_value.as_ref().and_then(|v| encode_rank_key(v).ok());
+            if old_rank_key.is_none() && new_rank_key.is_none() {
+              continue;
+            }
+            let payload = encode_rk_index_op(&RkIndexOp {
               pk_id,
-              unique_conflict_op: conflict_op,
+              old_rank_key,
+              new_rank_key,
             });
-            self.ctx.schedule_index_update(new_key, "sk", payload);
+            let target = rk_key(&tracked.def.name, field);
+            self.ctx.schedule_index_update(target, "rk", payload);
           }
         }
       }
@@ -155,6 +188,7 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
 mod tests {
   use super::*;
   use crate::field::FieldType;
+  use crate::rk_index::{decode_rk_index_op, encode_rank_key, rk_key};
   use crate::schema::{ConflictOp, DatumTypeDef, IndexDef};
   use crate::sk_index::{decode_sk_index_op, sk_key, SkIndexOp};
   use seisin_core::cache::Cache;
@@ -353,6 +387,106 @@ mod tests {
       } => assert_eq!(unique_conflict_op, Some("resolve".to_string())),
       other => panic!("expected an Insert op, got {other:?}"),
     }
+  }
+
+  fn player_type() -> DatumTypeDef {
+    DatumTypeDef::new("player")
+      .field("score", FieldType::I64)
+      .index(IndexDef::Rk {
+        field: "score".to_string(),
+      })
+  }
+
+  fn commit_initial(cache: &mut Cache, def: &DatumTypeDef, pk_id: DatumId, values: &[FieldValue]) {
+    let mut ctx = OpContext::new(cache);
+    ctx.put(pk_id, crate::encode_datum(def, values).unwrap());
+    let staged = ctx.take_staged_writes();
+    for (id, content) in staged {
+      if let Some(bytes) = content {
+        cache.put(id, bytes);
+      }
+    }
+  }
+
+  #[test]
+  fn a_fresh_rk_write_schedules_one_insert_with_no_old_key() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let def = player_type();
+    let pk_id = DatumId::new();
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.set(pk_id, &def, vec![FieldValue::I64(100)]).unwrap();
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].index_kind, "rk");
+    assert_eq!(updates[0].target, rk_key("player", "score"));
+    let op = decode_rk_index_op(&updates[0].payload).unwrap();
+    assert_eq!(op.pk_id, pk_id);
+    assert_eq!(op.old_rank_key, None);
+    assert_eq!(
+      op.new_rank_key,
+      Some(encode_rank_key(&FieldValue::I64(100)).unwrap())
+    );
+  }
+
+  #[test]
+  fn an_rk_score_change_schedules_one_update_carrying_old_and_new_keys() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = player_type();
+    let pk_id = DatumId::new();
+    commit_initial(&mut cache, &def, pk_id, &[FieldValue::I64(100)]);
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk_id, &def).unwrap();
+      tctx.set(pk_id, &def, vec![FieldValue::I64(250)]).unwrap();
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1); // one target datum, unlike sk's two
+    let op = decode_rk_index_op(&updates[0].payload).unwrap();
+    assert_eq!(
+      op.old_rank_key,
+      Some(encode_rank_key(&FieldValue::I64(100)).unwrap())
+    );
+    assert_eq!(
+      op.new_rank_key,
+      Some(encode_rank_key(&FieldValue::I64(250)).unwrap())
+    );
+  }
+
+  #[test]
+  fn deleting_an_rk_indexed_datum_schedules_a_remove_only_update() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = player_type();
+    let pk_id = DatumId::new();
+    commit_initial(&mut cache, &def, pk_id, &[FieldValue::I64(100)]);
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.delete(pk_id, &def).unwrap();
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    let op = decode_rk_index_op(&updates[0].payload).unwrap();
+    assert!(op.old_rank_key.is_some());
+    assert_eq!(op.new_rank_key, None);
+  }
+
+  #[test]
+  fn an_unchanged_rk_score_schedules_nothing() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = player_type();
+    let pk_id = DatumId::new();
+    commit_initial(&mut cache, &def, pk_id, &[FieldValue::I64(100)]);
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk_id, &def).unwrap();
+      tctx.set(pk_id, &def, vec![FieldValue::I64(100)]).unwrap();
+    }
+    assert_eq!(ctx.take_pending_index_updates().len(), 0);
   }
 
   #[test]
