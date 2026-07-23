@@ -58,28 +58,38 @@ fn handle_connection(
       Ok(r) => r,
       Err(_) => return, // malformed request: drop the connection
     };
-    let Request::Op {
-      op_id,
-      op_name,
-      datum_ids,
-      payload,
-    } = request
-    else {
-      // Acquire/Recall are node-to-node only, carried over a
-      // peer-link connection (see peer_link.rs) — a client should
-      // never send one on this client-facing connection.
-      return;
+    let response = match request {
+      Request::Op {
+        op_id,
+        op_name,
+        datum_ids,
+        payload,
+      } => handle_op_request(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        op_id,
+        op_name,
+        datum_ids,
+        payload,
+      ),
+      Request::RkQuery {
+        index_datum_id,
+        query,
+      } => handle_rk_query(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        index_datum_id,
+        query,
+      ),
+      // Acquire/Recall/Release/IndexUpdate are node-to-node only,
+      // carried over a peer-link connection (see peer_link.rs) — a
+      // client should never send one on this client-facing connection.
+      _ => return,
     };
-    let response = handle_op_request(
-      self_node_id,
-      &ring,
-      &address_book,
-      &pool,
-      op_id,
-      op_name,
-      datum_ids,
-      payload,
-    );
     if write_frame(&mut stream, &encode_response(&response)).is_err() {
       return;
     }
@@ -131,6 +141,44 @@ fn handle_op_request(
 
   match pool.run_op(op_id, op_name, datum_ids, payload) {
     Ok(payload) => Response::OpResult { payload },
+    Err(message) => Response::OpError { message },
+  }
+}
+
+/// Routes a client rk query: redirect if `index_datum_id` isn't native
+/// here (same check as `handle_op_request`), else answer synchronously
+/// from the owning thread's resident tree. The query kind is re-encoded
+/// to the protocol's standalone codec bytes because the worker treats
+/// query/result bytes as opaque (`ResidentIndex::query`) — the byte
+/// layout is defined once, in seisin-protocol, shared with the rk
+/// impl's decoder in seisin-types.
+fn handle_rk_query(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  index_datum_id: DatumId,
+  query: seisin_protocol::RkQueryKind,
+) -> Response {
+  let native_node = ring.read().unwrap().native(index_datum_id).0;
+  if native_node != self_node_id {
+    return match address_book.get(&native_node) {
+      Some(address) => Response::Redirect {
+        address: address.clone(),
+      },
+      None => Response::OpError {
+        message: format!("no known address for node {native_node:?}"),
+      },
+    };
+  }
+  let query_bytes = seisin_protocol::encode_rk_query_kind(&query);
+  match pool.run_index_query(index_datum_id, "rk".to_string(), query_bytes) {
+    Ok(result_bytes) => match seisin_protocol::decode_rk_entries(&result_bytes) {
+      Ok(entries) => Response::RkQueryResult { entries },
+      Err(e) => Response::OpError {
+        message: format!("malformed rk query result: {e}"),
+      },
+    },
     Err(message) => Response::OpError { message },
   }
 }

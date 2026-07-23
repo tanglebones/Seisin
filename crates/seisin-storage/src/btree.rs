@@ -572,7 +572,10 @@ impl BPlusTree {
       match page_type(&bytes)? {
         PageType::Leaf => {
           let mut node = decode_leaf(&bytes, self.key_size, self.value_size)?;
-          if let Ok(i) = node.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+          if let Ok(i) = node
+            .entries
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+          {
             node.entries.remove(i);
             self.write_leaf(page_id, &node)?;
           }
@@ -1035,7 +1038,7 @@ mod tests {
         tree.insert(&key, &key).unwrap();
         model.insert(key.to_vec(), key.to_vec());
       } else {
-        let expected = model.remove(&key.to_vec()).is_some();
+        let expected = model.remove(key.as_slice()).is_some();
         assert_eq!(tree.remove(&key).unwrap(), expected);
       }
     }

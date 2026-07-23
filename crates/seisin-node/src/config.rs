@@ -20,6 +20,9 @@ pub struct MemberConfig {
 pub struct NodeConfig {
   pub self_node_id: u64,
   pub members: Vec<MemberConfig>,
+  /// Where this node's own index/data files live (rk B+Tree files
+  /// today). Node-local only — not Storage Tier placement.
+  pub data_dir: String,
 }
 
 impl NodeConfig {
@@ -60,8 +63,15 @@ mod tests {
         (node_id: 1, address: "127.0.0.1:7878", gossip_address: "127.0.0.1:8878", peer_link_address: "127.0.0.1:9878", thread_count: 2),
         (node_id: 2, address: "127.0.0.1:7879", gossip_address: "127.0.0.1:8879", peer_link_address: "127.0.0.1:9879", thread_count: 4),
     ],
+    data_dir: "/tmp/seisin-data",
 )
 "#;
+
+  #[test]
+  fn parses_the_data_dir() {
+    let config = NodeConfig::parse(SAMPLE).unwrap();
+    assert_eq!(config.data_dir, "/tmp/seisin-data");
+  }
 
   #[test]
   fn parses_a_well_formed_config() {

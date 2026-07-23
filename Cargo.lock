@@ -257,6 +257,8 @@ dependencies = [
  "seisin-ops",
  "seisin-protocol",
  "seisin-ring",
+ "seisin-storage",
+ "tempfile",
 ]
 
 [[package]]

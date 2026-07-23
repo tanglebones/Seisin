@@ -98,9 +98,12 @@ fn main() -> Result<()> {
   println!("seisin-node {self_node_id:?} peer-link listener on {self_peer_link_address}");
 
   let store = Arc::new(InMemoryStore::new());
-  // No solution has been wired up yet — an empty registry until a real
-  // solution built on this framework needs one populated with actual
-  // operations.
+  // No solution has been wired up yet — empty op and index-kind
+  // registries until a real solution built on this framework registers
+  // its ops and index kinds (e.g. seisin_types::rk_kind::
+  // register_rk_index_kind with config.data_dir) in its own binary;
+  // this bare framework binary can't do it itself without a
+  // seisin-node <-> seisin-types dependency cycle.
   let pool = Arc::new(WorkerPool::spawn(
     store,
     self_thread_count,
