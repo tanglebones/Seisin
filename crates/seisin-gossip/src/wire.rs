@@ -134,6 +134,14 @@ fn decode_string(buf: &[u8], offset: &mut usize) -> Result<String> {
   Ok(s)
 }
 
+/// The gossip wire protocol version, carried as the first byte of
+/// every encoded `GossipMessage` — same n/n+1 rolling-deployment
+/// policy as `seisin_protocol::PROTOCOL_VERSION`: when bumping to n+1,
+/// keep the version-n decoder alive for one release so mixed-version
+/// clusters mid-rollout still gossip. Versioned independently of the
+/// main protocol since the two evolve independently.
+pub const GOSSIP_PROTOCOL_VERSION: u8 = 1;
+
 const MSG_PING: u8 = 0;
 const MSG_PING_REQ: u8 = 1;
 const MSG_ACK: u8 = 2;
@@ -191,7 +199,7 @@ fn decode_list<T>(
 }
 
 pub fn encode_gossip_message(msg: &GossipMessage) -> Vec<u8> {
-  let mut buf = Vec::new();
+  let mut buf = vec![GOSSIP_PROTOCOL_VERSION];
   match msg {
     GossipMessage::Ping { updates, mutations } => {
       buf.push(MSG_PING);
@@ -224,6 +232,15 @@ pub fn encode_gossip_message(msg: &GossipMessage) -> Vec<u8> {
 }
 
 pub fn decode_gossip_message(buf: &[u8]) -> Result<GossipMessage> {
+  // Check and strip the leading version byte — the single place a
+  // future n/n-1 dual-decode dispatch would live.
+  let buf = match buf.first() {
+    None => bail!("empty gossip message payload"),
+    Some(&v) if v == GOSSIP_PROTOCOL_VERSION => &buf[1..],
+    Some(&v) => bail!(
+      "unsupported gossip protocol version {v}; this node speaks version {GOSSIP_PROTOCOL_VERSION}"
+    ),
+  };
   if buf.is_empty() {
     bail!("empty gossip message payload");
   }
@@ -400,7 +417,27 @@ mod tests {
       updates: vec![],
       mutations: vec![],
     });
-    buf[0] = 99;
+    buf[1] = 99; // buf[0] is the version byte; the tag follows it
     assert!(decode_gossip_message(&buf).is_err());
+  }
+
+  #[test]
+  fn every_encoded_gossip_message_starts_with_the_protocol_version() {
+    let buf = encode_gossip_message(&GossipMessage::Ping {
+      updates: vec![],
+      mutations: vec![],
+    });
+    assert_eq!(buf[0], GOSSIP_PROTOCOL_VERSION);
+  }
+
+  #[test]
+  fn decode_rejects_an_unsupported_gossip_protocol_version() {
+    let mut buf = encode_gossip_message(&GossipMessage::Ping {
+      updates: vec![],
+      mutations: vec![],
+    });
+    buf[0] = GOSSIP_PROTOCOL_VERSION + 1;
+    let err = decode_gossip_message(&buf).unwrap_err();
+    assert!(err.to_string().contains("gossip protocol version"), "{err}");
   }
 }

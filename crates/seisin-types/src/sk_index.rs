@@ -1,14 +1,13 @@
 //! sk (secondary-key) index maintenance: deriving a stable datum_id for
-//! a `(type, field, value)` key, and the `"sk"` `IndexHandler` that
-//! keeps that key's entry list in sync with writes. See the design
-//! doc's "sk Index" section and "Automatic Index Maintenance & Op
-//! Lifecycle".
+//! a `(type, field, value)` key, and the `"sk"` index kind that keeps
+//! that key's entry list in sync with writes. See the design doc's "sk
+//! Index" section and "Automatic Index Maintenance & Op Lifecycle".
 
 use anyhow::{bail, Context, Result};
 use seisin_core::authority::AuthorityIdx;
 use seisin_core::datum::DatumId;
 use seisin_core::sk::{decode_sk_entries, encode_sk_entries};
-use seisin_node::index_handler::IndexHandlerRegistry;
+use seisin_node::index_handler::{IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex};
 
 use crate::field::FieldValue;
 
@@ -48,7 +47,7 @@ pub fn sk_key(type_name: &str, field_name: &str, value: &FieldValue) -> Result<D
 }
 
 /// One update to apply to an sk index's entry list — the payload
-/// `IndexHandlerRegistry` dispatches for the `"sk"` kind.
+/// `IndexKindRegistry` dispatches for the `"sk"` kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkIndexOp {
   Insert {
@@ -130,49 +129,77 @@ pub fn decode_sk_index_op(buf: &[u8]) -> Result<SkIndexOp> {
   }
 }
 
-/// The `IndexHandler` for the `"sk"` kind — applies one `SkIndexOp`
-/// against `current`'s decoded entry list (empty if `None`, a cold sk
-/// key with nothing resident/stored yet).
-pub fn apply_sk_index_update(current: Option<&[u8]>, payload: &[u8]) -> (Vec<u8>, Option<String>) {
-  let mut entries = match current {
-    Some(bytes) => decode_sk_entries(bytes).unwrap_or_default(),
-    None => Vec::new(),
-  };
-  let op = match decode_sk_index_op(payload) {
-    Ok(op) => op,
-    Err(e) => {
-      return (
-        encode_sk_entries(&entries),
-        Some(format!("malformed sk index payload: {e}")),
-      )
-    }
-  };
-  match op {
-    SkIndexOp::Remove { pk_id } => {
-      entries.retain(|(id, _)| *id != pk_id);
-      (encode_sk_entries(&entries), None)
-    }
-    SkIndexOp::Insert {
-      pk_id,
-      unique_conflict_op,
-    } => {
-      if let Some(conflict_op) = &unique_conflict_op {
-        if entries.iter().any(|(id, _)| *id != pk_id) {
-          return (encode_sk_entries(&entries), Some(conflict_op.clone()));
+/// The `"sk"` kind's resident structure: one key's decoded entry list,
+/// kept live on the owning thread — decoded once on cold miss, mutated
+/// in place per update, re-encoded only for the write-through.
+pub struct SkResidentIndex {
+  entries: Vec<(DatumId, AuthorityIdx)>,
+}
+
+impl ResidentIndex for SkResidentIndex {
+  fn apply(&mut self, payload: &[u8]) -> IndexApplyOutcome {
+    let op = match decode_sk_index_op(payload) {
+      Ok(op) => op,
+      Err(e) => {
+        return IndexApplyOutcome {
+          violation: Some(format!("malformed sk index payload: {e}")),
+          write_through: None,
         }
       }
-      if !entries.iter().any(|(id, _)| *id == pk_id) {
-        entries.push((pk_id, AuthorityIdx::Native));
+    };
+    match op {
+      SkIndexOp::Remove { pk_id } => {
+        self.entries.retain(|(id, _)| *id != pk_id);
       }
-      (encode_sk_entries(&entries), None)
+      SkIndexOp::Insert {
+        pk_id,
+        unique_conflict_op,
+      } => {
+        if let Some(conflict_op) = &unique_conflict_op {
+          if self.entries.iter().any(|(id, _)| *id != pk_id) {
+            return IndexApplyOutcome {
+              violation: Some(conflict_op.clone()),
+              write_through: None,
+            };
+          }
+        }
+        if !self.entries.iter().any(|(id, _)| *id == pk_id) {
+          self.entries.push((pk_id, AuthorityIdx::Native));
+        }
+      }
+    }
+    IndexApplyOutcome {
+      violation: None,
+      write_through: Some(encode_sk_entries(&self.entries)),
     }
   }
 }
 
-/// Registers the `"sk"` kind's `IndexHandler` — call once at startup,
-/// alongside registering a solution's ops.
-pub fn register_sk_index_handler(registry: &mut IndexHandlerRegistry) {
-  registry.register("sk", Box::new(apply_sk_index_update));
+/// The `"sk"` `IndexKind`: blob-persisted, so `open` decodes whatever
+/// is currently stored. Stored bytes that fail to decode are an error,
+/// not an empty index — silently starting fresh would drop every
+/// existing entry for that key on the next write-through.
+pub struct SkIndexKind;
+
+impl IndexKind for SkIndexKind {
+  fn open(
+    &self,
+    target: DatumId,
+    stored: Option<Vec<u8>>,
+  ) -> std::result::Result<Box<dyn ResidentIndex>, String> {
+    let entries = match stored {
+      Some(bytes) => decode_sk_entries(&bytes)
+        .map_err(|e| format!("stored sk entries for {target:?} failed to decode: {e}"))?,
+      None => Vec::new(),
+    };
+    Ok(Box::new(SkResidentIndex { entries }))
+  }
+}
+
+/// Registers the `"sk"` index kind — call once at startup, alongside
+/// registering a solution's ops.
+pub fn register_sk_index_kind(registry: &mut IndexKindRegistry) {
+  registry.register("sk", Box::new(SkIndexKind));
 }
 
 #[cfg(test)]
@@ -252,6 +279,12 @@ mod tests {
     assert_eq!(decode_sk_index_op(&encode_sk_index_op(&op)).unwrap(), op);
   }
 
+  /// Cold-opens the "sk" kind over `stored`, mirroring what the owning
+  /// thread's worker does on a cold miss.
+  fn open_sk(stored: Option<Vec<u8>>) -> Box<dyn ResidentIndex> {
+    SkIndexKind.open(DatumId::new(), stored).unwrap()
+  }
+
   #[test]
   fn apply_insert_on_a_cold_target_creates_a_single_entry_list() {
     let pk_id = DatumId::new();
@@ -259,9 +292,10 @@ mod tests {
       pk_id,
       unique_conflict_op: None,
     });
-    let (new_bytes, violation) = apply_sk_index_update(None, &payload);
-    assert!(violation.is_none());
-    let entries = seisin_core::sk::decode_sk_entries(&new_bytes).unwrap();
+    let mut resident = open_sk(None);
+    let outcome = resident.apply(&payload);
+    assert!(outcome.violation.is_none());
+    let entries = seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, pk_id);
   }
@@ -269,16 +303,15 @@ mod tests {
   #[test]
   fn apply_remove_on_an_existing_entry_removes_it() {
     let pk_id = DatumId::new();
-    let insert_payload = encode_sk_index_op(&SkIndexOp::Insert {
+    let mut resident = open_sk(None);
+    resident.apply(&encode_sk_index_op(&SkIndexOp::Insert {
       pk_id,
       unique_conflict_op: None,
-    });
-    let (after_insert, _) = apply_sk_index_update(None, &insert_payload);
-    let remove_payload = encode_sk_index_op(&SkIndexOp::Remove { pk_id });
-    let (after_remove, violation) = apply_sk_index_update(Some(&after_insert), &remove_payload);
-    assert!(violation.is_none());
+    }));
+    let outcome = resident.apply(&encode_sk_index_op(&SkIndexOp::Remove { pk_id }));
+    assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&after_remove).unwrap(),
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap(),
       vec![]
     );
   }
@@ -290,49 +323,49 @@ mod tests {
       pk_id,
       unique_conflict_op: Some("resolve".to_string()),
     });
-    let (first, _) = apply_sk_index_update(None, &payload);
-    let (second, violation) = apply_sk_index_update(Some(&first), &payload);
-    assert!(violation.is_none());
+    let mut resident = open_sk(None);
+    resident.apply(&payload);
+    let outcome = resident.apply(&payload);
+    assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&second).unwrap().len(),
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap())
+        .unwrap()
+        .len(),
       1
     );
   }
 
   #[test]
   fn apply_insert_of_a_different_pk_id_when_unique_reports_a_violation() {
-    let first_pk = DatumId::new();
-    let second_pk = DatumId::new();
-    let first_payload = encode_sk_index_op(&SkIndexOp::Insert {
-      pk_id: first_pk,
+    let mut resident = open_sk(None);
+    resident.apply(&encode_sk_index_op(&SkIndexOp::Insert {
+      pk_id: DatumId::new(),
       unique_conflict_op: Some("resolve".to_string()),
-    });
-    let (after_first, _) = apply_sk_index_update(None, &first_payload);
-    let second_payload = encode_sk_index_op(&SkIndexOp::Insert {
-      pk_id: second_pk,
+    }));
+    let outcome = resident.apply(&encode_sk_index_op(&SkIndexOp::Insert {
+      pk_id: DatumId::new(),
       unique_conflict_op: Some("resolve".to_string()),
-    });
-    let (_, violation) = apply_sk_index_update(Some(&after_first), &second_payload);
-    assert_eq!(violation, Some("resolve".to_string()));
+    }));
+    assert_eq!(outcome.violation, Some("resolve".to_string()));
+    // A rejected update writes nothing through — resident/stored state
+    // must be left untouched.
+    assert!(outcome.write_through.is_none());
   }
 
   #[test]
   fn apply_insert_of_a_different_pk_id_without_unique_is_not_a_violation() {
-    let first_pk = DatumId::new();
-    let second_pk = DatumId::new();
-    let first_payload = encode_sk_index_op(&SkIndexOp::Insert {
-      pk_id: first_pk,
+    let mut resident = open_sk(None);
+    resident.apply(&encode_sk_index_op(&SkIndexOp::Insert {
+      pk_id: DatumId::new(),
       unique_conflict_op: None,
-    });
-    let (after_first, _) = apply_sk_index_update(None, &first_payload);
-    let second_payload = encode_sk_index_op(&SkIndexOp::Insert {
-      pk_id: second_pk,
+    }));
+    let outcome = resident.apply(&encode_sk_index_op(&SkIndexOp::Insert {
+      pk_id: DatumId::new(),
       unique_conflict_op: None,
-    });
-    let (after_second, violation) = apply_sk_index_update(Some(&after_first), &second_payload);
-    assert!(violation.is_none());
+    }));
+    assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&after_second)
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap())
         .unwrap()
         .len(),
       2
@@ -340,18 +373,42 @@ mod tests {
   }
 
   #[test]
-  fn register_sk_index_handler_wires_the_kind_name_correctly() {
-    let mut registry = IndexHandlerRegistry::new();
-    register_sk_index_handler(&mut registry);
+  fn open_seeds_the_resident_entries_from_stored_bytes() {
+    let pk_id = DatumId::new();
+    let stored = encode_sk_entries(&[(pk_id, AuthorityIdx::Native)]);
+    let mut resident = open_sk(Some(stored));
+    let outcome = resident.apply(&encode_sk_index_op(&SkIndexOp::Remove { pk_id }));
+    assert_eq!(
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap(),
+      vec![]
+    );
+  }
+
+  #[test]
+  fn open_on_undecodable_stored_bytes_is_an_error_not_an_empty_index() {
+    assert!(SkIndexKind
+      .open(DatumId::new(), Some(vec![0xFF, 0xFF, 0xFF]))
+      .is_err());
+  }
+
+  #[test]
+  fn register_sk_index_kind_wires_the_kind_name_correctly() {
+    let mut registry = IndexKindRegistry::new();
+    register_sk_index_kind(&mut registry);
     let pk_id = DatumId::new();
     let payload = encode_sk_index_op(&SkIndexOp::Insert {
       pk_id,
       unique_conflict_op: None,
     });
-    let (new_bytes, violation) = registry.apply("sk", None, &payload).unwrap();
-    assert!(violation.is_none());
+    let mut resident = registry
+      .get("sk")
+      .unwrap()
+      .open(DatumId::new(), None)
+      .unwrap();
+    let outcome = resident.apply(&payload);
+    assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&new_bytes).unwrap()[0].0,
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap()[0].0,
       pk_id
     );
   }

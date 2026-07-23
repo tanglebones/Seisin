@@ -81,6 +81,28 @@ pub enum Response {
   },
 }
 
+/// The wire protocol version, carried as the first byte of every
+/// encoded `Request`/`Response` (and therefore inside every peer-link
+/// envelope body too). Deployment policy is strict n -> n+1 rolling
+/// updates with no version skipping, so when this is bumped to n+1 the
+/// decoder for version n must be kept alive for one release — during a
+/// rollout, version-n and version-n+1 nodes and clients coexist and
+/// must decode each other's frames. Only one version exists so far, so
+/// today's decoders accept exactly `PROTOCOL_VERSION`.
+pub const PROTOCOL_VERSION: u8 = 1;
+
+/// Checks and strips the leading version byte. Kept as the single
+/// place a future n/n-1 dual-decode dispatch would live.
+fn check_version<'a>(buf: &'a [u8], what: &str) -> Result<&'a [u8]> {
+  match buf.first() {
+    None => bail!("empty {what} payload"),
+    Some(&v) if v == PROTOCOL_VERSION => Ok(&buf[1..]),
+    Some(&v) => {
+      bail!("unsupported {what} protocol version {v}; this node speaks version {PROTOCOL_VERSION}")
+    }
+  }
+}
+
 const OP_OP: u8 = 1;
 const OP_ACQUIRE: u8 = 2;
 const OP_RECALL: u8 = 3;
@@ -97,7 +119,7 @@ const RESP_INDEX_UPDATE_RESULT: u8 = 6;
 const ID_LEN: usize = 16;
 
 pub fn encode_request(req: &Request) -> Vec<u8> {
-  let mut buf = Vec::new();
+  let mut buf = vec![PROTOCOL_VERSION];
   match req {
     Request::Op {
       op_id,
@@ -155,6 +177,7 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
 }
 
 pub fn decode_request(buf: &[u8]) -> Result<Request> {
+  let buf = check_version(buf, "request")?;
   if buf.is_empty() {
     bail!("empty request payload");
   }
@@ -289,7 +312,7 @@ fn decode_op_request(buf: &[u8]) -> Result<Request> {
 }
 
 pub fn encode_response(resp: &Response) -> Vec<u8> {
-  let mut buf = Vec::new();
+  let mut buf = vec![PROTOCOL_VERSION];
   match resp {
     Response::Redirect { address } => {
       buf.push(RESP_REDIRECT);
@@ -322,6 +345,7 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
 }
 
 pub fn decode_response(buf: &[u8]) -> Result<Response> {
+  let buf = check_version(buf, "response")?;
   if buf.is_empty() {
     bail!("empty response payload");
   }
@@ -473,6 +497,29 @@ mod tests {
   use std::io::Cursor;
 
   #[test]
+  fn every_encoded_frame_starts_with_the_protocol_version() {
+    let req = Request::Recall {
+      datum_id: DatumId::new(),
+    };
+    assert_eq!(encode_request(&req)[0], PROTOCOL_VERSION);
+    assert_eq!(encode_response(&Response::Granted)[0], PROTOCOL_VERSION);
+  }
+
+  #[test]
+  fn decode_rejects_an_unsupported_protocol_version() {
+    let mut buf = encode_request(&Request::Recall {
+      datum_id: DatumId::new(),
+    });
+    buf[0] = PROTOCOL_VERSION + 1;
+    let err = decode_request(&buf).unwrap_err();
+    assert!(err.to_string().contains("protocol version"), "{err}");
+
+    let mut buf = encode_response(&Response::Granted);
+    buf[0] = PROTOCOL_VERSION + 1;
+    assert!(decode_response(&buf).is_err());
+  }
+
+  #[test]
   fn round_trips_op_request_with_no_datum_ids() {
     let req = Request::Op {
       op_id: DatumId::new(),
@@ -502,7 +549,7 @@ mod tests {
       datum_ids: vec![],
       payload: vec![],
     });
-    buf[0] = 99;
+    buf[1] = 99; // buf[0] is the version byte; the opcode follows it
     assert!(decode_request(&buf).is_err());
   }
 

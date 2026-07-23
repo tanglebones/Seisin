@@ -294,7 +294,62 @@ commit and push immediately, since work sessions may end abruptly.
   storage-engine decision later against the same research, not assumed to
   need this same engine.
 
-As of this entry: 10 crates, 261 tests passing, `cargo fmt --check` and
+- **Index-architecture review follow-ups (pre-Part 3).** Four changes
+  from a direction review of the index abstraction, done before rk is
+  built:
+  1. **`ResidentIndex`/`IndexKind` traits replace the bytes-based
+     `IndexHandlerRegistry`.** The old
+     `Fn(Option<&[u8]>, &[u8]) -> (Vec<u8>, Option<String>)` contract
+     fit sk but couldn't hold rk's live B+Tree file handle; the rk
+     design doc's earlier answer (delete the registry, hardcode a
+     per-kind string match in `worker.rs`, move sk logic into
+     `seisin-node`) is superseded — the registry layering was right,
+     only the handler contract was wrong. `IndexKindRegistry` now holds
+     `IndexKind` trait objects whose `open` builds a per-thread
+     resident `Box<dyn ResidentIndex>` on cold miss (one
+     `HashMap<DatumId, Box<dyn ResidentIndex>>` in `worker.rs`, no
+     parallel per-kind caches); `apply` returns
+     `{violation, write_through: Option<Vec<u8>>}` so blob-persisted
+     kinds (sk) write through while self-persisted kinds (rk's file)
+     return `None`. sk's impl (`SkIndexKind`/`SkResidentIndex`) stays in
+     `seisin-types` — it already depends on `seisin-node`, so the
+     "logic must move into seisin-node" premise was wrong. Bonus fixes:
+     sk entries now decode once per residency instead of per update,
+     and undecodable stored sk bytes are an `open` error instead of
+     silently becoming an empty index.
+  2. **`TypedOpContext` silent failures fixed.** `set` swallowed encode
+     errors while still updating its diff state (indexes scheduled for
+     a write that never staged); `get`/`ensure_tracked` mapped
+     undecodable existing bytes to `None` (corrupt data
+     indistinguishable from absent — an op could overwrite real data
+     and strand stale sk entries). `get`/`set`/`delete` now return
+     `Result` and fail loudly before any divergence.
+  3. **Version prefixes everywhere bytes cross a boundary.** Every
+     encoded `Request`/`Response` (`PROTOCOL_VERSION`) and
+     `GossipMessage` (`GOSSIP_PROTOCOL_VERSION`) starts with a version
+     byte; every encoded datum starts with a `u16`
+     `DatumTypeDef.version`. Policy documented at each constant: strict
+     n → n+1 rolling deployments mean the version-n decoder is kept for
+     one release after bumping; datum decoding across schema versions
+     needs a version history (deployment sub-project's job) — until
+     then a mismatch is a hard, explicit error, never silent
+     misinterpretation. The tagless datum encoding made this
+     load-bearing: without the prefix, add-a-field evolution could
+     never decode pre-existing bytes at all.
+  4. **Index taxonomy corrected in the design doc.** pk is identity
+     (but still needs a real id→location structure — Storage Tier's
+     job); sk/rk are derived+rebuildable (which is what licenses
+     `seisin-storage`'s no-WAL/`rebuild_from` stance); **tk is
+     decomposed field storage, not an index** — its values exist
+     nowhere else, so rebuildability-based durability relaxations
+     never apply to it, and its residency model is lazily-loaded
+     range segments (range queries over long histories), not
+     whole-history-resident. The rk design doc's framework section was
+     rewritten around the trait pair (including a `query` method on
+     `ResidentIndex` for the read path, and `RkIndexKind` carrying
+     `data_dir` from registration so spawn signatures don't change).
+
+As of this entry: 10 crates, 272 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 

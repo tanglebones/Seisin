@@ -38,7 +38,7 @@ impl WorkerPool {
     self_node_id: NodeId,
     peer_link_listener: TcpListener,
     peer_link_address_book: Arc<HashMap<NodeId, String>>,
-    index_handlers: Arc<crate::index_handler::IndexHandlerRegistry>,
+    index_kinds: Arc<crate::index_handler::IndexKindRegistry>,
   ) -> Self {
     let mut senders = Vec::with_capacity(thread_count as usize);
     let mut receivers = Vec::with_capacity(thread_count as usize);
@@ -115,7 +115,7 @@ impl WorkerPool {
           Arc::clone(&ring),
           self_node_id,
           Arc::clone(&peer_links),
-          Arc::clone(&index_handlers),
+          Arc::clone(&index_kinds),
         )
       })
       .collect();
@@ -195,7 +195,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
-      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
+      Arc::new(crate::index_handler::IndexKindRegistry::new()),
     )
   }
 
@@ -219,7 +219,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
-      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
+      Arc::new(crate::index_handler::IndexKindRegistry::new()),
     );
     let id = DatumId::new();
     let result = pool.run_op(
@@ -263,7 +263,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
-      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
+      Arc::new(crate::index_handler::IndexKindRegistry::new()),
     );
     let id = DatumId::new();
     pool
@@ -306,7 +306,7 @@ mod tests {
       NodeId(1),
       listener,
       address_book,
-      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
+      Arc::new(crate::index_handler::IndexKindRegistry::new()),
     );
 
     let id = DatumId::new();

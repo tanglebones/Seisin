@@ -219,14 +219,15 @@ impl WorkerHandle {
     ring: Arc<RwLock<Ring>>,
     self_node_id: NodeId,
     peer_links: Arc<StdMutex<PeerLinkRegistry>>,
-    index_handlers: Arc<crate::index_handler::IndexHandlerRegistry>,
+    index_kinds: Arc<crate::index_handler::IndexKindRegistry>,
   ) -> Self {
     let join_sender = sender.clone();
     let join = thread::spawn(move || {
       let mut cache = Cache::new(store);
       let mut native_locks: HashMap<DatumId, NativeLock> = HashMap::new();
       let mut op_records: HashMap<DatumId, OpRecord> = HashMap::new();
-      let mut index_cache: HashMap<DatumId, Vec<u8>> = HashMap::new();
+      let mut resident_indexes: HashMap<DatumId, Box<dyn crate::index_handler::ResidentIndex>> =
+        HashMap::new();
 
       for message in receiver {
         match message {
@@ -454,22 +455,31 @@ impl WorkerHandle {
             payload,
             reply,
           } => {
-            let current = match index_cache.get(&target) {
-              Some(bytes) => Some(bytes.clone()),
-              None => cache.get(target),
-            };
-            match index_handlers.apply(&index_kind, current.as_deref(), &payload) {
-              Ok((new_bytes, violation)) => {
-                if violation.is_none() {
-                  index_cache.insert(target, new_bytes.clone());
-                  cache.put(target, new_bytes);
+            // Cold miss: build the resident structure once via the
+            // kind's `open`; every later update on this thread mutates
+            // it in place, never rebuilding from bytes.
+            let resident = match resident_indexes.entry(target) {
+              std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+              std::collections::hash_map::Entry::Vacant(vacancy) => {
+                let opened = index_kinds
+                  .get(&index_kind)
+                  .and_then(|kind| kind.open(target, cache.get(target)));
+                match opened {
+                  Ok(resident) => vacancy.insert(resident),
+                  Err(message) => {
+                    reply.respond(op_id, target, Some(message));
+                    continue;
+                  }
                 }
-                reply.respond(op_id, target, violation);
               }
-              Err(message) => {
-                reply.respond(op_id, target, Some(message));
+            };
+            let outcome = resident.apply(&payload);
+            if outcome.violation.is_none() {
+              if let Some(bytes) = outcome.write_through {
+                cache.put(target, bytes);
               }
             }
+            reply.respond(op_id, target, outcome.violation);
           }
           WorkerMessage::IndexUpdateReplied {
             op_id,
@@ -867,24 +877,24 @@ mod tests {
     ring: Arc<RwLock<Ring>>,
     ops: OpRegistry,
   ) -> Vec<WorkerHandle> {
-    spawn_test_pool_with_index_handlers(
+    spawn_test_pool_with_index_kinds(
       thread_count,
       ring,
       ops,
-      crate::index_handler::IndexHandlerRegistry::new(),
+      crate::index_handler::IndexKindRegistry::new(),
     )
   }
 
-  fn spawn_test_pool_with_index_handlers(
+  fn spawn_test_pool_with_index_kinds(
     thread_count: u32,
     ring: Arc<RwLock<Ring>>,
     ops: OpRegistry,
-    index_handlers: crate::index_handler::IndexHandlerRegistry,
+    index_kinds: crate::index_handler::IndexKindRegistry,
   ) -> Vec<WorkerHandle> {
     let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
     let ops = Arc::new(ops);
     let peer_links = empty_peer_links();
-    let index_handlers = Arc::new(index_handlers);
+    let index_kinds = Arc::new(index_kinds);
     let mut senders = Vec::with_capacity(thread_count as usize);
     let mut receivers = Vec::with_capacity(thread_count as usize);
     for _ in 0..thread_count {
@@ -907,10 +917,41 @@ mod tests {
           Arc::clone(&ring),
           NodeId(1),
           Arc::clone(&peer_links),
-          Arc::clone(&index_handlers),
+          Arc::clone(&index_kinds),
         )
       })
       .collect()
+  }
+
+  /// A minimal test `IndexKind`: applies always succeed (or always
+  /// report `violation` when one is given), with no resident state
+  /// beyond that fixed answer.
+  struct FixedOutcomeKind {
+    violation: Option<String>,
+  }
+  struct FixedOutcomeResident {
+    violation: Option<String>,
+  }
+
+  impl crate::index_handler::ResidentIndex for FixedOutcomeResident {
+    fn apply(&mut self, payload: &[u8]) -> crate::index_handler::IndexApplyOutcome {
+      crate::index_handler::IndexApplyOutcome {
+        violation: self.violation.clone(),
+        write_through: Some(payload.to_vec()),
+      }
+    }
+  }
+
+  impl crate::index_handler::IndexKind for FixedOutcomeKind {
+    fn open(
+      &self,
+      _target: DatumId,
+      _stored: Option<Vec<u8>>,
+    ) -> Result<Box<dyn crate::index_handler::ResidentIndex>, String> {
+      Ok(Box::new(FixedOutcomeResident {
+        violation: self.violation.clone(),
+      }))
+    }
   }
 
   fn register_echo_ops(ops: &mut OpRegistry) {
@@ -1072,12 +1113,9 @@ mod tests {
         vec![]
       }),
     );
-    let mut index_handlers = crate::index_handler::IndexHandlerRegistry::new();
-    index_handlers.register(
-      "always_ok",
-      Box::new(|_current, payload| (payload.to_vec(), None)),
-    );
-    let handles = spawn_test_pool_with_index_handlers(1, ring, ops, index_handlers);
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register("always_ok", Box::new(FixedOutcomeKind { violation: None }));
+    let handles = spawn_test_pool_with_index_kinds(1, ring, ops, index_kinds);
     let id = DatumId::new();
     let result = handles[0].run_op(
       DatumId::new(),
@@ -1101,12 +1139,14 @@ mod tests {
         vec![]
       }),
     );
-    let mut index_handlers = crate::index_handler::IndexHandlerRegistry::new();
-    index_handlers.register(
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register(
       "always_reject",
-      Box::new(|_current, payload| (payload.to_vec(), Some("rejected".to_string()))),
+      Box::new(FixedOutcomeKind {
+        violation: Some("rejected".to_string()),
+      }),
     );
-    let handles = spawn_test_pool_with_index_handlers(1, ring, ops, index_handlers);
+    let handles = spawn_test_pool_with_index_kinds(1, ring, ops, index_kinds);
     let id = DatumId::new();
     let result = handles[0].run_op(
       DatumId::new(),

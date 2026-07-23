@@ -38,7 +38,7 @@ fn start_single_node_server(thread_count: u32) -> (String, Arc<RwLock<Ring>>, No
     node_id,
     peer_link_listener,
     Arc::new(HashMap::new()),
-    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
+    Arc::new(seisin_node::index_handler::IndexKindRegistry::new()),
   ));
   let serve_ring = Arc::clone(&ring);
   thread::spawn(move || serve(listener, node_id, serve_ring, address_book, pool));

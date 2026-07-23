@@ -57,7 +57,7 @@ fn start_single_node_server() -> String {
     node_id,
     peer_link_listener,
     Arc::new(HashMap::new()),
-    Arc::new(seisin_node::index_handler::IndexHandlerRegistry::new()),
+    Arc::new(seisin_node::index_handler::IndexKindRegistry::new()),
   ));
 
   thread::spawn(move || serve(listener, node_id, ring, address_book, pool));

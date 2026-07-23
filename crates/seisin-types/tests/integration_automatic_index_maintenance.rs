@@ -5,7 +5,7 @@ use std::thread;
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
 use seisin_core::store::InMemoryStore;
-use seisin_node::index_handler::IndexHandlerRegistry;
+use seisin_node::index_handler::IndexKindRegistry;
 use seisin_node::pool::WorkerPool;
 use seisin_node::server::serve;
 use seisin_ops::context::OpContext;
@@ -14,7 +14,7 @@ use seisin_protocol::{Request, Response};
 use seisin_ring::ring::Ring;
 use seisin_types::field::{FieldType, FieldValue};
 use seisin_types::schema::{ConflictOp, DatumTypeDef, IndexDef};
-use seisin_types::sk_index::register_sk_index_handler;
+use seisin_types::sk_index::register_sk_index_kind;
 use seisin_types::typed_context::TypedOpContext;
 use seisin_types::{decode_datum, encode_datum};
 
@@ -36,14 +36,14 @@ fn start_node() -> String {
     Box::new(move |ctx: &mut OpContext, ids, payload| {
       let values = decode_datum(&write_def, payload).unwrap();
       let mut tctx = TypedOpContext::new(ctx);
-      tctx.get(ids[0], &write_def);
-      tctx.set(ids[0], &write_def, values);
+      tctx.get(ids[0], &write_def).unwrap();
+      tctx.set(ids[0], &write_def, values).unwrap();
       vec![]
     }),
   );
 
-  let mut index_handlers = IndexHandlerRegistry::new();
-  register_sk_index_handler(&mut index_handlers);
+  let mut index_kinds = IndexKindRegistry::new();
+  register_sk_index_kind(&mut index_kinds);
 
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let addr = listener.local_addr().unwrap().to_string();
@@ -58,7 +58,7 @@ fn start_node() -> String {
     node_id,
     peer_link_listener,
     Arc::new(std::collections::HashMap::new()),
-    Arc::new(index_handlers),
+    Arc::new(index_kinds),
   ));
   let address_book = Arc::new(std::collections::HashMap::new());
   thread::spawn(move || serve(listener, node_id, ring, address_book, pool));

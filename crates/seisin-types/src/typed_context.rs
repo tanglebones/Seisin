@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::{Context, Result};
 use seisin_core::datum::DatumId;
 use seisin_ops::context::OpContext;
 
@@ -36,53 +37,65 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
 
   /// Reads `pk_id`'s current typed value, decoding via `def`. Remembers
   /// it as the "before" snapshot for diffing on drop, if `pk_id` hasn't
-  /// been tracked yet this op.
-  pub fn get(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Option<Vec<FieldValue>> {
-    let values = self
-      .ctx
-      .get(pk_id)
-      .and_then(|bytes| decode_datum(def, &bytes).ok());
+  /// been tracked yet this op. Existing bytes that fail to decode are an
+  /// error, not `None` — treating corrupt/mismatched content as absent
+  /// would let an op silently overwrite real data and compute index
+  /// diffs from a false "before" state, stranding stale index entries.
+  pub fn get(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Result<Option<Vec<FieldValue>>> {
+    let values = match self.ctx.get(pk_id) {
+      Some(bytes) => Some(
+        decode_datum(def, &bytes)
+          .with_context(|| format!("existing content for datum {pk_id:?} failed to decode"))?,
+      ),
+      None => None,
+    };
     self.tracked.entry(pk_id).or_insert_with(|| TrackedDatum {
       def: def.clone(),
       before: values.clone(),
       after: values.clone(),
       touched: false,
     });
-    values
+    Ok(values)
   }
 
   /// Writes `pk_id`'s new typed value. The byte write is staged
   /// immediately via the underlying `OpContext`; index maintenance is
-  /// computed automatically on drop.
-  pub fn set(&mut self, pk_id: DatumId, def: &DatumTypeDef, values: Vec<FieldValue>) {
-    self.ensure_tracked(pk_id, def);
-    if let Ok(bytes) = encode_datum(def, &values) {
-      self.ctx.put(pk_id, bytes);
-    }
+  /// computed automatically on drop. An encode failure (type mismatch,
+  /// wrong field count) fails the call before anything is staged or
+  /// tracked — the datum and its indexes never diverge.
+  pub fn set(&mut self, pk_id: DatumId, def: &DatumTypeDef, values: Vec<FieldValue>) -> Result<()> {
+    let bytes = encode_datum(def, &values)?;
+    self.ensure_tracked(pk_id, def)?;
+    self.ctx.put(pk_id, bytes);
     let entry = self.tracked.get_mut(&pk_id).unwrap();
     entry.after = Some(values);
     entry.touched = true;
+    Ok(())
   }
 
   /// Deletes `pk_id`. Same tracking/diffing as `set`, but with an
   /// `after` of `None` — every declared sk index gets a remove
   /// scheduled for whatever the "before" value was.
-  pub fn delete(&mut self, pk_id: DatumId, def: &DatumTypeDef) {
-    self.ensure_tracked(pk_id, def);
+  pub fn delete(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Result<()> {
+    self.ensure_tracked(pk_id, def)?;
     self.ctx.delete(pk_id);
     let entry = self.tracked.get_mut(&pk_id).unwrap();
     entry.after = None;
     entry.touched = true;
+    Ok(())
   }
 
-  fn ensure_tracked(&mut self, pk_id: DatumId, def: &DatumTypeDef) {
+  fn ensure_tracked(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Result<()> {
     if self.tracked.contains_key(&pk_id) {
-      return;
+      return Ok(());
     }
-    let before = self
-      .ctx
-      .get(pk_id)
-      .and_then(|bytes| decode_datum(def, &bytes).ok());
+    let before = match self.ctx.get(pk_id) {
+      Some(bytes) => Some(
+        decode_datum(def, &bytes)
+          .with_context(|| format!("existing content for datum {pk_id:?} failed to decode"))?,
+      ),
+      None => None,
+    };
     self.tracked.insert(
       pk_id,
       TrackedDatum {
@@ -92,6 +105,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
         touched: false,
       },
     );
+    Ok(())
   }
 }
 
@@ -166,11 +180,13 @@ mod tests {
     let pk_id = DatumId::new();
     {
       let mut tctx = TypedOpContext::new(&mut ctx);
-      tctx.set(
-        pk_id,
-        &def,
-        vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)],
-      );
+      tctx
+        .set(
+          pk_id,
+          &def,
+          vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)],
+        )
+        .unwrap();
     } // tctx dropped here — diffing happens now
     let updates = ctx.take_pending_index_updates();
     assert_eq!(updates.len(), 1);
@@ -211,15 +227,17 @@ mod tests {
     let mut ctx = OpContext::new(&mut cache);
     {
       let mut tctx = TypedOpContext::new(&mut ctx);
-      tctx.get(pk_id, &def);
-      tctx.set(
-        pk_id,
-        &def,
-        vec![
-          FieldValue::String("clifford".to_string()),
-          FieldValue::I64(41),
-        ],
-      );
+      tctx.get(pk_id, &def).unwrap();
+      tctx
+        .set(
+          pk_id,
+          &def,
+          vec![
+            FieldValue::String("clifford".to_string()),
+            FieldValue::I64(41),
+          ],
+        )
+        .unwrap();
     }
     let updates = ctx.take_pending_index_updates();
     assert_eq!(updates.len(), 2);
@@ -256,8 +274,8 @@ mod tests {
     let mut ctx = OpContext::new(&mut cache);
     {
       let mut tctx = TypedOpContext::new(&mut ctx);
-      tctx.get(pk_id, &def);
-      tctx.set(pk_id, &def, values);
+      tctx.get(pk_id, &def).unwrap();
+      tctx.set(pk_id, &def, values).unwrap();
     }
     assert_eq!(ctx.take_pending_index_updates().len(), 0);
   }
@@ -270,7 +288,7 @@ mod tests {
     let mut ctx = OpContext::new(&mut cache);
     {
       let mut tctx = TypedOpContext::new(&mut ctx);
-      tctx.get(pk_id, &def);
+      tctx.get(pk_id, &def).unwrap();
     }
     assert_eq!(ctx.take_pending_index_updates().len(), 0);
   }
@@ -294,8 +312,8 @@ mod tests {
     let mut ctx = OpContext::new(&mut cache);
     {
       let mut tctx = TypedOpContext::new(&mut ctx);
-      tctx.get(pk_id, &def);
-      tctx.delete(pk_id, &def);
+      tctx.get(pk_id, &def).unwrap();
+      tctx.delete(pk_id, &def).unwrap();
     }
     let updates = ctx.take_pending_index_updates();
     assert_eq!(updates.len(), 1);
@@ -320,11 +338,13 @@ mod tests {
     let pk_id = DatumId::new();
     {
       let mut tctx = TypedOpContext::new(&mut ctx);
-      tctx.set(
-        pk_id,
-        &def,
-        vec![FieldValue::String("a@example.com".to_string())],
-      );
+      tctx
+        .set(
+          pk_id,
+          &def,
+          vec![FieldValue::String("a@example.com".to_string())],
+        )
+        .unwrap();
     }
     let updates = ctx.take_pending_index_updates();
     match decode_sk_index_op(&updates[0].payload).unwrap() {
@@ -333,5 +353,40 @@ mod tests {
       } => assert_eq!(unique_conflict_op, Some("resolve".to_string())),
       other => panic!("expected an Insert op, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn a_set_with_a_type_mismatched_value_fails_and_stages_nothing() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let def = user_type();
+    let pk_id = DatumId::new();
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      // "age" is declared I64 — encoding must fail, and the failure must
+      // not leave a staged write or a scheduled index update behind.
+      let result = tctx.set(
+        pk_id,
+        &def,
+        vec![
+          FieldValue::String("cliff".to_string()),
+          FieldValue::String("not a number".to_string()),
+        ],
+      );
+      assert!(result.is_err());
+    }
+    assert!(ctx.take_staged_writes().is_empty());
+    assert!(ctx.take_pending_index_updates().is_empty());
+  }
+
+  #[test]
+  fn a_get_over_undecodable_existing_content_is_an_error_not_absence() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let pk_id = DatumId::new();
+    cache.put(pk_id, vec![0xFF, 0xFF, 0xFF]); // garbage no schema decodes
+    let mut ctx = OpContext::new(&mut cache);
+    let def = user_type();
+    let mut tctx = TypedOpContext::new(&mut ctx);
+    assert!(tctx.get(pk_id, &def).is_err());
   }
 }

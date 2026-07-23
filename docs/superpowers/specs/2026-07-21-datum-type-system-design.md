@@ -94,6 +94,21 @@ values) -> Vec<u8>` / `decode_datum(def, bytes) -> Result<Vec<FieldValue>>`
 are the two entry points; a `FieldValue` enum mirrors `FieldType`'s shape
 (`FieldValue::Bool(bool)`, `FieldValue::Array(Vec<FieldValue>)`, etc.).
 
+**Every encoded datum carries a `u16` schema-version prefix**
+(`DatumTypeDef.version`, bumped on any field-layout change). The
+encoding being tagless means stored bytes are undecodable under any
+other field layout, so the planned add-freely/deprecate-then-remove
+schema evolution (deployment-management design, future sub-project)
+requires bytes to say which layout wrote them. Decoding bytes stamped
+with an older version needs that version's field layout — a version
+history on `DatumTypeDef`, which is the deployment sub-project's job;
+until then a version mismatch is a hard, explicit decode error rather
+than silent misinterpretation. (The wire protocols got the same
+treatment: `seisin_protocol::PROTOCOL_VERSION` and
+`seisin_gossip::wire::GOSSIP_PROTOCOL_VERSION` prefix every frame, with
+the strict n → n+1 rolling-deployment policy requiring the version-n
+decoder be kept for one release after bumping.)
+
 A tk-indexed field's value is stored *only* in that field's tk index (see
 below) — it is not duplicated in the type's own encoded content. This is
 6NF-style decomposition (each independently time-varying attribute gets
@@ -190,8 +205,14 @@ the next implementation plan, not a separate one.
 
 ## pk Index
 
-Trivial, unchanged: the datum_id itself is the primary key. No new
-mechanism.
+Trivial *at this layer*: the datum_id itself is the primary key, so the
+type system adds no new mechanism. That does not mean pk needs no index
+structure at all — resolving an id to a datum's actual stored location
+efficiently is a real lookup structure (today the in-memory
+`InMemoryStore` map; on disk, Storage Tier's job). The point is only
+that its design belongs to Storage Tier's disk format, not to the type
+system, and it gets its own storage-engine decision there (per the
+Index Storage Engine research's "pk/sk/tk decided separately" note).
 
 ## sk Index (Secondary Key)
 
@@ -296,6 +317,37 @@ numeric field" need.
   deferred rather than built now.
 
 ## tk Index (Bitemporal Valid-Time)
+
+**Classification: decomposed field storage, not a derived index.**
+"pk/sk/rk/tk" ride the same declaration surface (`IndexDef`) and the
+same `IndexUpdate` dispatch/residency rail, but they are not the same
+kind of thing, and the difference is load-bearing for durability:
+
+- **pk** is identity (see above — its lookup structure is Storage
+  Tier's concern).
+- **sk and rk** are *derived, redundant* structures — fully rebuildable
+  from a scan of the datums themselves. That rebuildability is exactly
+  what licenses `seisin-storage` having no WAL/fsync and `rebuild_from`,
+  and licenses "index writes don't need to be fsynced before ack."
+- **tk** is *primary data*: a tk-indexed field's value lives **only**
+  in the tk structure (6NF decomposition, below) — it is not
+  reconstructible from anything else. Every rebuildability-based
+  relaxation is therefore **off the table for tk**: its content needs
+  datum-grade durability (write-through-before-ack, same as any datum's
+  content), never index-grade. Any future "it's an index, index rules
+  apply" reasoning must check which class it's reasoning about.
+
+**Residency model: lazily-loaded range segments, not whole-history.**
+tk's primary access pattern is efficient range lookups (`as_of`,
+"what was in effect between X and Y", `history`). For an entity with a
+long correction history, the owning thread should not hold the entire
+history resident the way sk holds its (small) entry list — the resident
+state is a cache of lazily-loaded, range-keyed segments (thunked: a
+range is materialized on first touch and kept, adjacent untouched
+ranges stay on disk), with the recent/open-ended end of the history the
+hot segment in practice. The `ResidentIndex` trait accommodates this
+directly (its impl owns whatever representation it likes); the segment
+granularity and eviction story are tk implementation-plan decisions.
 
 Models the valid-time half of the database guideline's `_t_` pattern:
 non-overlapping, half-open `[lower, upper)` ranged versions of a field's

@@ -222,7 +222,7 @@ mod tests {
       node_a,
       listener,
       Arc::new(std::collections::HashMap::new()),
-      Arc::new(crate::index_handler::IndexHandlerRegistry::new()),
+      Arc::new(crate::index_handler::IndexKindRegistry::new()),
     );
 
     let gossip = GossipState::new();

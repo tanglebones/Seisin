@@ -9,6 +9,17 @@ use crate::field::{value_matches_type, FieldType, FieldValue};
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatumTypeDef {
   pub name: String,
+  /// The type's schema version, stamped as a prefix on every encoded
+  /// datum. The encoding is deliberately tagless (schema-driven, no
+  /// per-value type markers), which makes stored bytes undecodable
+  /// under any *other* field layout — so bytes must carry which layout
+  /// wrote them, or the planned add-freely/deprecate-then-remove schema
+  /// evolution can never decode data written before a field was added.
+  /// Bump this on any field-layout change. Decoding bytes stamped with
+  /// an older version requires that version's field layout (a version
+  /// history) — not built yet; today a mismatch is a hard, explicit
+  /// decode error rather than silent misinterpretation.
+  pub version: u16,
   pub fields: Vec<(String, FieldType)>,
   pub indexes: Vec<IndexDef>,
 }
@@ -17,9 +28,17 @@ impl DatumTypeDef {
   pub fn new(name: impl Into<String>) -> Self {
     Self {
       name: name.into(),
+      version: 1,
       fields: Vec::new(),
       indexes: Vec::new(),
     }
+  }
+
+  /// Sets the schema version this def describes — see the `version`
+  /// field's doc for when it must be bumped.
+  pub fn version(mut self, version: u16) -> Self {
+    self.version = version;
+    self
   }
 
   /// Appends a field to the type, in declaration order — that order is
@@ -64,7 +83,7 @@ pub fn encode_datum(def: &DatumTypeDef, values: &[FieldValue]) -> Result<Vec<u8>
       values.len()
     );
   }
-  let mut buf = Vec::new();
+  let mut buf = def.version.to_le_bytes().to_vec();
   for ((field_name, field_ty), value) in def.fields.iter().zip(values) {
     if !value_matches_type(value, field_ty) {
       bail!(
@@ -83,7 +102,23 @@ pub fn encode_datum(def: &DatumTypeDef, values: &[FieldValue]) -> Result<Vec<u8>
 /// declared order. Fails if the bytes don't cleanly decode into exactly
 /// that many fields with nothing left over.
 pub fn decode_datum(def: &DatumTypeDef, bytes: &[u8]) -> Result<Vec<FieldValue>> {
-  let mut offset = 0;
+  if bytes.len() < 2 {
+    bail!(
+      "datum bytes too short for a schema version prefix: {} bytes",
+      bytes.len()
+    );
+  }
+  let stored_version = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+  if stored_version != def.version {
+    bail!(
+      "datum was encoded at schema version {} but type {:?} is at version {} — decoding \
+       across versions needs that version's field layout (schema version history, not yet built)",
+      stored_version,
+      def.name,
+      def.version
+    );
+  }
+  let mut offset = 2;
   let mut values = Vec::with_capacity(def.fields.len());
   for (_, field_ty) in &def.fields {
     values.push(decode_field_value(field_ty, bytes, &mut offset)?);
@@ -181,6 +216,23 @@ mod tests {
       FieldValue::String("not a number".to_string()), // "age" is declared I64
     ];
     assert!(encode_datum(&def, &values).is_err());
+  }
+
+  #[test]
+  fn decode_rejects_bytes_stamped_with_a_different_schema_version() {
+    let def_v1 = user_type();
+    let def_v2 = user_type().version(2);
+    let values = vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)];
+    let encoded_v1 = encode_datum(&def_v1, &values).unwrap();
+    let err = decode_datum(&def_v2, &encoded_v1).unwrap_err();
+    assert!(err.to_string().contains("schema version"), "{err}");
+    // Same layout, matching version: still round-trips.
+    assert_eq!(decode_datum(&def_v1, &encoded_v1).unwrap(), values);
+  }
+
+  #[test]
+  fn decode_rejects_bytes_too_short_for_a_version_prefix() {
+    assert!(decode_datum(&user_type(), &[0x01]).is_err());
   }
 
   #[test]

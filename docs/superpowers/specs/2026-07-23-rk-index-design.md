@@ -20,50 +20,60 @@ node/thread currently natively owns that index datum, using the same
 per-thread resident-cache mechanism already used for sk), and page-size
 auto-detection/benchmarking.
 
-## Framework Change: Removing `IndexHandlerRegistry`
+## Framework Foundation: The `ResidentIndex`/`IndexKind` Traits (already implemented)
 
-The existing `IndexHandlerRegistry` (`seisin-node/src/index_handler.rs`,
-built in Datum Type System Part 2 revised) is a generic
-`Fn(Option<&[u8]>, &[u8]) -> (Vec<u8>, Option<String>)` bytes-in/bytes-out
-contract. It fits sk (a small entry-list blob, cheap to fully decode/
-re-encode per update) but cannot fit rk: rk's resident state is a live,
-multi-page `seisin-storage::BPlusTree` file handle, and forcing it through
-"pass current bytes, get new bytes" would mean serializing the entire file
-on every update — defeating the point of a disk-backed, bounded-I/O
+The original bytes-in/bytes-out `IndexHandlerRegistry` contract
+(`Fn(Option<&[u8]>, &[u8]) -> (Vec<u8>, Option<String>)`, built in Datum
+Type System Part 2 revised) fit sk (a small entry-list blob) but could
+not fit rk: rk's resident state is a live, multi-page
+`seisin-storage::BPlusTree` file handle, and forcing it through "pass
+current bytes, get new bytes" would mean serializing the entire file on
+every update — defeating the point of a disk-backed, bounded-I/O
 structure.
 
-Rather than build a second parallel registry, `IndexHandlerRegistry` is
-removed entirely. `seisin-node`'s `worker.rs` gains hardcoded logic per
-index kind:
+The registry itself was the right layering, though — only the handler
+*contract* was wrong. It has been replaced (already implemented, ahead
+of this plan) by a trait pair in `seisin-node/src/index_handler.rs`
+that lets each kind own its resident representation while sharing the
+one `IndexUpdate` dispatch/lifecycle rail:
 
 ```rust
-match index_kind.as_str() {
-  "sk" => { /* sk logic, moved in from seisin-types::sk_index */ }
-  "rk" => { /* rk logic, using seisin-storage against rk_cache */ }
-  other => { /* reply with a "no such index kind" violation */ }
+pub struct IndexApplyOutcome {
+  pub violation: Option<String>,
+  /// New serialized content for blob-persisted kinds (sk) — the worker
+  /// writes it through to cache/storage. Self-persisted kinds (rk's
+  /// B+Tree file) return None and the worker writes nothing.
+  pub write_through: Option<Vec<u8>>,
+}
+
+pub trait ResidentIndex: Send {
+  fn apply(&mut self, payload: &[u8]) -> IndexApplyOutcome;
+}
+
+pub trait IndexKind: Send + Sync {
+  fn open(&self, target: DatumId, stored: Option<Vec<u8>>)
+    -> Result<Box<dyn ResidentIndex>, String>;
 }
 ```
 
-This is a deliberate loosening of the framework/solution-logic separation
-this project has otherwise maintained (`seisin-node` previously knew
-nothing about what "sk"/"rk" meant). sk's apply logic (`SkIndexOp`,
-`encode_sk_index_op`/`decode_sk_index_op`, `apply_sk_index_update`)
-migrates from `crates/seisin-types/src/sk_index.rs` into `seisin-node`
-(new module `seisin-node/src/sk_apply.rs`), since `seisin-node` cannot
-depend on `seisin-types` (one-directional dependency, established in Part
-2 revised) — the logic must physically live in `seisin-node` to be called
-from `worker.rs` directly. `seisin-types::sk_index` keeps only the
-payload-*building* side (`sk_key`, `encode_sk_index_op`,
-`decode_sk_index_op` re-exported or duplicated as needed for
-`TypedOpContext` to construct what it schedules) — `register_sk_index_handler`
-and the registry-facing wrapper are deleted.
+`worker.rs` holds one `HashMap<DatumId, Box<dyn ResidentIndex>>` per
+thread (built on cold miss via the registered kind's `open`, mutated in
+place forever after) — no parallel `rk_cache`, no per-kind string match
+in the framework, and `seisin-node` stays ignorant of what "sk"/"rk"
+mean. sk's implementation (`SkIndexKind`/`SkResidentIndex`) lives in
+`seisin-types::sk_index`, registered at the composition root via
+`register_sk_index_kind` — `seisin-types` already depends on
+`seisin-node`, so no code migration into `seisin-node` is needed.
 
-`WorkerHandle::spawn`/`WorkerPool::spawn` currently take a trailing
-`index_handlers: Arc<IndexHandlerRegistry>` parameter (threaded through 13
-call sites across the workspace in Part 2 revised). This parameter is
-replaced with `data_dir: Arc<String>` (see below) — same call-site
-position, so the same 13 sites get a small, mechanical update rather than
-a structural one.
+What this plan adds is an `RkIndexKind` in `seisin-types::rk_index`
+implementing the same pair: `open` opens-or-creates the B+Tree file
+(`BPlusTree::open`/`create`), `apply` does the remove-then-insert, and
+every outcome has `write_through: None` (the tree persists itself).
+`RkIndexKind` is constructed with the data directory at registration
+time — `register_rk_index_kind(&mut IndexKindRegistry, data_dir)` —
+so `WorkerHandle::spawn`/`WorkerPool::spawn` signatures do not change
+at all (the 13-call-site ripple the earlier draft of this section
+anticipated disappears).
 
 ## `seisin-storage` Change: Adding `remove`
 
@@ -191,16 +201,16 @@ pub struct RkIndexOp {
 This flows through the *exact same* three-phase op lifecycle already
 built in Part 2 revised (execute → dispatch `IndexUpdate` → wait →
 commit-or-fail) — no changes needed to `try_run_if_ready`/
-`dispatch_index_update`/`IndexUpdateReplied`. `worker.rs`'s `rk_cache:
-HashMap<DatumId, BPlusTree>` (parallel to the existing `index_cache:
-HashMap<DatumId, Vec<u8>>` for sk) holds the open file handle for
-whichever rk indexes this thread has touched, opened lazily
-(`BPlusTree::open` if the file exists, else `BPlusTree::create`) on
-first access per index. `worker.rs`'s `"rk"` match arm: look up (or
-open/create) the tree in `rk_cache`, `remove(old_key ++ pk_id)` if
-`old_rank_key.is_some()`, `insert(new_key ++ pk_id, pk_id_bytes)` if
-`new_rank_key.is_some()`, always succeeds (no violation possible in this
-minimal version — unconditional replace).
+`dispatch_index_update`/`IndexUpdateReplied`, and none to `worker.rs`
+either: the worker's existing per-thread
+`HashMap<DatumId, Box<dyn ResidentIndex>>` cold-opens the tree via
+`RkIndexKind::open` (`BPlusTree::open` if the file exists, else
+`BPlusTree::create`) on first access per index. `RkResidentIndex::apply`
+decodes the `RkIndexOp`, does `remove(old_key ++ pk_id)` if
+`old_rank_key.is_some()` and `insert(new_key ++ pk_id, pk_id_bytes)` if
+`new_rank_key.is_some()`, and always succeeds with
+`write_through: None` (no violation possible in this minimal version —
+unconditional replace; the tree persists itself).
 
 **Correction from the brainstorm discussion:** bundling "the new rank"
 into the update's own result was floated and rejected. `TypedOpContext`'s
@@ -262,14 +272,23 @@ directly parallel to the existing `WorkerPool::run_op`/
 sends a message, blocks on the same kind of reply channel `run_op` already
 uses) — but skipping collation/`op_records` entirely, since a query only
 ever touches one datum and is answered synchronously and immediately by
-whichever thread owns it, straight from `rk_cache`. `worker.rs` hardcodes
-`RkQueryKind::TopN(n)` → `scan_backward_bounded(n)`,
-`RkQueryKind::BottomN(n)` → `scan_forward_bounded(n)`,
-`RkQueryKind::PercentileSample(k)` → `sample_by_rank(k)`, decoding each
-returned `(Vec<u8>, Vec<u8>)` pair (24-byte-key-derived rank_key bytes
-aren't separately needed here — the tree's *value* is already the
-16-byte pk_id, so results are read directly as `(key[0..8].to_vec(),
-DatumId::from_bytes(value.try_into().unwrap()))`).
+whichever thread owns it, straight from that thread's resident-index
+map. Reaching the tree through `Box<dyn ResidentIndex>` needs a read
+path on the trait: `ResidentIndex` gains a
+`query(&self, query: &[u8]) -> Result<Vec<u8>, String>` method with a
+default "this kind supports no queries" error implementation (sk keeps
+the default; nothing about sk changes). `RkResidentIndex::query`
+decodes the query bytes into `RkQueryKind` and hardcodes
+`TopN(n)` → `scan_backward_bounded(n)`,
+`BottomN(n)` → `scan_forward_bounded(n)`,
+`PercentileSample(k)` → `sample_by_rank(k)`, encoding each returned
+`(Vec<u8>, Vec<u8>)` pair (24-byte-key-derived rank_key bytes aren't
+separately needed here — the tree's *value* is already the 16-byte
+pk_id, so results are read directly as `(key[0..8].to_vec(),
+DatumId::from_bytes(value.try_into().unwrap()))`). The worker stays
+kind-agnostic: it just passes the opaque query bytes through and
+returns the opaque result bytes; `Request::RkQuery`'s decode/encode of
+those bytes lives with the rest of the rk logic in `seisin-types`.
 
 ## Data Directory
 
@@ -284,6 +303,9 @@ pub struct NodeConfig {
 ```
 
 rk index files live at `{data_dir}/rk_{type_name}.{field_name}.btree`.
+The composition root (`main.rs`) passes `data_dir` into
+`register_rk_index_kind` when wiring the `IndexKindRegistry` — the
+worker/pool spawn signatures never see it.
 This is the minimum real decision needed to make rk functional at all —
 not a stand-in for Storage Tier's eventual placement/replication/
 multi-node concerns, just "where do this node's own files go." Tests use
@@ -305,13 +327,11 @@ sandbox.
   bytes, matches their numeric order), F64 ordering matches
   `f64::total_cmp` exactly for a set including negative/positive/zero/
   NaN/infinity values, rejects non-numeric `FieldValue`s.
-- Unit tests for the moved sk apply logic in `seisin-node` (same test
-  cases already existing in `seisin-types::sk_index`, moved along with
-  the code, confirming the migration didn't change behavior).
-- Unit tests for `worker.rs`'s `"rk"` `IndexUpdate` handling: a fresh
-  insert (`old_rank_key: None`), a rank_key change (remove old +
-  insert new), a pure removal (`new_rank_key: None`, entity deleted) —
-  each verified via the resident `rk_cache`'s tree state directly.
+- Unit tests for `RkResidentIndex`'s `apply`/`query`: a fresh insert
+  (`old_rank_key: None`), a rank_key change (remove old + insert new),
+  a pure removal (`new_rank_key: None`, entity deleted) — each verified
+  via the tree state directly; plus `query` decode/dispatch per
+  `RkQueryKind`, and `open`'s open-vs-create split against a temp dir.
 - Integration test (`seisin-node` or `seisin-types`, following the
   existing `integration_automatic_index_maintenance.rs` pattern): a real
   node, a solution op writing a scored entity via `TypedOpContext`,
@@ -325,8 +345,8 @@ sandbox.
   concurrency-sensitive integration tests (`integration_wound_wait`,
   `integration_cross_node_wound_wait`, `integration_op_collation`) 20x
   per this project's established discipline, since `worker.rs`'s
-  `WorkerHandle::spawn`/`WorkerPool::spawn` signatures change again
-  (13 call sites, same ripple pattern as Part 2 revised's Task 5).
+  `IndexUpdate` handling and the `ResidentIndex` read path both sit in
+  its core message loop.
 
 ## Open Questions Carried Forward
 
