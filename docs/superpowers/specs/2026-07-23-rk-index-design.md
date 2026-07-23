@@ -302,10 +302,15 @@ pub struct NodeConfig {
 }
 ```
 
-rk index files live at `{data_dir}/rk_{type_name}.{field_name}.btree`.
-The composition root (`main.rs`) passes `data_dir` into
+rk index files are named `rk_<index-datum-id-hex>.btree` under
+`data_dir` — `IndexKind::open` receives only the `DatumId`, which is
+already the stable, collision-free derivation of `rk:{type}.{field}`,
+so the id is the natural file name.
+The composition root (a solution binary) passes `data_dir` into
 `register_rk_index_kind` when wiring the `IndexKindRegistry` — the
-worker/pool spawn signatures never see it.
+worker/pool spawn signatures never see it. (`seisin-node`'s own bare
+binary can't register the kind itself: `seisin-types` depends on
+`seisin-node`, so the reverse dependency would be a cycle.)
 This is the minimum real decision needed to make rk functional at all —
 not a stand-in for Storage Tier's eventual placement/replication/
 multi-node concerns, just "where do this node's own files go." Tests use

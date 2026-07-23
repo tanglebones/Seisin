@@ -349,7 +349,44 @@ commit and push immediately, since work sessions may end abruptly.
      `ResidentIndex` for the read path, and `RkIndexKind` carrying
      `data_dir` from registration so spawn signatures don't change).
 
-As of this entry: 10 crates, 272 tests passing, `cargo fmt --check` and
+- **Datum Type System, Part 3 — rk index (leaderboards).** Per
+  `specs/2026-07-23-rk-index-design.md` and
+  `plans/2026-07-22-datum-type-system-part3-rk-index.md`. rk rides the
+  `ResidentIndex`/`IndexKind` rail end to end: `IndexDef::Rk { field }`
+  (declaration-time panic if the field is undeclared or non-numeric),
+  `TypedOpContext`'s drop-diffing schedules a single `RkIndexOp`
+  (`old_rank_key`/`new_rank_key` options) to the one derived
+  `rk:{type}.{field}` datum, and `RkIndexKind`/`RkResidentIndex`
+  (`seisin-types::rk_kind`) apply it as remove-then-insert against a
+  resident `seisin-storage::BPlusTree` file handle
+  (`write_through: None` — self-persisted; files named
+  `rk_<index-datum-id-hex>.btree` under the new `NodeConfig.data_dir`).
+  Keys are 24-byte composites (order-preserving 8-byte rank key —
+  sign-bit flip for I64, total_cmp bit transform for F64 — ++ pk_id as
+  tiebreaker, so tied scores never collide). New engine primitive:
+  `BPlusTree::remove` (presence check, then a count-decrementing
+  descent; no page merge/rebalance — documented accepted limitation),
+  property-tested against a model map over interleaved insert/remove.
+  Read path: `ResidentIndex` gained a default-erroring `query` method;
+  new client-facing `Request::RkQuery { index_datum_id, query }` /
+  `Response::RkQueryResult { entries }` wire pair with standalone
+  `RkQueryKind`/entry codecs in `seisin-protocol` (defined once, used
+  by both `server.rs`'s routing and rk's own impl);
+  `WorkerMessage::IndexQuery` + `WorkerHandle`/`WorkerPool::
+  run_index_query` answer synchronously from the owning thread with no
+  collation; `server.rs` redirects a non-native `RkQuery` exactly like
+  `Op`. Registration is a composition-root concern
+  (`register_rk_index_kind(&mut registry, data_dir)`) — the bare
+  `seisin-node` binary can't do it (dependency cycle), a solution
+  binary does. Proven end-to-end by `integration_rk_leaderboard.rs`
+  (writes via `TypedOpContext` over the real wire, then
+  TopN/BottomN/PercentileSample queries, including a score change
+  moving — not duplicating — an entry), stress-run 10x, plus the
+  existing wound-wait/collation suites 20x, no flakiness. Deferred, per
+  the spec: conditional/ratchet updates, rank-in-write-response,
+  sharding, placement wiring, page-size auto-detection.
+
+As of this entry: 10 crates, 308 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -392,10 +429,11 @@ sub-project plans:
 - **Datum type system.** Fully designed in
   `specs/2026-07-21-datum-type-system-design.md` (schema, pk/sk/rk/tk,
   uniqueness/relational constraint enforcement). Parts 1 (schema
-  declaration & field encoding) and 2 (sk index + uniqueness
-  constraint) are done — see "Done" above. Parts 3 (rk — splay tree
-  leaderboard), 4 (tk — bitemporal valid-time), and 5 (relational/FK
-  constraint enforcement) are separate, not-yet-started plans.
+  declaration & field encoding), 2 (sk index + uniqueness constraint),
+  and 3 (rk — counted-B+Tree leaderboard) are done — see "Done" above.
+  Parts 4 (tk — decomposed bitemporal valid-time field storage, per the
+  revised taxonomy in the design doc) and 5 (relational/FK constraint
+  enforcement) are separate, not-yet-started plans.
 - **Framework/codegen shape.** Seisin's actual deliverable is base
   libraries a solution uses to define datum types + operations in code,
   compiling into a server executable and a paired client library. None
