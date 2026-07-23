@@ -55,6 +55,23 @@ pub enum Request {
     index_kind: String,
     payload: Vec<u8>,
   },
+  /// A read-only query against one rk index datum — client-facing,
+  /// routed exactly like `Request::Op` (redirect if the receiving node
+  /// isn't native for `index_datum_id`), but bypassing op collation
+  /// entirely: a query touches exactly one datum and is answered
+  /// synchronously by its owning thread. See the rk design doc's "Read
+  /// Path" section.
+  RkQuery {
+    index_datum_id: DatumId,
+    query: RkQueryKind,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RkQueryKind {
+  TopN(u32),
+  BottomN(u32),
+  PercentileSample(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +95,12 @@ pub enum Response {
   /// the index's resident/stored state was left untouched.
   IndexUpdateResult {
     violation: Option<String>,
+  },
+  /// Reply to an `RkQuery`: `(rank_key bytes, pk_id)` pairs in the
+  /// order the query implies (descending for TopN, ascending for
+  /// BottomN/PercentileSample). Rank keys are always exactly 8 bytes.
+  RkQueryResult {
+    entries: Vec<(Vec<u8>, DatumId)>,
   },
 }
 
@@ -108,6 +131,12 @@ const OP_ACQUIRE: u8 = 2;
 const OP_RECALL: u8 = 3;
 const OP_RELEASE: u8 = 4;
 const OP_INDEX_UPDATE: u8 = 5;
+const OP_RK_QUERY: u8 = 6;
+
+const RK_QUERY_TOP_N: u8 = 0;
+const RK_QUERY_BOTTOM_N: u8 = 1;
+const RK_QUERY_PERCENTILE_SAMPLE: u8 = 2;
+const RK_RANK_KEY_LEN: usize = 8;
 
 const RESP_REDIRECT: u8 = 1;
 const RESP_OP_RESULT: u8 = 2;
@@ -115,6 +144,7 @@ const RESP_OP_ERROR: u8 = 3;
 const RESP_GRANTED: u8 = 4;
 const RESP_RELEASED: u8 = 5;
 const RESP_INDEX_UPDATE_RESULT: u8 = 6;
+const RESP_RK_QUERY_RESULT: u8 = 7;
 
 const ID_LEN: usize = 16;
 
@@ -172,6 +202,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.extend_from_slice(kind_bytes);
       buf.extend_from_slice(payload);
     }
+    Request::RkQuery {
+      index_datum_id,
+      query,
+    } => {
+      buf.push(OP_RK_QUERY);
+      buf.extend_from_slice(&index_datum_id.as_bytes());
+      buf.extend_from_slice(&encode_rk_query_kind(query));
+    }
   }
   buf
 }
@@ -187,8 +225,95 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_RECALL => decode_recall_request(buf),
     OP_RELEASE => decode_release_request(buf),
     OP_INDEX_UPDATE => decode_index_update_request(buf),
+    OP_RK_QUERY => decode_rk_query_request(buf),
     op => bail!("unknown request opcode: {op}"),
   }
+}
+
+fn decode_rk_query_request(buf: &[u8]) -> Result<Request> {
+  if buf.len() != 1 + ID_LEN + 5 {
+    bail!(
+      "rk query request has the wrong length: expected {} bytes, got {}",
+      1 + ID_LEN + 5,
+      buf.len()
+    );
+  }
+  let index_datum_id = DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap());
+  let query = decode_rk_query_kind(&buf[1 + ID_LEN..])?;
+  Ok(Request::RkQuery {
+    index_datum_id,
+    query,
+  })
+}
+
+/// The rk query/entry codecs are public standalone functions (not just
+/// baked into `encode_request`) because the worker treats query/result
+/// bytes as opaque (`ResidentIndex::query`): the rk implementation in
+/// `seisin-types` decodes the query bytes and encodes the result bytes
+/// with these same functions, so the byte layout is defined exactly
+/// once, here.
+pub fn encode_rk_query_kind(q: &RkQueryKind) -> Vec<u8> {
+  let (tag, n) = match q {
+    RkQueryKind::TopN(n) => (RK_QUERY_TOP_N, *n),
+    RkQueryKind::BottomN(n) => (RK_QUERY_BOTTOM_N, *n),
+    RkQueryKind::PercentileSample(n) => (RK_QUERY_PERCENTILE_SAMPLE, *n),
+  };
+  let mut buf = vec![tag];
+  buf.extend_from_slice(&n.to_le_bytes());
+  buf
+}
+
+pub fn decode_rk_query_kind(buf: &[u8]) -> Result<RkQueryKind> {
+  if buf.len() != 5 {
+    bail!("rk query kind must be exactly 5 bytes, got {}", buf.len());
+  }
+  let n = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+  match buf[0] {
+    RK_QUERY_TOP_N => Ok(RkQueryKind::TopN(n)),
+    RK_QUERY_BOTTOM_N => Ok(RkQueryKind::BottomN(n)),
+    RK_QUERY_PERCENTILE_SAMPLE => Ok(RkQueryKind::PercentileSample(n)),
+    tag => bail!("unknown rk query kind tag: {tag}"),
+  }
+}
+
+/// `entries` rank keys must be exactly 8 bytes each (the fixed
+/// `encode_rank_key` width) — enforced by the producers (rk's resident
+/// index), validated strictly by `decode_rk_entries`.
+pub fn encode_rk_entries(entries: &[(Vec<u8>, DatumId)]) -> Vec<u8> {
+  let mut buf = (entries.len() as u32).to_le_bytes().to_vec();
+  for (rank_key, pk_id) in entries {
+    buf.extend_from_slice(rank_key);
+    buf.extend_from_slice(&pk_id.as_bytes());
+  }
+  buf
+}
+
+pub fn decode_rk_entries(buf: &[u8]) -> Result<Vec<(Vec<u8>, DatumId)>> {
+  if buf.len() < 4 {
+    bail!("rk entries buffer too short for a count");
+  }
+  let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+  let entry_len = RK_RANK_KEY_LEN + ID_LEN;
+  if buf.len() != 4 + count * entry_len {
+    bail!(
+      "rk entries length mismatch: {} entries need {} bytes, got {}",
+      count,
+      4 + count * entry_len,
+      buf.len()
+    );
+  }
+  let mut entries = Vec::with_capacity(count);
+  for i in 0..count {
+    let start = 4 + i * entry_len;
+    let rank_key = buf[start..start + RK_RANK_KEY_LEN].to_vec();
+    let pk_id = DatumId::from_bytes(
+      buf[start + RK_RANK_KEY_LEN..start + entry_len]
+        .try_into()
+        .unwrap(),
+    );
+    entries.push((rank_key, pk_id));
+  }
+  Ok(entries)
 }
 
 fn decode_acquire_request(buf: &[u8]) -> Result<Request> {
@@ -340,6 +465,10 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
         }
       }
     }
+    Response::RkQueryResult { entries } => {
+      buf.push(RESP_RK_QUERY_RESULT);
+      buf.extend_from_slice(&encode_rk_entries(entries));
+    }
   }
   buf
 }
@@ -393,6 +522,9 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
       };
       Ok(Response::IndexUpdateResult { violation })
     }
+    RESP_RK_QUERY_RESULT => Ok(Response::RkQueryResult {
+      entries: decode_rk_entries(&buf[1..])?,
+    }),
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -495,6 +627,48 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
 mod tests {
   use super::*;
   use std::io::Cursor;
+
+  #[test]
+  fn round_trips_an_rk_query_request() {
+    for query in [
+      RkQueryKind::TopN(10),
+      RkQueryKind::BottomN(3),
+      RkQueryKind::PercentileSample(7),
+    ] {
+      let req = Request::RkQuery {
+        index_datum_id: DatumId::new(),
+        query: query.clone(),
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn round_trips_an_rk_query_result_response() {
+    let resp = Response::RkQueryResult {
+      entries: vec![
+        (vec![1u8; 8], DatumId::new()),
+        (vec![2u8; 8], DatumId::new()),
+      ],
+    };
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  fn round_trips_an_empty_rk_query_result() {
+    let resp = Response::RkQueryResult { entries: vec![] };
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  fn rk_entry_codec_rejects_a_truncated_buffer() {
+    assert!(decode_rk_entries(&encode_rk_entries(&[]))
+      .unwrap()
+      .is_empty());
+    let mut buf = encode_rk_entries(&[(vec![1u8; 8], DatumId::new())]);
+    buf.truncate(buf.len() - 1); // corrupt: short by one byte
+    assert!(decode_rk_entries(&buf).is_err());
+  }
 
   #[test]
   fn every_encoded_frame_starts_with_the_protocol_version() {
