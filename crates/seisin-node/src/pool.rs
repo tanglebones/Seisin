@@ -154,6 +154,19 @@ impl WorkerPool {
       .unwrap_or(&ThreadId(0))
   }
 
+  /// Routes an index query to whichever local thread natively owns
+  /// `target`. Callers must have already confirmed `target` resolves to
+  /// this node — see `server.rs`'s redirect check.
+  pub fn run_index_query(
+    &self,
+    target: DatumId,
+    index_kind: String,
+    query: Vec<u8>,
+  ) -> Result<Vec<u8>, String> {
+    let (_, thread_id) = self.ring.read().unwrap().native(target);
+    self.handles[thread_id.0 as usize].run_index_query(target, index_kind, query)
+  }
+
   /// Asks every worker in the pool to evict cache entries `is_native`
   /// rejects — see `WorkerHandle::evict_non_native`.
   pub fn evict_non_native(&self, is_native: Arc<dyn Fn(DatumId) -> bool + Send + Sync>) {

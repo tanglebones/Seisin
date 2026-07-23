@@ -102,6 +102,16 @@ pub(crate) enum WorkerMessage {
     target: DatumId,
     violation: Option<String>,
   },
+  /// A read-only query against the index datum `target`, answered
+  /// synchronously by its owning thread from the resident structure
+  /// (cold-opening it if needed) — no collation, no op record. Query
+  /// and result bytes are opaque to the framework.
+  IndexQuery {
+    target: DatumId,
+    index_kind: String,
+    query: Vec<u8>,
+    reply: Sender<Result<Vec<u8>, String>>,
+  },
 }
 
 /// Where an `Acquire`'s eventual grant should be delivered — a local
@@ -481,6 +491,25 @@ impl WorkerHandle {
             }
             reply.respond(op_id, target, outcome.violation);
           }
+          WorkerMessage::IndexQuery {
+            target,
+            index_kind,
+            query,
+            reply,
+          } => {
+            let resident = match resident_indexes.entry(target) {
+              std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+              std::collections::hash_map::Entry::Vacant(vacancy) => index_kinds
+                .get(&index_kind)
+                .and_then(|kind| kind.open(target, cache.get(target)))
+                .map(|resident| vacancy.insert(resident)),
+            };
+            let result = match resident {
+              Ok(resident) => resident.query(&query),
+              Err(message) => Err(message),
+            };
+            let _ = reply.send(result);
+          }
           WorkerMessage::IndexUpdateReplied {
             op_id,
             target,
@@ -546,6 +575,27 @@ impl WorkerHandle {
         op_name,
         datum_ids,
         payload,
+        reply: reply_tx,
+      })
+      .expect("worker thread exited unexpectedly");
+    reply_rx.recv().expect("worker dropped the reply channel")
+  }
+
+  /// Sends an index query to this thread and blocks for the answer —
+  /// same synchronous shape as `run_op`, minus collation/op records.
+  pub fn run_index_query(
+    &self,
+    target: DatumId,
+    index_kind: String,
+    query: Vec<u8>,
+  ) -> Result<Vec<u8>, String> {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    self
+      .sender
+      .send(WorkerMessage::IndexQuery {
+        target,
+        index_kind,
+        query,
         reply: reply_tx,
       })
       .expect("worker thread exited unexpectedly");
@@ -940,6 +990,12 @@ mod tests {
         write_through: Some(payload.to_vec()),
       }
     }
+
+    fn query(&self, query: &[u8]) -> Result<Vec<u8>, String> {
+      // Echo, uppercased — enough to prove the bytes round-tripped
+      // through the worker rather than being fabricated.
+      Ok(query.iter().map(u8::to_ascii_uppercase).collect())
+    }
   }
 
   impl crate::index_handler::IndexKind for FixedOutcomeKind {
@@ -1124,6 +1180,56 @@ mod tests {
       vec![],
     );
     assert_eq!(result, Ok(vec![]));
+  }
+
+  #[test]
+  fn run_index_query_answers_from_the_resident_index() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register("echo", Box::new(FixedOutcomeKind { violation: None }));
+    let handles = spawn_test_pool_with_index_kinds(1, ring, OpRegistry::new(), index_kinds);
+    let result = handles[0].run_index_query(DatumId::new(), "echo".to_string(), b"abc".to_vec());
+    assert_eq!(result, Ok(b"ABC".to_vec()));
+  }
+
+  #[test]
+  fn run_index_query_on_an_unregistered_kind_is_an_error() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let handles = spawn_test_pool(1, ring, OpRegistry::new());
+    assert!(handles[0]
+      .run_index_query(DatumId::new(), "nope".to_string(), vec![])
+      .is_err());
+  }
+
+  #[test]
+  fn an_index_updated_then_queried_on_the_same_thread_uses_one_resident_instance() {
+    // Proves both message paths (IndexUpdate and IndexQuery) resolve to
+    // the same resident map entry without error — an update followed by
+    // a query on the same target must not cold-open a second instance.
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let index_target = DatumId::new();
+    let mut ops = OpRegistry::new();
+    ops.register(
+      "touch_with_index",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"touched".to_vec());
+        ctx.schedule_index_update(index_target, "echo", vec![1]);
+        vec![]
+      }),
+    );
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register("echo", Box::new(FixedOutcomeKind { violation: None }));
+    let handles = spawn_test_pool_with_index_kinds(1, ring, ops, index_kinds);
+    handles[0]
+      .run_op(
+        DatumId::new(),
+        "touch_with_index".to_string(),
+        vec![DatumId::new()],
+        vec![],
+      )
+      .unwrap();
+    let result = handles[0].run_index_query(index_target, "echo".to_string(), b"q".to_vec());
+    assert_eq!(result, Ok(b"Q".to_vec()));
   }
 
   #[test]
