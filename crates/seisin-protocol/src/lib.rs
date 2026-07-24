@@ -81,6 +81,62 @@ pub enum Request {
     class: String,
     query: LbQueryReq,
   },
+  /// A solution-called, mutating tk (valid-time history) op — same
+  /// routing as `LbExecute`. `class` only forms the registry kind
+  /// string `tk:{class}`.
+  TkExecute {
+    entity_datum_id: DatumId,
+    class: String,
+    op: TkOp,
+  },
+  /// A read-only tk query — same routing as `TkExecute`.
+  TkQuery {
+    entity_datum_id: DatumId,
+    class: String,
+    query: TkQueryReq,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TkOp {
+  /// Correction-upsert at `as_of` (`None` = the server stamps "now").
+  /// `value` is the schema-encoded FieldValue bytes for the class's
+  /// declared value type.
+  Set {
+    sub_key: Vec<u8>,
+    as_of: Option<i64>,
+    value: Vec<u8>,
+  },
+  /// Close the covering range at `as_of` with no successor — creates
+  /// a gap.
+  Clear {
+    sub_key: Vec<u8>,
+    as_of: Option<i64>,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TkQueryReq {
+  AsOf { sub_key: Vec<u8>, t: i64 },
+  Current { sub_key: Vec<u8> },
+  History { sub_key: Vec<u8> },
+  Range { sub_key: Vec<u8>, from: i64, to: i64 },
+  /// For every sub-key present, its covering span at `t`, if any —
+  /// "what did the whole entity hold at time t" in one call.
+  SnapshotAt { t: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TkSpan {
+  pub sub_key: Vec<u8>,
+  pub lower: i64,
+  pub upper: Option<i64>, // None = open-ended
+  pub value: Vec<u8>,     // schema-encoded FieldValue bytes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TkResult {
+  pub spans: Vec<TkSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +229,8 @@ pub enum Response {
   },
   /// Reply to `LbExecute`/`LbQuery`.
   LbResult(LbResult),
+  /// Reply to `TkExecute`/`TkQuery`.
+  TkResult(TkResult),
 }
 
 /// The wire protocol version, carried as the first byte of every
@@ -209,6 +267,18 @@ const OP_LB_QUERY: u8 = 8;
 const LB_OP_UPDATE: u8 = 0;
 const LB_OP_REMOVE: u8 = 1;
 
+const OP_TK_EXECUTE: u8 = 9;
+const OP_TK_QUERY: u8 = 10;
+
+const TK_OP_SET: u8 = 0;
+const TK_OP_CLEAR: u8 = 1;
+
+const TK_Q_AS_OF: u8 = 0;
+const TK_Q_CURRENT: u8 = 1;
+const TK_Q_HISTORY: u8 = 2;
+const TK_Q_RANGE: u8 = 3;
+const TK_Q_SNAPSHOT_AT: u8 = 4;
+
 const RK_QUERY_TOP_N: u8 = 0;
 const RK_QUERY_BOTTOM_N: u8 = 1;
 const RK_QUERY_PERCENTILE_SAMPLE: u8 = 2;
@@ -222,6 +292,7 @@ const RESP_RELEASED: u8 = 5;
 const RESP_INDEX_UPDATE_RESULT: u8 = 6;
 const RESP_RK_QUERY_RESULT: u8 = 7;
 const RESP_LB_RESULT: u8 = 8;
+const RESP_TK_RESULT: u8 = 9;
 
 const ID_LEN: usize = 16;
 
@@ -307,6 +378,26 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       put_bytes(&mut buf, class.as_bytes());
       buf.extend_from_slice(&encode_lb_query_req(query));
     }
+    Request::TkExecute {
+      entity_datum_id,
+      class,
+      op,
+    } => {
+      buf.push(OP_TK_EXECUTE);
+      buf.extend_from_slice(&entity_datum_id.as_bytes());
+      put_bytes(&mut buf, class.as_bytes());
+      buf.extend_from_slice(&encode_tk_op(op));
+    }
+    Request::TkQuery {
+      entity_datum_id,
+      class,
+      query,
+    } => {
+      buf.push(OP_TK_QUERY);
+      buf.extend_from_slice(&entity_datum_id.as_bytes());
+      put_bytes(&mut buf, class.as_bytes());
+      buf.extend_from_slice(&encode_tk_query_req(query));
+    }
   }
   buf
 }
@@ -325,8 +416,36 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_RK_QUERY => decode_rk_query_request(buf),
     OP_LB_EXECUTE => decode_lb_execute_request(buf),
     OP_LB_QUERY => decode_lb_query_request(buf),
+    OP_TK_EXECUTE => decode_tk_execute_request(buf),
+    OP_TK_QUERY => decode_tk_query_request(buf),
     op => bail!("unknown request opcode: {op}"),
   }
+}
+
+fn decode_tk_execute_request(buf: &[u8]) -> Result<Request> {
+  let mut offset = 1;
+  let entity_datum_id = take_id(buf, &mut offset)?;
+  let class =
+    String::from_utf8(take_bytes(buf, &mut offset)?).context("tk class was not valid utf8")?;
+  let op = decode_tk_op(&buf[offset..])?;
+  Ok(Request::TkExecute {
+    entity_datum_id,
+    class,
+    op,
+  })
+}
+
+fn decode_tk_query_request(buf: &[u8]) -> Result<Request> {
+  let mut offset = 1;
+  let entity_datum_id = take_id(buf, &mut offset)?;
+  let class =
+    String::from_utf8(take_bytes(buf, &mut offset)?).context("tk class was not valid utf8")?;
+  let query = decode_tk_query_req(&buf[offset..])?;
+  Ok(Request::TkQuery {
+    entity_datum_id,
+    class,
+    query,
+  })
 }
 
 fn decode_lb_execute_request(buf: &[u8]) -> Result<Request> {
@@ -768,6 +887,175 @@ fn take_lb_entries(buf: &[u8], offset: &mut usize) -> Result<Vec<LbEntry>> {
   Ok(entries)
 }
 
+fn put_opt_i64(buf: &mut Vec<u8>, v: Option<i64>) {
+  match v {
+    None => buf.push(0),
+    Some(v) => {
+      buf.push(1);
+      buf.extend_from_slice(&v.to_le_bytes());
+    }
+  }
+}
+
+fn take_opt_i64(buf: &[u8], offset: &mut usize) -> Result<Option<i64>> {
+  if buf.len() < *offset + 1 {
+    bail!("truncated option flag at offset {offset}");
+  }
+  let flag = buf[*offset];
+  *offset += 1;
+  match flag {
+    0 => Ok(None),
+    1 => Ok(Some(take_u64(buf, offset)? as i64)),
+    f => bail!("unknown option flag: {f}"),
+  }
+}
+
+/// The tk codecs are public standalone functions for the same reason
+/// as lb's: the worker treats op/query/result bytes as opaque, so the
+/// tk implementation in `seisin-types` and `server.rs`'s routing both
+/// use these — the byte layout is defined exactly once, here.
+pub fn encode_tk_op(op: &TkOp) -> Vec<u8> {
+  let mut buf = Vec::new();
+  match op {
+    TkOp::Set {
+      sub_key,
+      as_of,
+      value,
+    } => {
+      buf.push(TK_OP_SET);
+      put_bytes(&mut buf, sub_key);
+      put_opt_i64(&mut buf, *as_of);
+      put_bytes(&mut buf, value);
+    }
+    TkOp::Clear { sub_key, as_of } => {
+      buf.push(TK_OP_CLEAR);
+      put_bytes(&mut buf, sub_key);
+      put_opt_i64(&mut buf, *as_of);
+    }
+  }
+  buf
+}
+
+pub fn decode_tk_op(buf: &[u8]) -> Result<TkOp> {
+  if buf.is_empty() {
+    bail!("empty tk op");
+  }
+  let mut offset = 1;
+  let op = match buf[0] {
+    TK_OP_SET => {
+      let sub_key = take_bytes(buf, &mut offset)?;
+      let as_of = take_opt_i64(buf, &mut offset)?;
+      let value = take_bytes(buf, &mut offset)?;
+      TkOp::Set {
+        sub_key,
+        as_of,
+        value,
+      }
+    }
+    TK_OP_CLEAR => {
+      let sub_key = take_bytes(buf, &mut offset)?;
+      let as_of = take_opt_i64(buf, &mut offset)?;
+      TkOp::Clear { sub_key, as_of }
+    }
+    tag => bail!("unknown tk op tag: {tag}"),
+  };
+  if offset != buf.len() {
+    bail!("tk op has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(op)
+}
+
+pub fn encode_tk_query_req(q: &TkQueryReq) -> Vec<u8> {
+  let mut buf = Vec::new();
+  match q {
+    TkQueryReq::AsOf { sub_key, t } => {
+      buf.push(TK_Q_AS_OF);
+      put_bytes(&mut buf, sub_key);
+      buf.extend_from_slice(&t.to_le_bytes());
+    }
+    TkQueryReq::Current { sub_key } => {
+      buf.push(TK_Q_CURRENT);
+      put_bytes(&mut buf, sub_key);
+    }
+    TkQueryReq::History { sub_key } => {
+      buf.push(TK_Q_HISTORY);
+      put_bytes(&mut buf, sub_key);
+    }
+    TkQueryReq::Range { sub_key, from, to } => {
+      buf.push(TK_Q_RANGE);
+      put_bytes(&mut buf, sub_key);
+      buf.extend_from_slice(&from.to_le_bytes());
+      buf.extend_from_slice(&to.to_le_bytes());
+    }
+    TkQueryReq::SnapshotAt { t } => {
+      buf.push(TK_Q_SNAPSHOT_AT);
+      buf.extend_from_slice(&t.to_le_bytes());
+    }
+  }
+  buf
+}
+
+pub fn decode_tk_query_req(buf: &[u8]) -> Result<TkQueryReq> {
+  if buf.is_empty() {
+    bail!("empty tk query");
+  }
+  let mut offset = 1;
+  let query = match buf[0] {
+    TK_Q_AS_OF => TkQueryReq::AsOf {
+      sub_key: take_bytes(buf, &mut offset)?,
+      t: take_u64(buf, &mut offset)? as i64,
+    },
+    TK_Q_CURRENT => TkQueryReq::Current {
+      sub_key: take_bytes(buf, &mut offset)?,
+    },
+    TK_Q_HISTORY => TkQueryReq::History {
+      sub_key: take_bytes(buf, &mut offset)?,
+    },
+    TK_Q_RANGE => TkQueryReq::Range {
+      sub_key: take_bytes(buf, &mut offset)?,
+      from: take_u64(buf, &mut offset)? as i64,
+      to: take_u64(buf, &mut offset)? as i64,
+    },
+    TK_Q_SNAPSHOT_AT => TkQueryReq::SnapshotAt {
+      t: take_u64(buf, &mut offset)? as i64,
+    },
+    tag => bail!("unknown tk query tag: {tag}"),
+  };
+  if offset != buf.len() {
+    bail!("tk query has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(query)
+}
+
+pub fn encode_tk_result(result: &TkResult) -> Vec<u8> {
+  let mut buf = (result.spans.len() as u32).to_le_bytes().to_vec();
+  for span in &result.spans {
+    put_bytes(&mut buf, &span.sub_key);
+    buf.extend_from_slice(&span.lower.to_le_bytes());
+    put_opt_i64(&mut buf, span.upper);
+    put_bytes(&mut buf, &span.value);
+  }
+  buf
+}
+
+pub fn decode_tk_result(buf: &[u8]) -> Result<TkResult> {
+  let mut offset = 0;
+  let count = take_u32(buf, &mut offset)? as usize;
+  let mut spans = Vec::with_capacity(count);
+  for _ in 0..count {
+    spans.push(TkSpan {
+      sub_key: take_bytes(buf, &mut offset)?,
+      lower: take_u64(buf, &mut offset)? as i64,
+      upper: take_opt_i64(buf, &mut offset)?,
+      value: take_bytes(buf, &mut offset)?,
+    });
+  }
+  if offset != buf.len() {
+    bail!("tk result has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(TkResult { spans })
+}
+
 pub fn encode_lb_result(result: &LbResult) -> Vec<u8> {
   let mut buf = result.total.to_le_bytes().to_vec();
   match result.player_rank {
@@ -866,6 +1154,10 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
       buf.push(RESP_LB_RESULT);
       buf.extend_from_slice(&encode_lb_result(result));
     }
+    Response::TkResult(result) => {
+      buf.push(RESP_TK_RESULT);
+      buf.extend_from_slice(&encode_tk_result(result));
+    }
   }
   buf
 }
@@ -923,6 +1215,7 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
       entries: decode_rk_entries(&buf[1..])?,
     }),
     RESP_LB_RESULT => Ok(Response::LbResult(decode_lb_result(&buf[1..])?)),
+    RESP_TK_RESULT => Ok(Response::TkResult(decode_tk_result(&buf[1..])?)),
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -1158,6 +1451,94 @@ mod tests {
     let mut buf = encode_lb_result(&sample_lb_result());
     buf.truncate(buf.len() - 1);
     assert!(decode_lb_result(&buf).is_err());
+  }
+
+  fn sample_tk_result() -> TkResult {
+    TkResult {
+      spans: vec![
+        TkSpan {
+          sub_key: vec![7u8; 16],
+          lower: -5000,
+          upper: Some(1000),
+          value: b"v1".to_vec(),
+        },
+        TkSpan {
+          sub_key: vec![],
+          lower: 1000,
+          upper: None,
+          value: b"v2".to_vec(),
+        },
+      ],
+    }
+  }
+
+  #[test]
+  fn round_trips_tk_execute_requests() {
+    for op in [
+      TkOp::Set {
+        sub_key: vec![7u8; 16],
+        as_of: Some(-123),
+        value: b"amount".to_vec(),
+      },
+      TkOp::Set {
+        sub_key: vec![],
+        as_of: None,
+        value: b"x".to_vec(),
+      },
+      TkOp::Clear {
+        sub_key: vec![7u8; 16],
+        as_of: None,
+      },
+    ] {
+      let req = Request::TkExecute {
+        entity_datum_id: DatumId::new(),
+        class: "holdings".to_string(),
+        op: op.clone(),
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn round_trips_every_tk_query_variant() {
+    for query in [
+      TkQueryReq::AsOf {
+        sub_key: vec![1u8; 16],
+        t: 42,
+      },
+      TkQueryReq::Current { sub_key: vec![] },
+      TkQueryReq::History {
+        sub_key: vec![1u8; 16],
+      },
+      TkQueryReq::Range {
+        sub_key: vec![1u8; 16],
+        from: -10,
+        to: 10,
+      },
+      TkQueryReq::SnapshotAt { t: 99 },
+    ] {
+      let req = Request::TkQuery {
+        entity_datum_id: DatumId::new(),
+        class: "holdings".to_string(),
+        query: query.clone(),
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn round_trips_tk_results_including_empty() {
+    for result in [sample_tk_result(), TkResult { spans: vec![] }] {
+      let resp = Response::TkResult(result.clone());
+      assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+    }
+  }
+
+  #[test]
+  fn tk_result_codec_rejects_a_truncated_buffer() {
+    let mut buf = encode_tk_result(&sample_tk_result());
+    buf.truncate(buf.len() - 1);
+    assert!(decode_tk_result(&buf).is_err());
   }
 
   #[test]

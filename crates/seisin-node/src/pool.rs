@@ -83,6 +83,8 @@ impl WorkerPool {
         seisin_protocol::Request::RkQuery { .. } => return,
         seisin_protocol::Request::LbExecute { .. } => return,
         seisin_protocol::Request::LbQuery { .. } => return,
+        seisin_protocol::Request::TkExecute { .. } => return,
+        seisin_protocol::Request::TkQuery { .. } => return,
         seisin_protocol::Request::IndexUpdate {
           target,
           op_id,
