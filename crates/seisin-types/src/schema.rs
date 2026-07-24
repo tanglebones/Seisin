@@ -76,6 +76,43 @@ pub struct DatumTypeDef {
   pub pk: PkKind,
   pub fields: Vec<(String, FieldType)>,
   pub indexes: Vec<IndexDef>,
+  pub constraints: Vec<RelationalConstraintDef>,
+}
+
+/// What an FK-constrained field references — always a declared
+/// identity/index, never a bare scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FkTarget {
+  /// References a Uuid-pk type: runtime existence check against the
+  /// referenced datum. The constrained field holds the referenced
+  /// DatumId as 16 `Bytes`.
+  PkUuid { type_name: String },
+  /// References an Enum-pk type: validity is set membership against
+  /// the declared mnemonics — a schema-local, synchronous check with
+  /// no runtime dispatch. The set is embedded at the declaring site
+  /// (solutions define the enum once as a shared const and use it in
+  /// both places); a cross-def type registry is future codegen work.
+  PkEnum {
+    type_name: String,
+    mnemonics: Vec<String>,
+  },
+  /// References a *unique* sk index: runtime check against the derived
+  /// sk key datum. The constrained field holds the referenced
+  /// natural-key VALUE (any sk-legal primitive) — the check target is
+  /// `sk_key(type_name, field, value)`.
+  SkUnique { type_name: String, field: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalConstraintDef {
+  pub field: String,
+  pub references: FkTarget,
+  /// None: a dangling reference is a hard synchronous rejection (the
+  /// default). Some: the write is allowed, the dangling reference is
+  /// tracked in fk_pending, and the named op is invoked by the scan
+  /// driver if still missing when the scan runs — the framework never
+  /// invokes it itself.
+  pub resolution: Option<ConflictOp>,
 }
 
 impl DatumTypeDef {
@@ -86,7 +123,46 @@ impl DatumTypeDef {
       pk: PkKind::Uuid,
       fields: Vec::new(),
       indexes: Vec::new(),
+      constraints: Vec::new(),
     }
+  }
+
+  /// Declares a relational constraint — see `RelationalConstraintDef`.
+  ///
+  /// # Panics
+  /// Panics on a schema declaration bug (unknown field, or a field
+  /// type incompatible with the reference target) — caught at process
+  /// start, same policy as `index`.
+  pub fn constraint(mut self, constraint: RelationalConstraintDef) -> Self {
+    let declared = self
+      .fields
+      .iter()
+      .find(|(name, _)| name == &constraint.field);
+    let Some((_, field_ty)) = declared else {
+      panic!(
+        "constraint field {:?} on type {:?} is not a declared field",
+        constraint.field, self.name
+      );
+    };
+    match (&constraint.references, field_ty) {
+      (FkTarget::PkEnum { .. }, FieldType::String) => {}
+      (FkTarget::PkEnum { .. }, other) => panic!(
+        "PkEnum constraint field {:?} on type {:?} must be String, found {:?}",
+        constraint.field, self.name, other
+      ),
+      (FkTarget::PkUuid { .. }, FieldType::Bytes) => {}
+      (FkTarget::PkUuid { .. }, other) => panic!(
+        "PkUuid constraint field {:?} on type {:?} must be Bytes (a 16-byte DatumId), found {:?}",
+        constraint.field, self.name, other
+      ),
+      (FkTarget::SkUnique { .. }, FieldType::Array(_) | FieldType::Dict(_, _)) => panic!(
+        "SkUnique constraint field {:?} on type {:?} must be a primitive natural-key value",
+        constraint.field, self.name
+      ),
+      (FkTarget::SkUnique { .. }, _) => {}
+    }
+    self.constraints.push(constraint);
+    self
   }
 
   /// Sets the pk identity discipline — see `PkKind`.
@@ -368,6 +444,62 @@ mod tests {
     assert!(check_pk(seisin_core::datum::DatumId::new(), &def).is_err());
     assert!(check_pk(enum_pk_id("status", "bogus"), &def).is_err());
     assert!(check_pk(enum_pk_id("kind", "active"), &def).is_err());
+  }
+
+  #[test]
+  #[should_panic(expected = "not a declared field")]
+  fn a_constraint_on_an_unknown_field_panics() {
+    DatumTypeDef::new("order").constraint(RelationalConstraintDef {
+      field: "nope".to_string(),
+      references: FkTarget::PkUuid {
+        type_name: "customer".to_string(),
+      },
+      resolution: None,
+    });
+  }
+
+  #[test]
+  #[should_panic(expected = "must be String")]
+  fn a_pk_enum_constraint_on_a_non_string_field_panics() {
+    DatumTypeDef::new("order")
+      .field("status", FieldType::I64)
+      .constraint(RelationalConstraintDef {
+        field: "status".to_string(),
+        references: FkTarget::PkEnum {
+          type_name: "status".to_string(),
+          mnemonics: vec!["active".to_string()],
+        },
+        resolution: None,
+      });
+  }
+
+  #[test]
+  #[should_panic(expected = "must be Bytes")]
+  fn a_pk_uuid_constraint_on_a_non_bytes_field_panics() {
+    DatumTypeDef::new("order")
+      .field("customer_id", FieldType::String)
+      .constraint(RelationalConstraintDef {
+        field: "customer_id".to_string(),
+        references: FkTarget::PkUuid {
+          type_name: "customer".to_string(),
+        },
+        resolution: None,
+      });
+  }
+
+  #[test]
+  #[should_panic(expected = "primitive natural-key")]
+  fn an_sk_unique_constraint_on_an_array_field_panics() {
+    DatumTypeDef::new("order")
+      .field("emails", FieldType::Array(Box::new(FieldType::String)))
+      .constraint(RelationalConstraintDef {
+        field: "emails".to_string(),
+        references: FkTarget::SkUnique {
+          type_name: "user".to_string(),
+          field: "email".to_string(),
+        },
+        resolution: None,
+      });
   }
 
   #[test]

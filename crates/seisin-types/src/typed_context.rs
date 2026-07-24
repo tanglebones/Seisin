@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use seisin_core::datum::DatumId;
 use seisin_ops::context::OpContext;
 
@@ -66,6 +66,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   /// tracked — the datum and its indexes never diverge.
   pub fn set(&mut self, pk_id: DatumId, def: &DatumTypeDef, values: Vec<FieldValue>) -> Result<()> {
     crate::schema::check_pk(pk_id, def)?;
+    check_static_constraints(def, &values)?;
     let bytes = encode_datum(def, &values)?;
     self.ensure_tracked(pk_id, def)?;
     self.ctx.put(pk_id, bytes);
@@ -110,6 +111,53 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
     );
     Ok(())
   }
+}
+
+/// The schema-local constraint checks that need no runtime dispatch —
+/// enforced synchronously at `set` time, before anything is staged:
+/// `PkEnum` membership (the whole point of enum pks — FK validity is
+/// static) and `PkUuid` value shape (exactly 16 bytes, a DatumId).
+fn check_static_constraints(def: &DatumTypeDef, values: &[FieldValue]) -> Result<()> {
+  for constraint in &def.constraints {
+    let Some(field_idx) = def
+      .fields
+      .iter()
+      .position(|(name, _)| name == &constraint.field)
+    else {
+      continue; // declaration validation guarantees presence
+    };
+    match &constraint.references {
+      crate::schema::FkTarget::PkEnum {
+        type_name,
+        mnemonics,
+      } => {
+        if let Some(FieldValue::String(value)) = values.get(field_idx) {
+          if !mnemonics.contains(value) {
+            bail!(
+              "field {:?} references enum-pk type {:?} but {:?} is not a declared mnemonic",
+              constraint.field,
+              type_name,
+              value
+            );
+          }
+        }
+      }
+      crate::schema::FkTarget::PkUuid { type_name } => {
+        if let Some(FieldValue::Bytes(bytes)) = values.get(field_idx) {
+          if bytes.len() != 16 {
+            bail!(
+              "field {:?} references pk type {:?} and must hold a 16-byte DatumId, got {} bytes",
+              constraint.field,
+              type_name,
+              bytes.len()
+            );
+          }
+        }
+      }
+      crate::schema::FkTarget::SkUnique { .. } => {}
+    }
+  }
+  Ok(())
 }
 
 impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
@@ -530,6 +578,66 @@ mod tests {
         )
         .is_ok());
     }
+  }
+
+  #[test]
+  fn set_time_enum_membership_and_uuid_shape_checks() {
+    use crate::schema::{FkTarget, RelationalConstraintDef};
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let order = DatumTypeDef::new("order")
+      .field("status", FieldType::String)
+      .field("customer_id", FieldType::Bytes)
+      .constraint(RelationalConstraintDef {
+        field: "status".to_string(),
+        references: FkTarget::PkEnum {
+          type_name: "status".to_string(),
+          mnemonics: vec!["active".to_string(), "closed".to_string()],
+        },
+        resolution: None,
+      })
+      .constraint(RelationalConstraintDef {
+        field: "customer_id".to_string(),
+        references: FkTarget::PkUuid {
+          type_name: "customer".to_string(),
+        },
+        resolution: None,
+      });
+    let mut tctx = TypedOpContext::new(&mut ctx);
+    // Unknown mnemonic rejected, message names it.
+    let err = tctx
+      .set(
+        DatumId::new(),
+        &order,
+        vec![
+          FieldValue::String("bogus".to_string()),
+          FieldValue::Bytes(vec![0u8; 16]),
+        ],
+      )
+      .unwrap_err();
+    assert!(err.to_string().contains("bogus"), "{err}");
+    // Wrong-length uuid bytes rejected.
+    assert!(tctx
+      .set(
+        DatumId::new(),
+        &order,
+        vec![
+          FieldValue::String("active".to_string()),
+          FieldValue::Bytes(vec![0u8; 15]),
+        ],
+      )
+      .is_err());
+    // Valid mnemonic + 16-byte id accepted.
+    assert!(tctx
+      .set(
+        DatumId::new(),
+        &order,
+        vec![
+          FieldValue::String("active".to_string()),
+          FieldValue::Bytes(DatumId::new().as_bytes().to_vec()),
+        ],
+      )
+      .is_ok());
   }
 
   #[test]

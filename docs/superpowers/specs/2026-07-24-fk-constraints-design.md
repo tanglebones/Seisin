@@ -78,9 +78,12 @@ pub enum FkTarget {
 `DatumTypeDef` gains `constraints: Vec<RelationalConstraintDef>`
 (builder `.constraint(...)`). Declaration-time validation panics on a
 schema bug (the rk/`self_address` policy): the constrained field must
-be declared; `PkEnum` fields must be `FieldType::String`;
-`PkUuid`/`SkUnique` fields must be `FieldType::Bytes` (holding a
-16-byte `DatumId`).
+be declared; `PkEnum` fields must be `FieldType::String`; `PkUuid`
+fields must be `FieldType::Bytes` (holding a 16-byte `DatumId`);
+`SkUnique` fields must be an sk-legal *primitive* (not `Array`/`Dict`)
+— an SkUnique FK holds the referenced natural-key **value**, which is
+exactly what `sk_key(type, field, value)` derives the check target
+from, so a 16-byte-id rule would be wrong for it.
 
 ## Write Path
 
