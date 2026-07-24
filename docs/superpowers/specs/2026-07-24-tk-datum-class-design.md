@@ -36,8 +36,27 @@ pub struct TkClassDef {
   pub name: String,
   pub value_type: FieldType,  // any FieldType — values are schema-encoded
   pub value_width: u16,       // hard cap on the encoded value, bytes
+  /// Width of the sub-key prefix, bytes; 0 = the class tracks the
+  /// entity itself (one history per tk datum). Non-zero = the class
+  /// tracks *sub-parts* of the entity, each with its own independent
+  /// range history under one shared tk datum — e.g. an investment
+  /// account's holdings: entity = account, sub_key = investment id
+  /// (16), value = amount held. Fixed-width so it can prefix the
+  /// B+Tree key.
+  pub sub_key_width: u16,
 }
 ```
+
+**Sub-parts, not just entities.** The tracked attribute frequently
+belongs to a sub-part of an entity — (account, investment) →
+amount-held-over-time, one independent history per investment. Folding
+the sub-part into the entity id instead (a derived id per
+(account, investment)) was rejected: it scatters one account's
+histories across the ring as separate datums/files, and "what did the
+account hold at time t" degenerates into N queries — a 1+N. With a
+sub-key prefix, all of a parent's sub-part histories live in one tk
+datum on one owning thread, and a whole-parent snapshot is a single
+ordered walk.
 
 Registered one-kind-per-class as registry kind `tk:{name}` via
 `register_tk_class(registry, def, data_dir, clock)` — the same
@@ -71,9 +90,15 @@ thread/node that owns any of the class's entities.
 
 Per entity, a counted B+Tree (`seisin-storage`):
 
-- **Key (8 bytes):** the range's `lower` timestamp — i64 milliseconds
-  since the Unix epoch, encoded with the existing order-preserving
-  sign-flip big-endian transform (pre-1970 backdates order correctly).
+- **Key (`sub_key_width + 8` bytes):** the sub-key prefix (empty for
+  `sub_key_width = 0` classes) ++ the range's `lower` timestamp — i64
+  milliseconds since the Unix epoch, encoded with the existing
+  order-preserving sign-flip big-endian transform (pre-1970 backdates
+  order correctly). Byte-lex order therefore groups by sub-part first,
+  time second: per-sub-key floor probes and contiguous per-sub-key
+  scans both fall out of the composite key, and a covering-range check
+  simply verifies the floor entry's sub-key prefix matches the probe's
+  (a floor landing in the previous sub-part's entries is "no cover").
 - **Value (fixed `1 + 8 + 2 + value_width` bytes):**
   `upper_flag (0 = open-ended, 1 = bounded) ++ upper (8, same
   transform; zeroes when open) ++ value_len (u16 LE) ++ encoded value
@@ -130,10 +155,16 @@ pub struct SystemWallClock;   // SystemTime-based
 `apply` is rejected, exactly like lb — tk is not on the framework-diff
 rail.
 
-**`Set { as_of: Option<i64>, value: Vec<u8> }`** (value = pre-encoded
-`FieldValue` bytes; the paired client encodes via the class's
-`value_type`): resolve `as_of`; validate the value decodes as
-`value_type` and fits `value_width`; then the correction-upsert:
+Every op and per-sub-part query carries `sub_key: Vec<u8>`, validated
+against the class's declared `sub_key_width` (empty for width-0
+classes). The correction-upsert and all floor/scan logic operate
+within that sub-key's prefix range only.
+
+**`Set { sub_key, as_of: Option<i64>, value: Vec<u8> }`** (value =
+pre-encoded `FieldValue` bytes; the paired client encodes via the
+class's `value_type`): resolve `as_of`; validate the sub-key width,
+that the value decodes as `value_type`, and that it fits
+`value_width`; then the correction-upsert:
 
 1. Floor-lookup at `as_of`.
 2. If a range covers `as_of` (`lower <= as_of` and open-ended or
@@ -143,27 +174,39 @@ rail.
    - else: close it (`upper = as_of`, an upsert on its own key) and
      insert the new entry `[as_of, old_upper)` — inheriting the closed
      range's old upper keeps non-overlap by construction.
-3. If nothing covers `as_of` (a gap, or before the first entry): the
-   new entry's upper is the *next* entry's lower (the entry at
-   floor-rank + 1, or rank 0 when there is no floor), or open-ended if
-   none — a gap-fill never overlaps its successor.
+3. If nothing covers `as_of` (a gap, or before the first entry of
+   this sub-key): the new entry's upper is the *next* entry's lower
+   **within the same sub-key** (the successor entry at floor-rank + 1,
+   or rank 0 when there is no floor, checked for a matching sub-key
+   prefix), or open-ended if the sub-key has no successor — a gap-fill
+   never overlaps its successor, and never leaks across sub-parts.
 
 Returns the resulting span.
 
-**`Clear { as_of: Option<i64> }`**: close the covering range at
-`as_of` (no insertion — creates a gap, which this design allows by
+**`Clear { sub_key, as_of: Option<i64> }`**: close the covering range
+at `as_of` (no insertion — creates a gap, which this design allows by
 default per the guideline's base case; a no-gaps opt-in invariant is
 deferred). Clearing inside an existing gap is a no-op. Returns the
 closed span, or nothing.
 
 **Queries** (read-only, via the `query` method):
-`AsOf(t)` — the covering span, if any; `Current` — the last span if
-open-ended, else nothing; `History` — all spans ascending;
-`Range { from, to }` — every span overlapping `[from, to)`, ascending.
+
+- Per sub-part: `AsOf { sub_key, t }` — the covering span, if any;
+  `Current { sub_key }` — the sub-key's last span if open-ended, else
+  nothing; `History { sub_key }` — that sub-key's spans ascending;
+  `Range { sub_key, from, to }` — that sub-key's spans overlapping
+  `[from, to)`, ascending.
+- Whole-parent: `SnapshotAt { t }` — for every sub-key present, its
+  covering span at `t`, if any (ascending by sub-key). This is "what
+  did the account hold at time t" in one call: an ordered walk of the
+  tree, taking at most one span per sub-key. For a width-0 class it
+  degenerates to `AsOf`. (`t` = now gives current holdings.)
+
 All return `Vec<TkSpan>`:
 
 ```rust
 pub struct TkSpan {
+  pub sub_key: Vec<u8>,   // empty for sub_key_width = 0 classes
   pub lower: i64,
   pub upper: Option<i64>, // None = open-ended
   pub value: Vec<u8>,     // schema-encoded FieldValue bytes
@@ -199,7 +242,12 @@ is deliberately no rebuild-from-scan recovery story.
   keys, before the first key, after the last, on a multi-level tree,
   and after removes (extending the existing model-based pattern).
 - tk unit tests: forward set on empty; forward set closing the open
-  range; backdated correction splitting a past closed range;
+  range; **sub-key isolation** (two sub-keys' histories under one
+  entity never interact: a gap-fill in one never inherits a bound from
+  the other, floors never cover across the prefix boundary);
+  `SnapshotAt` returning one covering span per sub-key and skipping
+  sub-keys in a gap at `t`; wrong-width sub-keys rejected;
+  backdated correction splitting a past closed range;
   same-instant overwrite (bounds unchanged); Clear creating a gap and
   `AsOf` inside the gap returning nothing; gap-fill inheriting the
   successor's lower; set before the first entry; value-too-wide and
