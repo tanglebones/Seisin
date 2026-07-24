@@ -628,6 +628,92 @@ impl BPlusTree {
       }
     }
   }
+
+  /// 0-based ascending rank of `key` (None if absent) — the mirror of
+  /// `entry_at_rank`: descend toward the key, accumulating the counts
+  /// of every subtree passed on the left, then add the position inside
+  /// the leaf.
+  pub fn rank_of_key(&mut self, key: &[u8]) -> Result<Option<u64>> {
+    if key.len() != self.key_size as usize {
+      bail!(
+        "key must be exactly {} bytes, got {}",
+        self.key_size,
+        key.len()
+      );
+    }
+    let mut page_id = self.root_page_id;
+    let mut passed: u64 = 0;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => {
+          let node = decode_leaf(&bytes, self.key_size, self.value_size)?;
+          return Ok(
+            node
+              .entries
+              .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+              .ok()
+              .map(|i| passed + i as u64),
+          );
+        }
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          let mut next = node.rightmost_child;
+          for (separator, child, count) in &node.entries {
+            if key < separator.as_slice() {
+              next = *child;
+              break;
+            }
+            passed += count;
+          }
+          page_id = next;
+        }
+      }
+    }
+  }
+
+  /// Up to `n` entries starting at ascending rank `rank`: one counted
+  /// descent to the holding leaf, then a sibling-link walk — no
+  /// per-entry descents, so a neighbors window costs one descent total.
+  pub fn scan_from_rank(&mut self, rank: u64, n: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if n == 0 || rank >= self.total_count {
+      return Ok(Vec::new());
+    }
+    let mut remaining_rank = rank as usize;
+    let mut page_id = self.root_page_id;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => break,
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          let mut next = node.rightmost_child;
+          for (_, child, count) in &node.entries {
+            let count = *count as usize;
+            if remaining_rank < count {
+              next = *child;
+              break;
+            }
+            remaining_rank -= count;
+          }
+          page_id = next;
+        }
+      }
+    }
+    let mut results = Vec::with_capacity(n);
+    while page_id != NULL_PAGE && results.len() < n {
+      let node = self.read_leaf(page_id)?;
+      for entry in node.entries.iter().skip(remaining_rank) {
+        if results.len() >= n {
+          break;
+        }
+        results.push(entry.clone());
+      }
+      remaining_rank = 0;
+      page_id = node.next;
+    }
+    Ok(results)
+  }
 }
 
 #[cfg(test)]
@@ -1067,6 +1153,69 @@ mod tests {
       tree.scan_backward_bounded(1).unwrap()[0].0,
       299u64.to_be_bytes().to_vec()
     );
+  }
+
+  #[test]
+  fn rank_of_key_matches_insertion_order_and_misses_return_none() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in 0..300u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    assert_eq!(tree.rank_of_key(&0u64.to_be_bytes()).unwrap(), Some(0));
+    assert_eq!(tree.rank_of_key(&157u64.to_be_bytes()).unwrap(), Some(157));
+    assert_eq!(tree.rank_of_key(&299u64.to_be_bytes()).unwrap(), Some(299));
+    assert_eq!(tree.rank_of_key(&999u64.to_be_bytes()).unwrap(), None);
+  }
+
+  #[test]
+  fn rank_of_key_stays_correct_after_removes_and_across_levels() {
+    let tmp = NamedTempFile::new().unwrap();
+    // key/value_size 1000 on 4096-byte pages: multi-level tree cheaply.
+    let mut tree = BPlusTree::create(tmp.path(), 1000, 1000, 4096).unwrap();
+    let make = |i: u64| {
+      let mut k = vec![0u8; 1000];
+      k[0..8].copy_from_slice(&i.to_be_bytes());
+      k
+    };
+    for i in 0..60u64 {
+      tree.insert(&make(i), &make(i)).unwrap();
+    }
+    for i in (0..60u64).step_by(3) {
+      assert!(tree.remove(&make(i)).unwrap());
+    }
+    let remaining: Vec<u64> = (0..60u64).filter(|i| i % 3 != 0).collect();
+    for (rank, i) in remaining.iter().enumerate() {
+      assert_eq!(tree.rank_of_key(&make(*i)).unwrap(), Some(rank as u64));
+    }
+    assert_eq!(tree.rank_of_key(&make(0)).unwrap(), None); // removed
+  }
+
+  #[test]
+  fn scan_from_rank_returns_entries_from_that_rank_crossing_leaves() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    // 300 entries, max_leaf_entries=254 — rank 250..260 crosses a leaf link.
+    for i in 0..300u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    let window = tree.scan_from_rank(250, 10).unwrap();
+    assert_eq!(window.len(), 10);
+    for (offset, (key, _)) in window.iter().enumerate() {
+      assert_eq!(key, &(250 + offset as u64).to_be_bytes().to_vec());
+    }
+  }
+
+  #[test]
+  fn scan_from_rank_clamps_at_the_end_and_returns_nothing_past_it() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in 0..10u64 {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    assert_eq!(tree.scan_from_rank(7, 100).unwrap().len(), 3);
+    assert_eq!(tree.scan_from_rank(10, 5).unwrap(), vec![]);
+    assert_eq!(tree.scan_from_rank(0, 0).unwrap(), vec![]);
   }
 
   #[test]
