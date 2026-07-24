@@ -22,6 +22,11 @@ use crate::tk::{decode_ts, encode_ts, tk_kind_name, TkClassDef, WallClock};
 
 const TK_PAGE_SIZE: u32 = 4096;
 
+/// A raw `(key, value)` tree entry.
+type TreeEntry = (Vec<u8>, Vec<u8>);
+/// A tree entry with its ascending rank — what `raw_floor` returns.
+type RankedEntry = (u64, Vec<u8>, Vec<u8>);
+
 pub struct TkIndexKind {
   def: TkClassDef,
   data_dir: PathBuf,
@@ -103,7 +108,7 @@ impl TkResidentHistory {
     &self,
     tree: &mut BPlusTree,
     rank: u64,
-  ) -> Result<Option<(Vec<u8>, Vec<u8>)>, String> {
+  ) -> Result<Option<TreeEntry>, String> {
     Ok(
       tree
         .scan_from_rank(rank, 1)
@@ -122,7 +127,7 @@ impl TkResidentHistory {
     tree: &mut BPlusTree,
     sub_key: &[u8],
     t: i64,
-  ) -> Result<Option<(u64, Vec<u8>, Vec<u8>)>, String> {
+  ) -> Result<Option<RankedEntry>, String> {
     let probe = self.composite(sub_key, t);
     match tree.rank_of_floor(&probe).map_err(|e| e.to_string())? {
       None => Ok(None),
