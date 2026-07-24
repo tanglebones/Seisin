@@ -85,6 +85,10 @@ impl WorkerPool {
         seisin_protocol::Request::LbQuery { .. } => return,
         seisin_protocol::Request::TkExecute { .. } => return,
         seisin_protocol::Request::TkQuery { .. } => return,
+        // Temporary until the ExistsCheck worker message exists (next
+        // task): treat as unroutable. FkPending stays client-only.
+        seisin_protocol::Request::ExistsCheck { .. } => return,
+        seisin_protocol::Request::FkPending { .. } => return,
         seisin_protocol::Request::IndexUpdate {
           target,
           op_id,

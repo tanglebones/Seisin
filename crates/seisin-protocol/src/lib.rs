@@ -95,6 +95,34 @@ pub enum Request {
     class: String,
     query: TkQueryReq,
   },
+  /// Does `datum_id` currently have stored content? Node-to-node
+  /// (the FK write path's dispatched check) AND client-facing (the FK
+  /// scan driver's re-probe) — routed with the usual redirect when a
+  /// client sends it.
+  ExistsCheck { datum_id: DatumId },
+  /// FK pending-reference tracking ops — client-facing only (the scan
+  /// driver's surface). Write-path inserts arrive as ordinary
+  /// `IndexUpdate`s to the "fk_pending" kind, never via this request.
+  FkPending {
+    pending_datum_id: DatumId,
+    op: FkPendingOp,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FkPendingOp {
+  List,
+  Remove {
+    referencing_pk: DatumId,
+    target: DatumId,
+  },
+  /// Apply-payload only (the write path's IndexUpdate body) — never
+  /// accepted on the `Request::FkPending` wire; `server.rs` maps only
+  /// List/Remove.
+  Insert {
+    referencing_pk: DatumId,
+    target: DatumId,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +272,11 @@ pub enum Response {
   LbResult(LbResult),
   /// Reply to `TkExecute`/`TkQuery`.
   TkResult(TkResult),
+  /// Reply to `ExistsCheck`.
+  Exists { exists: bool },
+  /// Reply to `FkPending`: the (referencing_pk, missing_target)
+  /// entries — the full list for `List`, the remainder for `Remove`.
+  FkPendingResult { entries: Vec<(DatumId, DatumId)> },
 }
 
 /// The wire protocol version, carried as the first byte of every
@@ -292,6 +325,13 @@ const TK_Q_HISTORY: u8 = 2;
 const TK_Q_RANGE: u8 = 3;
 const TK_Q_SNAPSHOT_AT: u8 = 4;
 
+const OP_EXISTS_CHECK: u8 = 11;
+const OP_FK_PENDING: u8 = 12;
+
+const FK_PENDING_LIST: u8 = 0;
+const FK_PENDING_REMOVE: u8 = 1;
+const FK_PENDING_INSERT: u8 = 2;
+
 const RK_QUERY_TOP_N: u8 = 0;
 const RK_QUERY_BOTTOM_N: u8 = 1;
 const RK_QUERY_PERCENTILE_SAMPLE: u8 = 2;
@@ -306,6 +346,8 @@ const RESP_INDEX_UPDATE_RESULT: u8 = 6;
 const RESP_RK_QUERY_RESULT: u8 = 7;
 const RESP_LB_RESULT: u8 = 8;
 const RESP_TK_RESULT: u8 = 9;
+const RESP_EXISTS: u8 = 10;
+const RESP_FK_PENDING_RESULT: u8 = 11;
 
 const ID_LEN: usize = 16;
 
@@ -411,6 +453,18 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       put_bytes(&mut buf, class.as_bytes());
       buf.extend_from_slice(&encode_tk_query_req(query));
     }
+    Request::ExistsCheck { datum_id } => {
+      buf.push(OP_EXISTS_CHECK);
+      buf.extend_from_slice(&datum_id.as_bytes());
+    }
+    Request::FkPending {
+      pending_datum_id,
+      op,
+    } => {
+      buf.push(OP_FK_PENDING);
+      buf.extend_from_slice(&pending_datum_id.as_bytes());
+      buf.extend_from_slice(&encode_fk_pending_op(op));
+    }
   }
   buf
 }
@@ -431,6 +485,27 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_LB_QUERY => decode_lb_query_request(buf),
     OP_TK_EXECUTE => decode_tk_execute_request(buf),
     OP_TK_QUERY => decode_tk_query_request(buf),
+    OP_EXISTS_CHECK => {
+      if buf.len() != 1 + ID_LEN {
+        bail!(
+          "exists check request has the wrong length: expected {} bytes, got {}",
+          1 + ID_LEN,
+          buf.len()
+        );
+      }
+      Ok(Request::ExistsCheck {
+        datum_id: DatumId::from_bytes(buf[1..1 + ID_LEN].try_into().unwrap()),
+      })
+    }
+    OP_FK_PENDING => {
+      let mut offset = 1;
+      let pending_datum_id = take_id(buf, &mut offset)?;
+      let op = decode_fk_pending_op(&buf[offset..])?;
+      Ok(Request::FkPending {
+        pending_datum_id,
+        op,
+      })
+    }
     op => bail!("unknown request opcode: {op}"),
   }
 }
@@ -1069,6 +1144,75 @@ pub fn decode_tk_result(buf: &[u8]) -> Result<TkResult> {
   Ok(TkResult { spans })
 }
 
+pub fn encode_fk_pending_op(op: &FkPendingOp) -> Vec<u8> {
+  let mut buf = Vec::new();
+  match op {
+    FkPendingOp::List => buf.push(FK_PENDING_LIST),
+    FkPendingOp::Remove {
+      referencing_pk,
+      target,
+    } => {
+      buf.push(FK_PENDING_REMOVE);
+      put_id(&mut buf, *referencing_pk);
+      put_id(&mut buf, *target);
+    }
+    FkPendingOp::Insert {
+      referencing_pk,
+      target,
+    } => {
+      buf.push(FK_PENDING_INSERT);
+      put_id(&mut buf, *referencing_pk);
+      put_id(&mut buf, *target);
+    }
+  }
+  buf
+}
+
+pub fn decode_fk_pending_op(buf: &[u8]) -> Result<FkPendingOp> {
+  if buf.is_empty() {
+    bail!("empty fk pending op");
+  }
+  let mut offset = 1;
+  let op = match buf[0] {
+    FK_PENDING_LIST => FkPendingOp::List,
+    FK_PENDING_REMOVE => FkPendingOp::Remove {
+      referencing_pk: take_id(buf, &mut offset)?,
+      target: take_id(buf, &mut offset)?,
+    },
+    FK_PENDING_INSERT => FkPendingOp::Insert {
+      referencing_pk: take_id(buf, &mut offset)?,
+      target: take_id(buf, &mut offset)?,
+    },
+    tag => bail!("unknown fk pending op tag: {tag}"),
+  };
+  if offset != buf.len() {
+    bail!("fk pending op has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(op)
+}
+
+pub fn encode_fk_entries(entries: &[(DatumId, DatumId)]) -> Vec<u8> {
+  let mut buf = (entries.len() as u32).to_le_bytes().to_vec();
+  for (referencing_pk, target) in entries {
+    put_id(&mut buf, *referencing_pk);
+    put_id(&mut buf, *target);
+  }
+  buf
+}
+
+pub fn decode_fk_entries(buf: &[u8]) -> Result<Vec<(DatumId, DatumId)>> {
+  let mut offset = 0;
+  let count = take_u32(buf, &mut offset)? as usize;
+  let mut entries = Vec::with_capacity(count);
+  for _ in 0..count {
+    entries.push((take_id(buf, &mut offset)?, take_id(buf, &mut offset)?));
+  }
+  if offset != buf.len() {
+    bail!("fk entries have {} trailing bytes", buf.len() - offset);
+  }
+  Ok(entries)
+}
+
 pub fn encode_lb_result(result: &LbResult) -> Vec<u8> {
   let mut buf = result.total.to_le_bytes().to_vec();
   match result.player_rank {
@@ -1171,6 +1315,14 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
       buf.push(RESP_TK_RESULT);
       buf.extend_from_slice(&encode_tk_result(result));
     }
+    Response::Exists { exists } => {
+      buf.push(RESP_EXISTS);
+      buf.push(u8::from(*exists));
+    }
+    Response::FkPendingResult { entries } => {
+      buf.push(RESP_FK_PENDING_RESULT);
+      buf.extend_from_slice(&encode_fk_entries(entries));
+    }
   }
   buf
 }
@@ -1229,6 +1381,19 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
     }),
     RESP_LB_RESULT => Ok(Response::LbResult(decode_lb_result(&buf[1..])?)),
     RESP_TK_RESULT => Ok(Response::TkResult(decode_tk_result(&buf[1..])?)),
+    RESP_EXISTS => {
+      if buf.len() != 2 {
+        bail!("exists response has the wrong length: {} bytes", buf.len());
+      }
+      match buf[1] {
+        0 => Ok(Response::Exists { exists: false }),
+        1 => Ok(Response::Exists { exists: true }),
+        flag => bail!("unknown exists flag: {flag}"),
+      }
+    }
+    RESP_FK_PENDING_RESULT => Ok(Response::FkPendingResult {
+      entries: decode_fk_entries(&buf[1..])?,
+    }),
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -1552,6 +1717,52 @@ mod tests {
     let mut buf = encode_tk_result(&sample_tk_result());
     buf.truncate(buf.len() - 1);
     assert!(decode_tk_result(&buf).is_err());
+  }
+
+  #[test]
+  fn round_trips_exists_check_and_exists_responses() {
+    let req = Request::ExistsCheck {
+      datum_id: DatumId::new(),
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    for exists in [true, false] {
+      let resp = Response::Exists { exists };
+      assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+    }
+  }
+
+  #[test]
+  fn round_trips_fk_pending_requests_and_results() {
+    for op in [
+      FkPendingOp::List,
+      FkPendingOp::Remove {
+        referencing_pk: DatumId::new(),
+        target: DatumId::new(),
+      },
+      FkPendingOp::Insert {
+        referencing_pk: DatumId::new(),
+        target: DatumId::new(),
+      },
+    ] {
+      let req = Request::FkPending {
+        pending_datum_id: DatumId::new(),
+        op: op.clone(),
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+    for entries in [vec![], vec![(DatumId::new(), DatumId::new())]] {
+      let resp = Response::FkPendingResult {
+        entries: entries.clone(),
+      };
+      assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+    }
+  }
+
+  #[test]
+  fn fk_entries_codec_rejects_a_truncated_buffer() {
+    let mut buf = encode_fk_entries(&[(DatumId::new(), DatumId::new())]);
+    buf.truncate(buf.len() - 1);
+    assert!(decode_fk_entries(&buf).is_err());
   }
 
   #[test]
