@@ -112,6 +112,17 @@ pub(crate) enum WorkerMessage {
     query: Vec<u8>,
     reply: Sender<Result<Vec<u8>, String>>,
   },
+  /// A solution-called, mutating op against the index/structured datum
+  /// `target`, answered synchronously by its owning thread — the
+  /// mutate-with-result sibling of `IndexQuery`. No collation, no op
+  /// record: single-datum atomicity comes from serial message
+  /// processing on the owning thread.
+  IndexExecute {
+    target: DatumId,
+    index_kind: String,
+    payload: Vec<u8>,
+    reply: Sender<Result<Vec<u8>, String>>,
+  },
 }
 
 /// Where an `Acquire`'s eventual grant should be delivered — a local
@@ -510,6 +521,25 @@ impl WorkerHandle {
             };
             let _ = reply.send(result);
           }
+          WorkerMessage::IndexExecute {
+            target,
+            index_kind,
+            payload,
+            reply,
+          } => {
+            let resident = match resident_indexes.entry(target) {
+              std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+              std::collections::hash_map::Entry::Vacant(vacancy) => index_kinds
+                .get(&index_kind)
+                .and_then(|kind| kind.open(target, cache.get(target)))
+                .map(|resident| vacancy.insert(resident)),
+            };
+            let result = match resident {
+              Ok(resident) => resident.execute(&payload),
+              Err(message) => Err(message),
+            };
+            let _ = reply.send(result);
+          }
           WorkerMessage::IndexUpdateReplied {
             op_id,
             target,
@@ -596,6 +626,27 @@ impl WorkerHandle {
         target,
         index_kind,
         query,
+        reply: reply_tx,
+      })
+      .expect("worker thread exited unexpectedly");
+    reply_rx.recv().expect("worker dropped the reply channel")
+  }
+
+  /// Sends a mutate-with-result op to this thread and blocks for the
+  /// answer — same synchronous shape as `run_index_query`.
+  pub fn run_index_execute(
+    &self,
+    target: DatumId,
+    index_kind: String,
+    payload: Vec<u8>,
+  ) -> Result<Vec<u8>, String> {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    self
+      .sender
+      .send(WorkerMessage::IndexExecute {
+        target,
+        index_kind,
+        payload,
         reply: reply_tx,
       })
       .expect("worker thread exited unexpectedly");
@@ -996,6 +1047,12 @@ mod tests {
       // through the worker rather than being fabricated.
       Ok(query.iter().map(u8::to_ascii_uppercase).collect())
     }
+
+    fn execute(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+      // Reverse — distinct from query's uppercase, so a test can tell
+      // which method actually ran.
+      Ok(payload.iter().rev().copied().collect())
+    }
   }
 
   impl crate::index_handler::IndexKind for FixedOutcomeKind {
@@ -1199,6 +1256,39 @@ mod tests {
     assert!(handles[0]
       .run_index_query(DatumId::new(), "nope".to_string(), vec![])
       .is_err());
+  }
+
+  #[test]
+  fn run_index_execute_reaches_the_resident_index_and_returns_its_result() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register("echo", Box::new(FixedOutcomeKind { violation: None }));
+    let handles = spawn_test_pool_with_index_kinds(1, ring, OpRegistry::new(), index_kinds);
+    let result = handles[0].run_index_execute(DatumId::new(), "echo".to_string(), b"abc".to_vec());
+    assert_eq!(result, Ok(b"cba".to_vec()));
+  }
+
+  #[test]
+  fn run_index_execute_on_an_unregistered_kind_is_an_error() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let handles = spawn_test_pool(1, ring, OpRegistry::new());
+    assert!(handles[0]
+      .run_index_execute(DatumId::new(), "nope".to_string(), vec![])
+      .is_err());
+  }
+
+  #[test]
+  fn execute_then_query_hit_the_same_resident_instance() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register("echo", Box::new(FixedOutcomeKind { violation: None }));
+    let handles = spawn_test_pool_with_index_kinds(1, ring, OpRegistry::new(), index_kinds);
+    let target = DatumId::new();
+    assert!(handles[0]
+      .run_index_execute(target, "echo".to_string(), b"x".to_vec())
+      .is_ok());
+    let result = handles[0].run_index_query(target, "echo".to_string(), b"q".to_vec());
+    assert_eq!(result, Ok(b"Q".to_vec()));
   }
 
   #[test]
