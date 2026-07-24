@@ -672,6 +672,61 @@ impl BPlusTree {
     }
   }
 
+  /// 0-based ascending rank of the greatest key `<=` the probe (`None`
+  /// if every key is greater, or the tree is empty). Same counted
+  /// descent as `rank_of_key`; at the leaf, a missed binary search
+  /// steps back to the predecessor — including across a leaf boundary
+  /// (`Err(0)` with passed subtrees on the left means the floor is the
+  /// last entry of the preceding subtree; separators are bounds, not
+  /// necessarily present keys, especially after removes).
+  pub fn rank_of_floor(&mut self, key: &[u8]) -> Result<Option<u64>> {
+    if key.len() != self.key_size as usize {
+      bail!(
+        "key must be exactly {} bytes, got {}",
+        self.key_size,
+        key.len()
+      );
+    }
+    let mut page_id = self.root_page_id;
+    let mut passed: u64 = 0;
+    loop {
+      let bytes = self.store.read_page(page_id)?;
+      match page_type(&bytes)? {
+        PageType::Leaf => {
+          let node = decode_leaf(&bytes, self.key_size, self.value_size)?;
+          return Ok(
+            match node
+              .entries
+              .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+            {
+              Ok(i) => Some(passed + i as u64),
+              Err(0) => {
+                if passed == 0 {
+                  None
+                } else {
+                  Some(passed - 1)
+                }
+              }
+              Err(i) => Some(passed + i as u64 - 1),
+            },
+          );
+        }
+        PageType::Internal => {
+          let node = decode_internal(&bytes, self.key_size)?;
+          let mut next = node.rightmost_child;
+          for (separator, child, count) in &node.entries {
+            if key < separator.as_slice() {
+              next = *child;
+              break;
+            }
+            passed += count;
+          }
+          page_id = next;
+        }
+      }
+    }
+  }
+
   /// Up to `n` entries starting at ascending rank `rank`: one counted
   /// descent to the holding leaf, then a sibling-link walk — no
   /// per-entry descents, so a neighbors window costs one descent total.
@@ -1189,6 +1244,59 @@ mod tests {
       assert_eq!(tree.rank_of_key(&make(*i)).unwrap(), Some(rank as u64));
     }
     assert_eq!(tree.rank_of_key(&make(0)).unwrap(), None); // removed
+  }
+
+  #[test]
+  fn rank_of_floor_finds_exact_keys_predecessors_and_none_before_first() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    for i in (0..300u64).step_by(2) {
+      tree.insert(&i.to_be_bytes(), &i.to_be_bytes()).unwrap();
+    }
+    // exact hit: key 100 is the 51st even number (rank 50)
+    assert_eq!(tree.rank_of_floor(&100u64.to_be_bytes()).unwrap(), Some(50));
+    // between keys: floor(101) = 100
+    assert_eq!(tree.rank_of_floor(&101u64.to_be_bytes()).unwrap(), Some(50));
+    // after last: floor = last entry (298, rank 149)
+    assert_eq!(
+      tree.rank_of_floor(&999u64.to_be_bytes()).unwrap(),
+      Some(149)
+    );
+    // smallest key is its own floor
+    assert_eq!(tree.rank_of_floor(&0u64.to_be_bytes()).unwrap(), Some(0));
+    // before the first key: none
+    let tmp2 = NamedTempFile::new().unwrap();
+    let mut tree2 = BPlusTree::create(tmp2.path(), 8, 8, 4096).unwrap();
+    tree2.insert(&10u64.to_be_bytes(), &[0; 8]).unwrap();
+    assert_eq!(tree2.rank_of_floor(&5u64.to_be_bytes()).unwrap(), None);
+  }
+
+  #[test]
+  fn rank_of_floor_stays_correct_across_levels_and_after_removes() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 1000, 1000, 4096).unwrap();
+    let make = |i: u64| {
+      let mut k = vec![0u8; 1000];
+      k[0..8].copy_from_slice(&i.to_be_bytes());
+      k
+    };
+    for i in (0..120u64).step_by(2) {
+      tree.insert(&make(i), &make(i)).unwrap();
+    }
+    for i in (0..120u64).step_by(4) {
+      assert!(tree.remove(&make(i)).unwrap()); // keep i % 4 == 2
+    }
+    // Remaining: 2, 6, 10, ... floor(11) = 10 at rank 2.
+    assert_eq!(tree.rank_of_floor(&make(11)).unwrap(), Some(2));
+    assert_eq!(tree.rank_of_floor(&make(1)).unwrap(), None);
+  }
+
+  #[test]
+  fn rank_of_floor_on_an_empty_tree_is_none_and_wrong_size_errors() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut tree = BPlusTree::create(tmp.path(), 8, 8, 4096).unwrap();
+    assert_eq!(tree.rank_of_floor(&1u64.to_be_bytes()).unwrap(), None);
+    assert!(tree.rank_of_floor(&[1u8; 4]).is_err());
   }
 
   #[test]
