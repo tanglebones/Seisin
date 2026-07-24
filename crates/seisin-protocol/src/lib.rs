@@ -332,8 +332,8 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
 fn decode_lb_execute_request(buf: &[u8]) -> Result<Request> {
   let mut offset = 1;
   let board_id = take_id(buf, &mut offset)?;
-  let class = String::from_utf8(take_bytes(buf, &mut offset)?)
-    .context("lb class was not valid utf8")?;
+  let class =
+    String::from_utf8(take_bytes(buf, &mut offset)?).context("lb class was not valid utf8")?;
   let op = decode_lb_execute_op(&buf[offset..])?;
   Ok(Request::LbExecute {
     board_id,
@@ -345,8 +345,8 @@ fn decode_lb_execute_request(buf: &[u8]) -> Result<Request> {
 fn decode_lb_query_request(buf: &[u8]) -> Result<Request> {
   let mut offset = 1;
   let board_id = take_id(buf, &mut offset)?;
-  let class = String::from_utf8(take_bytes(buf, &mut offset)?)
-    .context("lb class was not valid utf8")?;
+  let class =
+    String::from_utf8(take_bytes(buf, &mut offset)?).context("lb class was not valid utf8")?;
   let query = decode_lb_query_req(&buf[offset..])?;
   Ok(Request::LbQuery {
     board_id,

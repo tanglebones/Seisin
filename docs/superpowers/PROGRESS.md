@@ -386,7 +386,52 @@ commit and push immediately, since work sessions may end abruptly.
   the spec: conditional/ratchet updates, rank-in-write-response,
   sharding, placement wiring, page-size auto-detection.
 
-As of this entry: 10 crates, 308 tests passing, `cargo fmt --check` and
+- **lb (leaderboard) datum class.** Per
+  `specs/2026-07-23-lb-datum-class-design.md` and
+  `plans/2026-07-24-lb-datum-class.md`. The third class on the
+  `ResidentIndex` rail: a structured ranked-set datum class —
+  **primary data** with solution-called ops, not a derived index (an
+  lb write is not a side effect of any datum field; the write *is* the
+  op). Framework extension: `ResidentIndex::execute` (mutate-with-
+  result, default-erroring) + `WorkerMessage::IndexExecute` +
+  `WorkerHandle`/`WorkerPool::run_index_execute`, mirroring the query
+  path — single-datum atomicity from serial message processing, no
+  collation. This is the rail tk (Part 4) will reuse for corrections.
+  Engine additions: `BPlusTree::rank_of_key` (counted descent, the
+  mirror of `entry_at_rank`) and `scan_from_rank` (one descent + a
+  sibling walk). lb itself: `LbClassDef { name, score_type,
+  display_len, rule: Max|Min|Replace }` registered one-kind-per-class
+  as `lb:{name}` (how `open` learns the class from just a `DatumId`);
+  board identity `lb:{class}:{leaderboard_id}:{area_config_id}` with
+  all board-level attributes normalized into the datum id — entries
+  are exactly `rank_key(8) ++ player_id(16) -> u16-length-prefixed
+  fixed-width display`; per-board resident state is the B+Tree handle
+  plus a player->rank-key map rebuilt by one O(n) scan on cold open
+  (derivable, never persisted). Ops: `update_lb` (declared rule
+  applied on the owning thread via raw rank-key byte comparison —
+  valid because the encoding is order-preserving — then one response
+  bundling total, exact best-first rank, top list with covering
+  display, a neighbors window via `scan_from_rank`, and friend ranks;
+  no 1+N fetches anywhere), `remove_lb`, and read-only `LbQuery`
+  (adds bottom lists; used by spectators and the client n+k
+  oversampling/reload contract — no cursors, no push). Wire:
+  `Request::LbExecute`/`LbQuery` + `Response::LbResult` with
+  standalone codecs in `seisin-protocol`; `server.rs` routes both like
+  `RkQuery` via a newly factored `redirect_if_foreign` shared with rk.
+  Registration is composition-root-only (`register_lb_class`), same as
+  rk. Proven end-to-end by `integration_lb_boards.rs`: two independent
+  boards over the real wire — top ordering with covering displays,
+  Max-rule rejection of a worse score, friend ranks (with absent
+  friends omitted), bottom lists via query, and removal; stress-run
+  10x plus the standing 20x wound-wait/collation suites, no flakiness.
+  Deferred per the spec: elo (needs opponent context), tie-policy
+  upgrades, bottom-in-update-response, board wipe (seasons are new
+  board ids), push notification (the oversampling contract exists to
+  avoid it), and variable-length display — TOAST-style inline+overflow
+  storage is recorded in the spec as a named Storage Tier requirement
+  (with its free-list consequence).
+
+As of this entry: 10 crates, 336 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
