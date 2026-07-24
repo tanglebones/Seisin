@@ -117,13 +117,26 @@ pub enum TkOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TkQueryReq {
-  AsOf { sub_key: Vec<u8>, t: i64 },
-  Current { sub_key: Vec<u8> },
-  History { sub_key: Vec<u8> },
-  Range { sub_key: Vec<u8>, from: i64, to: i64 },
+  AsOf {
+    sub_key: Vec<u8>,
+    t: i64,
+  },
+  Current {
+    sub_key: Vec<u8>,
+  },
+  History {
+    sub_key: Vec<u8>,
+  },
+  Range {
+    sub_key: Vec<u8>,
+    from: i64,
+    to: i64,
+  },
   /// For every sub-key present, its covering span at `t`, if any —
   /// "what did the whole entity hold at time t" in one call.
-  SnapshotAt { t: i64 },
+  SnapshotAt {
+    t: i64,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

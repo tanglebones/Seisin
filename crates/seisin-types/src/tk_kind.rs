@@ -104,11 +104,7 @@ impl TkResidentHistory {
     }
   }
 
-  fn entry_at(
-    &self,
-    tree: &mut BPlusTree,
-    rank: u64,
-  ) -> Result<Option<TreeEntry>, String> {
+  fn entry_at(&self, tree: &mut BPlusTree, rank: u64) -> Result<Option<TreeEntry>, String> {
     Ok(
       tree
         .scan_from_rank(rank, 1)

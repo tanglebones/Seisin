@@ -431,7 +431,47 @@ commit and push immediately, since work sessions may end abruptly.
   storage is recorded in the spec as a named Storage Tier requirement
   (with its free-list consequence).
 
-As of this entry: 10 crates, 336 tests passing, `cargo fmt --check` and
+- **Datum Type System, Part 4 — tk (bitemporal valid-time) datum
+  class.** Per `specs/2026-07-24-tk-datum-class-design.md` and
+  `plans/2026-07-24-tk-datum-class.md`. The fourth resident-rail
+  class: decomposed field storage — primary data (values exist
+  nowhere else; no rebuild-from-scan story), riding lb's
+  `execute`/`query` rail with explicit ops rather than
+  `TypedOpContext` diffing, because corrections need an explicit
+  `as_of` that field-diffing can't express. One counted-B+Tree file
+  per (class, entity), keyed `sub_key ++ ts(lower)` — the declared
+  `sub_key_width` (0 = plain per-entity) gives independent
+  non-overlapping histories per *sub-part* of an entity (the driving
+  example: entity = investment account, sub_key = investment id,
+  value = amount held), all in one file on one owning thread, with a
+  `SnapshotAt{t}` query answering "what did the whole entity hold at
+  time t" in a single ordered walk — no 1+N. Rejected layouts
+  documented as broken, not deferred: segment-blobs-as-datums (foreign
+  ownership) and one shared per-class file (concurrent multi-owner
+  writes). Residency is the open file handle only — B+Tree pages are
+  the lazily-loaded range segments, O(log n) page reads per op.
+  Engine addition: `BPlusTree::rank_of_floor` (counted descent;
+  `Err(0)`-with-passed-subtrees steps back across the leaf boundary).
+  Correction-upsert: covering-range close + inherit-old-upper insert;
+  same-instant set = in-place value correction; gap-fill bounded by
+  the sub-key's own successor (never leaks across sub-parts);
+  `Clear` closes without a successor (gaps allowed; clear at exact
+  lower removes the empty span). `as_of: Option<i64>` — `None`
+  server-stamped via a new `WallClock` seam (`SystemWallClock` +
+  test fakes; gossip's `ClockSource` is monotonic, wrong tool).
+  `value_width`/`sub_key_width` violations and mistyped values are
+  rejected loudly, never truncated. Wire:
+  `Request::TkExecute`/`TkQuery` + `Response::TkResult` with
+  standalone codecs, routed via the shared `redirect_if_foreign`.
+  Proven end-to-end by `integration_tk_history.rs` (two accounts, two
+  investments each, over the real wire: backdated correction,
+  snapshot before/after a Clear, range spanning a gap, server-stamped
+  write, oversized-value rejection), stress-run 10x plus the standing
+  20x wound-wait/collation suites, no flakiness. Deferred per spec:
+  TypedOpContext sugar, transaction-time audit, no-gaps opt-in,
+  TOAST for wide values, file consolidation (Storage Tier).
+
+As of this entry: 10 crates, 364 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -475,10 +515,12 @@ sub-project plans:
   `specs/2026-07-21-datum-type-system-design.md` (schema, pk/sk/rk/tk,
   uniqueness/relational constraint enforcement). Parts 1 (schema
   declaration & field encoding), 2 (sk index + uniqueness constraint),
-  and 3 (rk — counted-B+Tree leaderboard) are done — see "Done" above.
-  Parts 4 (tk — decomposed bitemporal valid-time field storage, per the
-  revised taxonomy in the design doc) and 5 (relational/FK constraint
-  enforcement) are separate, not-yet-started plans.
+  3 (rk — counted-B+Tree leaderboard), and 4 (tk — decomposed
+  bitemporal valid-time field storage, plus the lb leaderboard class
+  built between 3 and 4) are done — see "Done" above. Part 5
+  (relational/FK constraint enforcement) is the remaining
+  not-yet-started plan; after it, the original sequence resumes with
+  Sub-project 4 (Storage Tier).
 - **Framework/codegen shape.** Seisin's actual deliverable is base
   libraries a solution uses to define datum types + operations in code,
   compiling into a server executable and a paired client library. None
