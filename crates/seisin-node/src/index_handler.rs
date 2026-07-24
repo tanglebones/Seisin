@@ -48,6 +48,18 @@ pub trait ResidentIndex: Send {
     let _ = query;
     Err("this index kind supports no queries".to_string())
   }
+
+  /// A solution-called, mutating op against the resident structure,
+  /// returning result data — payload and result bytes are opaque to
+  /// the framework, exactly like `query`. Unlike `apply` (the
+  /// framework-diff rail with pass/violation semantics), `execute`
+  /// carries a data result; the owning thread's serial message
+  /// processing makes each call atomic. Kinds with no solution-called
+  /// ops (sk, rk) keep this default.
+  fn execute(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let _ = payload;
+    Err("this index kind supports no execute ops".to_string())
+  }
 }
 
 /// A registered index kind: knows how to build its resident structure
@@ -140,6 +152,19 @@ mod tests {
       .unwrap();
     let err = resident.query(b"anything").unwrap_err();
     assert!(err.contains("no queries"), "{err}");
+  }
+
+  #[test]
+  fn execute_default_impl_reports_the_kind_supports_no_execute_ops() {
+    let mut registry = IndexKindRegistry::new();
+    registry.register("append", Box::new(AppendKind));
+    let mut resident = registry
+      .get("append")
+      .unwrap()
+      .open(DatumId::new(), None)
+      .unwrap();
+    let err = resident.execute(b"anything").unwrap_err();
+    assert!(err.contains("no execute ops"), "{err}");
   }
 
   #[test]
