@@ -171,13 +171,6 @@ fn handle_op_request(
   }
 }
 
-/// Routes a client rk query: redirect if `index_datum_id` isn't native
-/// here (same check as `handle_op_request`), else answer synchronously
-/// from the owning thread's resident tree. The query kind is re-encoded
-/// to the protocol's standalone codec bytes because the worker treats
-/// query/result bytes as opaque (`ResidentIndex::query`) — the byte
-/// layout is defined once, in seisin-protocol, shared with the rk
-/// impl's decoder in seisin-types.
 /// `Some(response)` if `datum_id` isn't native here (a redirect, or an
 /// error if the native node's address is unknown); `None` when this
 /// node should serve the request itself.
@@ -201,6 +194,12 @@ fn redirect_if_foreign(
   })
 }
 
+/// Routes a client rk query: redirect if `index_datum_id` isn't native
+/// here, else answer synchronously from the owning thread's resident
+/// tree. The query kind is re-encoded to the protocol's standalone
+/// codec bytes because the worker treats query/result bytes as opaque
+/// (`ResidentIndex::query`) — the byte layout is defined once, in
+/// seisin-protocol, shared with the rk impl's decoder in seisin-types.
 fn handle_rk_query(
   self_node_id: NodeId,
   ring: &Arc<RwLock<Ring>>,
