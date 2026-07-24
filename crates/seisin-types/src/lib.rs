@@ -7,6 +7,7 @@ pub mod rk_kind;
 pub mod schema;
 pub mod sk_index;
 pub mod tk;
+pub mod tk_kind;
 pub mod typed_context;
 
 pub use schema::{decode_datum, encode_datum};
