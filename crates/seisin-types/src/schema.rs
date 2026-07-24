@@ -2,9 +2,62 @@
 //! the design doc's "Schema Declaration & Field Encoding" section.
 
 use anyhow::{bail, Result};
+use seisin_core::datum::DatumId;
 
 use crate::encoding::{decode_field_value, encode_field_value};
 use crate::field::{value_matches_type, FieldType, FieldValue};
+use crate::sk_index::derived_id_namespace;
+
+/// A type's pk identity discipline — one of exactly two kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PkKind {
+  /// The default: ids must be version-7 UUIDs (what `DatumId::new`
+  /// produces) — time-ordered, non-guessable.
+  Uuid,
+  /// A closed set of well-known mnemonics ("active", "closed", ...),
+  /// each deterministically deriving its DatumId — the shared-status-
+  /// set case, where entities FK by mnemonic rather than uuid.
+  /// Extending the set is a schema migration (a code deploy under the
+  /// n -> n+1 rollout model), never a runtime operation.
+  Enum(Vec<String>),
+}
+
+/// The derived id for an Enum-pk mnemonic — derived-on-demand, no
+/// seeding: the id is a valid reference target by construction.
+pub fn enum_pk_id(type_name: &str, mnemonic: &str) -> DatumId {
+  let name = format!("pk:{type_name}:{mnemonic}");
+  DatumId::from_name(&derived_id_namespace(), name.as_bytes())
+}
+
+/// Validates `pk_id` against `def`'s declared pk discipline — called
+/// by `TypedOpContext` on every typed write/delete. The byte-level
+/// `OpContext` stays unrestricted (framework internals legitimately
+/// use derived, non-v7 ids).
+pub fn check_pk(pk_id: DatumId, def: &DatumTypeDef) -> Result<()> {
+  match &def.pk {
+    PkKind::Uuid => {
+      // UUID version nibble: high 4 bits of byte 6.
+      if pk_id.as_bytes()[6] >> 4 != 7 {
+        bail!(
+          "type {:?} declares Uuid pk identity: id {:?} is not a version-7 uuid",
+          def.name,
+          pk_id
+        );
+      }
+    }
+    PkKind::Enum(mnemonics) => {
+      if !mnemonics.iter().any(|m| enum_pk_id(&def.name, m) == pk_id) {
+        bail!(
+          "type {:?} declares Enum pk identity: id {:?} matches none of its {} mnemonics",
+          def.name,
+          pk_id,
+          mnemonics.len()
+        );
+      }
+    }
+  }
+  Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatumTypeDef {
@@ -20,6 +73,7 @@ pub struct DatumTypeDef {
   /// history) — not built yet; today a mismatch is a hard, explicit
   /// decode error rather than silent misinterpretation.
   pub version: u16,
+  pub pk: PkKind,
   pub fields: Vec<(String, FieldType)>,
   pub indexes: Vec<IndexDef>,
 }
@@ -29,9 +83,16 @@ impl DatumTypeDef {
     Self {
       name: name.into(),
       version: 1,
+      pk: PkKind::Uuid,
       fields: Vec::new(),
       indexes: Vec::new(),
     }
+  }
+
+  /// Sets the pk identity discipline — see `PkKind`.
+  pub fn pk(mut self, pk: PkKind) -> Self {
+    self.pk = pk;
+    self
   }
 
   /// Sets the schema version this def describes — see the `version`
@@ -279,6 +340,34 @@ mod tests {
   #[test]
   fn decode_rejects_bytes_too_short_for_a_version_prefix() {
     assert!(decode_datum(&user_type(), &[0x01]).is_err());
+  }
+
+  #[test]
+  fn enum_pk_id_is_stable_and_distinct_per_type_and_mnemonic() {
+    assert_eq!(enum_pk_id("status", "active"), enum_pk_id("status", "active"));
+    assert_ne!(enum_pk_id("status", "active"), enum_pk_id("status", "closed"));
+    assert_ne!(enum_pk_id("status", "active"), enum_pk_id("kind", "active"));
+  }
+
+  #[test]
+  fn check_pk_enforces_v7_on_uuid_types() {
+    let def = user_type(); // default PkKind::Uuid
+    assert!(check_pk(seisin_core::datum::DatumId::new(), &def).is_ok());
+    // A derived (v5) id is not a v7 uuid.
+    let derived = enum_pk_id("status", "active");
+    assert!(check_pk(derived, &def).is_err());
+  }
+
+  #[test]
+  fn check_pk_enforces_membership_on_enum_types() {
+    let def = DatumTypeDef::new("status")
+      .pk(PkKind::Enum(vec!["active".to_string(), "closed".to_string()]))
+      .field("label", FieldType::String);
+    assert!(check_pk(enum_pk_id("status", "active"), &def).is_ok());
+    assert!(check_pk(enum_pk_id("status", "closed"), &def).is_ok());
+    assert!(check_pk(seisin_core::datum::DatumId::new(), &def).is_err());
+    assert!(check_pk(enum_pk_id("status", "bogus"), &def).is_err());
+    assert!(check_pk(enum_pk_id("kind", "active"), &def).is_err());
   }
 
   #[test]

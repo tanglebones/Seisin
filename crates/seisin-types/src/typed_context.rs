@@ -65,6 +65,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   /// wrong field count) fails the call before anything is staged or
   /// tracked — the datum and its indexes never diverge.
   pub fn set(&mut self, pk_id: DatumId, def: &DatumTypeDef, values: Vec<FieldValue>) -> Result<()> {
+    crate::schema::check_pk(pk_id, def)?;
     let bytes = encode_datum(def, &values)?;
     self.ensure_tracked(pk_id, def)?;
     self.ctx.put(pk_id, bytes);
@@ -78,6 +79,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   /// `after` of `None` — every declared sk index gets a remove
   /// scheduled for whatever the "before" value was.
   pub fn delete(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Result<()> {
+    crate::schema::check_pk(pk_id, def)?;
     self.ensure_tracked(pk_id, def)?;
     self.ctx.delete(pk_id);
     let entry = self.tracked.get_mut(&pk_id).unwrap();
@@ -487,6 +489,47 @@ mod tests {
       tctx.set(pk_id, &def, vec![FieldValue::I64(100)]).unwrap();
     }
     assert_eq!(ctx.take_pending_index_updates().len(), 0);
+  }
+
+  #[test]
+  fn set_rejects_a_non_v7_id_on_a_uuid_pk_type_and_wrong_ids_on_enum_pk_types() {
+    use crate::schema::{enum_pk_id, PkKind};
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let def = user_type();
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      // A derived id is not v7 — rejected on the default Uuid-pk type.
+      let result = tctx.set(
+        enum_pk_id("status", "active"),
+        &def,
+        vec![FieldValue::String("x".to_string()), FieldValue::I64(1)],
+      );
+      assert!(result.is_err());
+    }
+
+    let status = DatumTypeDef::new("status")
+      .pk(PkKind::Enum(vec!["active".to_string()]))
+      .field("label", FieldType::String);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      // A random v7 id is not a declared mnemonic — rejected.
+      assert!(tctx
+        .set(
+          DatumId::new(),
+          &status,
+          vec![FieldValue::String("Active".to_string())]
+        )
+        .is_err());
+      // The derived mnemonic id is accepted.
+      assert!(tctx
+        .set(
+          enum_pk_id("status", "active"),
+          &status,
+          vec![FieldValue::String("Active".to_string())]
+        )
+        .is_ok());
+    }
   }
 
   #[test]
