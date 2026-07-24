@@ -111,6 +111,32 @@ fn handle_connection(
         class,
         query,
       ),
+      Request::TkExecute {
+        entity_datum_id,
+        class,
+        op,
+      } => handle_tk_execute(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        entity_datum_id,
+        class,
+        op,
+      ),
+      Request::TkQuery {
+        entity_datum_id,
+        class,
+        query,
+      } => handle_tk_query(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        entity_datum_id,
+        class,
+        query,
+      ),
       // Acquire/Recall/Release/IndexUpdate are node-to-node only,
       // carried over a peer-link connection (see peer_link.rs) — a
       // client should never send one on this client-facing connection.
@@ -269,6 +295,55 @@ fn lb_result_response(result: Result<Vec<u8>, String>) -> Response {
       Ok(result) => Response::LbResult(result),
       Err(e) => Response::OpError {
         message: format!("malformed lb result: {e}"),
+      },
+    },
+    Err(message) => Response::OpError { message },
+  }
+}
+
+/// Routes a client tk execute op — same shape as `handle_lb_execute`;
+/// `class` only forms the registry kind string `tk:{class}`.
+#[allow(clippy::too_many_arguments)]
+fn handle_tk_execute(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  entity_datum_id: DatumId,
+  class: String,
+  op: seisin_protocol::TkOp,
+) -> Response {
+  if let Some(response) = redirect_if_foreign(self_node_id, ring, address_book, entity_datum_id) {
+    return response;
+  }
+  let payload = seisin_protocol::encode_tk_op(&op);
+  tk_result_response(pool.run_index_execute(entity_datum_id, format!("tk:{class}"), payload))
+}
+
+/// Routes a client tk query — read-only sibling of `handle_tk_execute`.
+#[allow(clippy::too_many_arguments)]
+fn handle_tk_query(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  entity_datum_id: DatumId,
+  class: String,
+  query: seisin_protocol::TkQueryReq,
+) -> Response {
+  if let Some(response) = redirect_if_foreign(self_node_id, ring, address_book, entity_datum_id) {
+    return response;
+  }
+  let payload = seisin_protocol::encode_tk_query_req(&query);
+  tk_result_response(pool.run_index_query(entity_datum_id, format!("tk:{class}"), payload))
+}
+
+fn tk_result_response(result: Result<Vec<u8>, String>) -> Response {
+  match result {
+    Ok(bytes) => match seisin_protocol::decode_tk_result(&bytes) {
+      Ok(result) => Response::TkResult(result),
+      Err(e) => Response::OpError {
+        message: format!("malformed tk result: {e}"),
       },
     },
     Err(message) => Response::OpError { message },
