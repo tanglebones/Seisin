@@ -1,6 +1,7 @@
 pub mod encoding;
 pub mod field;
 pub mod lb;
+pub mod lb_kind;
 pub mod rk_index;
 pub mod rk_kind;
 pub mod schema;
