@@ -65,6 +65,75 @@ pub enum Request {
     index_datum_id: DatumId,
     query: RkQueryKind,
   },
+  /// A solution-called, mutating leaderboard op (update/remove) —
+  /// client-facing, routed like `Op`/`RkQuery` (redirect if the
+  /// receiving node isn't native for `board_id`). `class` exists only
+  /// to form the registry kind string `lb:{class}`; the framework
+  /// never interprets lb semantics. See the lb design doc.
+  LbExecute {
+    board_id: DatumId,
+    class: String,
+    op: LbExecuteOp,
+  },
+  /// A read-only leaderboard query — same routing as `LbExecute`.
+  LbQuery {
+    board_id: DatumId,
+    class: String,
+    query: LbQueryReq,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LbExecuteOp {
+  Update {
+    player_id: DatumId,
+    display: Vec<u8>,
+    rank_key: [u8; 8],
+    friend_ids: Vec<DatumId>,
+    top: u32,
+    window: u32,
+  },
+  Remove {
+    player_id: DatumId,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LbQueryReq {
+  pub top: u32,
+  pub bottom: u32,
+  pub around_player: Option<DatumId>,
+  pub window: u32,
+  pub friend_ids: Vec<DatumId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LbEntry {
+  pub rank_key: [u8; 8],
+  pub player_id: DatumId,
+  pub display: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LbFriendRank {
+  pub player_id: DatumId,
+  /// 0-based from best (rank 0 = highest score).
+  pub rank: u64,
+  pub rank_key: [u8; 8],
+  pub display: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LbResult {
+  pub total: u64,
+  /// 0-based from best; None for a Remove result or a query without
+  /// `around_player`.
+  pub player_rank: Option<u64>,
+  pub top: Vec<LbEntry>,
+  /// Empty on execute results — bottom lists are a query concern.
+  pub bottom: Vec<LbEntry>,
+  pub around: Vec<LbEntry>,
+  pub friends: Vec<LbFriendRank>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +171,8 @@ pub enum Response {
   RkQueryResult {
     entries: Vec<(Vec<u8>, DatumId)>,
   },
+  /// Reply to `LbExecute`/`LbQuery`.
+  LbResult(LbResult),
 }
 
 /// The wire protocol version, carried as the first byte of every
@@ -132,6 +203,11 @@ const OP_RECALL: u8 = 3;
 const OP_RELEASE: u8 = 4;
 const OP_INDEX_UPDATE: u8 = 5;
 const OP_RK_QUERY: u8 = 6;
+const OP_LB_EXECUTE: u8 = 7;
+const OP_LB_QUERY: u8 = 8;
+
+const LB_OP_UPDATE: u8 = 0;
+const LB_OP_REMOVE: u8 = 1;
 
 const RK_QUERY_TOP_N: u8 = 0;
 const RK_QUERY_BOTTOM_N: u8 = 1;
@@ -145,6 +221,7 @@ const RESP_GRANTED: u8 = 4;
 const RESP_RELEASED: u8 = 5;
 const RESP_INDEX_UPDATE_RESULT: u8 = 6;
 const RESP_RK_QUERY_RESULT: u8 = 7;
+const RESP_LB_RESULT: u8 = 8;
 
 const ID_LEN: usize = 16;
 
@@ -210,6 +287,26 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.extend_from_slice(&index_datum_id.as_bytes());
       buf.extend_from_slice(&encode_rk_query_kind(query));
     }
+    Request::LbExecute {
+      board_id,
+      class,
+      op,
+    } => {
+      buf.push(OP_LB_EXECUTE);
+      buf.extend_from_slice(&board_id.as_bytes());
+      put_bytes(&mut buf, class.as_bytes());
+      buf.extend_from_slice(&encode_lb_execute_op(op));
+    }
+    Request::LbQuery {
+      board_id,
+      class,
+      query,
+    } => {
+      buf.push(OP_LB_QUERY);
+      buf.extend_from_slice(&board_id.as_bytes());
+      put_bytes(&mut buf, class.as_bytes());
+      buf.extend_from_slice(&encode_lb_query_req(query));
+    }
   }
   buf
 }
@@ -226,8 +323,36 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
     OP_RELEASE => decode_release_request(buf),
     OP_INDEX_UPDATE => decode_index_update_request(buf),
     OP_RK_QUERY => decode_rk_query_request(buf),
+    OP_LB_EXECUTE => decode_lb_execute_request(buf),
+    OP_LB_QUERY => decode_lb_query_request(buf),
     op => bail!("unknown request opcode: {op}"),
   }
+}
+
+fn decode_lb_execute_request(buf: &[u8]) -> Result<Request> {
+  let mut offset = 1;
+  let board_id = take_id(buf, &mut offset)?;
+  let class = String::from_utf8(take_bytes(buf, &mut offset)?)
+    .context("lb class was not valid utf8")?;
+  let op = decode_lb_execute_op(&buf[offset..])?;
+  Ok(Request::LbExecute {
+    board_id,
+    class,
+    op,
+  })
+}
+
+fn decode_lb_query_request(buf: &[u8]) -> Result<Request> {
+  let mut offset = 1;
+  let board_id = take_id(buf, &mut offset)?;
+  let class = String::from_utf8(take_bytes(buf, &mut offset)?)
+    .context("lb class was not valid utf8")?;
+  let query = decode_lb_query_req(&buf[offset..])?;
+  Ok(Request::LbQuery {
+    board_id,
+    class,
+    query,
+  })
 }
 
 fn decode_rk_query_request(buf: &[u8]) -> Result<Request> {
@@ -436,6 +561,274 @@ fn decode_op_request(buf: &[u8]) -> Result<Request> {
   })
 }
 
+// --- lb codec building blocks (shared cursor-style helpers) ---
+
+fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+  buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+  buf.extend_from_slice(bytes);
+}
+
+fn take_bytes(buf: &[u8], offset: &mut usize) -> Result<Vec<u8>> {
+  if buf.len() < *offset + 4 {
+    bail!("truncated length prefix at offset {offset}");
+  }
+  let len = u32::from_le_bytes(buf[*offset..*offset + 4].try_into().unwrap()) as usize;
+  *offset += 4;
+  if buf.len() < *offset + len {
+    bail!("truncated byte field at offset {offset}: expected {len} bytes");
+  }
+  let bytes = buf[*offset..*offset + len].to_vec();
+  *offset += len;
+  Ok(bytes)
+}
+
+fn put_id(buf: &mut Vec<u8>, id: DatumId) {
+  buf.extend_from_slice(&id.as_bytes());
+}
+
+fn take_id(buf: &[u8], offset: &mut usize) -> Result<DatumId> {
+  if buf.len() < *offset + ID_LEN {
+    bail!("truncated datum id at offset {offset}");
+  }
+  let id = DatumId::from_bytes(buf[*offset..*offset + ID_LEN].try_into().unwrap());
+  *offset += ID_LEN;
+  Ok(id)
+}
+
+fn take_u32(buf: &[u8], offset: &mut usize) -> Result<u32> {
+  if buf.len() < *offset + 4 {
+    bail!("truncated u32 at offset {offset}");
+  }
+  let v = u32::from_le_bytes(buf[*offset..*offset + 4].try_into().unwrap());
+  *offset += 4;
+  Ok(v)
+}
+
+fn take_u64(buf: &[u8], offset: &mut usize) -> Result<u64> {
+  if buf.len() < *offset + 8 {
+    bail!("truncated u64 at offset {offset}");
+  }
+  let v = u64::from_le_bytes(buf[*offset..*offset + 8].try_into().unwrap());
+  *offset += 8;
+  Ok(v)
+}
+
+fn take_rank_key(buf: &[u8], offset: &mut usize) -> Result<[u8; 8]> {
+  if buf.len() < *offset + 8 {
+    bail!("truncated rank key at offset {offset}");
+  }
+  let key: [u8; 8] = buf[*offset..*offset + 8].try_into().unwrap();
+  *offset += 8;
+  Ok(key)
+}
+
+fn put_id_list(buf: &mut Vec<u8>, ids: &[DatumId]) {
+  buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+  for id in ids {
+    put_id(buf, *id);
+  }
+}
+
+fn take_id_list(buf: &[u8], offset: &mut usize) -> Result<Vec<DatumId>> {
+  let count = take_u32(buf, offset)? as usize;
+  let mut ids = Vec::with_capacity(count);
+  for _ in 0..count {
+    ids.push(take_id(buf, offset)?);
+  }
+  Ok(ids)
+}
+
+/// The lb codecs are public standalone functions (the rk precedent):
+/// the worker treats op/query/result bytes as opaque, so the lb
+/// implementation in `seisin-types` and `server.rs`'s routing both use
+/// these — the byte layout is defined exactly once, here.
+pub fn encode_lb_execute_op(op: &LbExecuteOp) -> Vec<u8> {
+  let mut buf = Vec::new();
+  match op {
+    LbExecuteOp::Update {
+      player_id,
+      display,
+      rank_key,
+      friend_ids,
+      top,
+      window,
+    } => {
+      buf.push(LB_OP_UPDATE);
+      put_id(&mut buf, *player_id);
+      buf.extend_from_slice(rank_key);
+      put_bytes(&mut buf, display);
+      put_id_list(&mut buf, friend_ids);
+      buf.extend_from_slice(&top.to_le_bytes());
+      buf.extend_from_slice(&window.to_le_bytes());
+    }
+    LbExecuteOp::Remove { player_id } => {
+      buf.push(LB_OP_REMOVE);
+      put_id(&mut buf, *player_id);
+    }
+  }
+  buf
+}
+
+pub fn decode_lb_execute_op(buf: &[u8]) -> Result<LbExecuteOp> {
+  if buf.is_empty() {
+    bail!("empty lb execute op");
+  }
+  let mut offset = 1;
+  let op = match buf[0] {
+    LB_OP_UPDATE => {
+      let player_id = take_id(buf, &mut offset)?;
+      let rank_key = take_rank_key(buf, &mut offset)?;
+      let display = take_bytes(buf, &mut offset)?;
+      let friend_ids = take_id_list(buf, &mut offset)?;
+      let top = take_u32(buf, &mut offset)?;
+      let window = take_u32(buf, &mut offset)?;
+      LbExecuteOp::Update {
+        player_id,
+        display,
+        rank_key,
+        friend_ids,
+        top,
+        window,
+      }
+    }
+    LB_OP_REMOVE => LbExecuteOp::Remove {
+      player_id: take_id(buf, &mut offset)?,
+    },
+    tag => bail!("unknown lb execute op tag: {tag}"),
+  };
+  if offset != buf.len() {
+    bail!("lb execute op has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(op)
+}
+
+pub fn encode_lb_query_req(q: &LbQueryReq) -> Vec<u8> {
+  let mut buf = Vec::new();
+  buf.extend_from_slice(&q.top.to_le_bytes());
+  buf.extend_from_slice(&q.bottom.to_le_bytes());
+  match q.around_player {
+    None => buf.push(0),
+    Some(id) => {
+      buf.push(1);
+      put_id(&mut buf, id);
+    }
+  }
+  buf.extend_from_slice(&q.window.to_le_bytes());
+  put_id_list(&mut buf, &q.friend_ids);
+  buf
+}
+
+pub fn decode_lb_query_req(buf: &[u8]) -> Result<LbQueryReq> {
+  let mut offset = 0;
+  let top = take_u32(buf, &mut offset)?;
+  let bottom = take_u32(buf, &mut offset)?;
+  if buf.len() < offset + 1 {
+    bail!("lb query truncated at around_player flag");
+  }
+  let flag = buf[offset];
+  offset += 1;
+  let around_player = match flag {
+    0 => None,
+    1 => Some(take_id(buf, &mut offset)?),
+    f => bail!("unknown around_player flag: {f}"),
+  };
+  let window = take_u32(buf, &mut offset)?;
+  let friend_ids = take_id_list(buf, &mut offset)?;
+  if offset != buf.len() {
+    bail!("lb query has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(LbQueryReq {
+    top,
+    bottom,
+    around_player,
+    window,
+    friend_ids,
+  })
+}
+
+fn put_lb_entries(buf: &mut Vec<u8>, entries: &[LbEntry]) {
+  buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+  for entry in entries {
+    buf.extend_from_slice(&entry.rank_key);
+    put_id(buf, entry.player_id);
+    put_bytes(buf, &entry.display);
+  }
+}
+
+fn take_lb_entries(buf: &[u8], offset: &mut usize) -> Result<Vec<LbEntry>> {
+  let count = take_u32(buf, offset)? as usize;
+  let mut entries = Vec::with_capacity(count);
+  for _ in 0..count {
+    entries.push(LbEntry {
+      rank_key: take_rank_key(buf, offset)?,
+      player_id: take_id(buf, offset)?,
+      display: take_bytes(buf, offset)?,
+    });
+  }
+  Ok(entries)
+}
+
+pub fn encode_lb_result(result: &LbResult) -> Vec<u8> {
+  let mut buf = result.total.to_le_bytes().to_vec();
+  match result.player_rank {
+    None => buf.push(0),
+    Some(rank) => {
+      buf.push(1);
+      buf.extend_from_slice(&rank.to_le_bytes());
+    }
+  }
+  put_lb_entries(&mut buf, &result.top);
+  put_lb_entries(&mut buf, &result.bottom);
+  put_lb_entries(&mut buf, &result.around);
+  buf.extend_from_slice(&(result.friends.len() as u32).to_le_bytes());
+  for friend in &result.friends {
+    put_id(&mut buf, friend.player_id);
+    buf.extend_from_slice(&friend.rank.to_le_bytes());
+    buf.extend_from_slice(&friend.rank_key);
+    put_bytes(&mut buf, &friend.display);
+  }
+  buf
+}
+
+pub fn decode_lb_result(buf: &[u8]) -> Result<LbResult> {
+  let mut offset = 0;
+  let total = take_u64(buf, &mut offset)?;
+  if buf.len() < offset + 1 {
+    bail!("lb result truncated at player_rank flag");
+  }
+  let flag = buf[offset];
+  offset += 1;
+  let player_rank = match flag {
+    0 => None,
+    1 => Some(take_u64(buf, &mut offset)?),
+    f => bail!("unknown player_rank flag: {f}"),
+  };
+  let top = take_lb_entries(buf, &mut offset)?;
+  let bottom = take_lb_entries(buf, &mut offset)?;
+  let around = take_lb_entries(buf, &mut offset)?;
+  let friend_count = take_u32(buf, &mut offset)? as usize;
+  let mut friends = Vec::with_capacity(friend_count);
+  for _ in 0..friend_count {
+    friends.push(LbFriendRank {
+      player_id: take_id(buf, &mut offset)?,
+      rank: take_u64(buf, &mut offset)?,
+      rank_key: take_rank_key(buf, &mut offset)?,
+      display: take_bytes(buf, &mut offset)?,
+    });
+  }
+  if offset != buf.len() {
+    bail!("lb result has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(LbResult {
+    total,
+    player_rank,
+    top,
+    bottom,
+    around,
+    friends,
+  })
+}
+
 pub fn encode_response(resp: &Response) -> Vec<u8> {
   let mut buf = vec![PROTOCOL_VERSION];
   match resp {
@@ -468,6 +861,10 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
     Response::RkQueryResult { entries } => {
       buf.push(RESP_RK_QUERY_RESULT);
       buf.extend_from_slice(&encode_rk_entries(entries));
+    }
+    Response::LbResult(result) => {
+      buf.push(RESP_LB_RESULT);
+      buf.extend_from_slice(&encode_lb_result(result));
     }
   }
   buf
@@ -525,6 +922,7 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
     RESP_RK_QUERY_RESULT => Ok(Response::RkQueryResult {
       entries: decode_rk_entries(&buf[1..])?,
     }),
+    RESP_LB_RESULT => Ok(Response::LbResult(decode_lb_result(&buf[1..])?)),
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -668,6 +1066,98 @@ mod tests {
     let mut buf = encode_rk_entries(&[(vec![1u8; 8], DatumId::new())]);
     buf.truncate(buf.len() - 1); // corrupt: short by one byte
     assert!(decode_rk_entries(&buf).is_err());
+  }
+
+  fn sample_lb_result() -> LbResult {
+    LbResult {
+      total: 42,
+      player_rank: Some(7),
+      top: vec![LbEntry {
+        rank_key: [9u8; 8],
+        player_id: DatumId::new(),
+        display: b"Alice".to_vec(),
+      }],
+      bottom: vec![],
+      around: vec![LbEntry {
+        rank_key: [3u8; 8],
+        player_id: DatumId::new(),
+        display: b"Bob".to_vec(),
+      }],
+      friends: vec![LbFriendRank {
+        player_id: DatumId::new(),
+        rank: 11,
+        rank_key: [2u8; 8],
+        display: b"Carol".to_vec(),
+      }],
+    }
+  }
+
+  #[test]
+  fn round_trips_lb_execute_requests() {
+    for op in [
+      LbExecuteOp::Update {
+        player_id: DatumId::new(),
+        display: b"Alice".to_vec(),
+        rank_key: [5u8; 8],
+        friend_ids: vec![DatumId::new(), DatumId::new()],
+        top: 10,
+        window: 5,
+      },
+      LbExecuteOp::Remove {
+        player_id: DatumId::new(),
+      },
+    ] {
+      let req = Request::LbExecute {
+        board_id: DatumId::new(),
+        class: "racing".to_string(),
+        op: op.clone(),
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn round_trips_lb_query_requests_with_and_without_around_player() {
+    for around in [None, Some(DatumId::new())] {
+      let req = Request::LbQuery {
+        board_id: DatumId::new(),
+        class: "racing".to_string(),
+        query: LbQueryReq {
+          top: 12,
+          bottom: 12,
+          around_player: around,
+          window: 4,
+          friend_ids: vec![DatumId::new()],
+        },
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn round_trips_an_lb_result_response() {
+    let resp = Response::LbResult(sample_lb_result());
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  fn round_trips_an_empty_lb_result() {
+    let resp = Response::LbResult(LbResult {
+      total: 0,
+      player_rank: None,
+      top: vec![],
+      bottom: vec![],
+      around: vec![],
+      friends: vec![],
+    });
+    assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+  }
+
+  #[test]
+  fn lb_result_codec_rejects_a_truncated_buffer() {
+    let mut buf = encode_lb_result(&sample_lb_result());
+    buf.truncate(buf.len() - 1);
+    assert!(decode_lb_result(&buf).is_err());
   }
 
   #[test]

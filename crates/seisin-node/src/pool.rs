@@ -81,6 +81,8 @@ impl WorkerPool {
         seisin_protocol::Request::Op { .. } => return, // client-only; never sent over a peer-link
         // Client-only too, never carried over a peer-link — same as Op.
         seisin_protocol::Request::RkQuery { .. } => return,
+        seisin_protocol::Request::LbExecute { .. } => return,
+        seisin_protocol::Request::LbQuery { .. } => return,
         seisin_protocol::Request::IndexUpdate {
           target,
           op_id,
