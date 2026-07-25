@@ -297,8 +297,7 @@ mod tests {
   use crate::sk_index::{decode_sk_index_op, sk_key, SkIndexOp};
   use seisin_core::cache::Cache;
   use seisin_core::store::InMemoryStore;
-  use seisin_ops::context::{FkMissingPolicy, OpContext};
-  use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
+  use seisin_ops::context::OpContext;
   use std::sync::Arc;
 
   fn user_type() -> DatumTypeDef {
