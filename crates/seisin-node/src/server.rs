@@ -151,6 +151,19 @@ fn handle_connection(
         pending_datum_id,
         op,
       ),
+      Request::ExtentQuery {
+        extent_datum_id,
+        offset,
+        limit,
+      } => handle_extent_query(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        extent_datum_id,
+        offset,
+        limit,
+      ),
       // Acquire/Recall/Release/IndexUpdate are node-to-node only,
       // carried over a peer-link connection (see peer_link.rs) — a
       // client should never send one on this client-facing connection.
@@ -414,6 +427,32 @@ fn handle_fk_pending(
       Ok(entries) => Response::FkPendingResult { entries },
       Err(e) => Response::OpError {
         message: format!("malformed fk pending result: {e}"),
+      },
+    },
+    Err(message) => Response::OpError { message },
+  }
+}
+
+/// Client-facing extent page (the rescan driver's enumeration).
+#[allow(clippy::too_many_arguments)]
+fn handle_extent_query(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  extent_datum_id: DatumId,
+  offset: u64,
+  limit: u32,
+) -> Response {
+  if let Some(response) = redirect_if_foreign(self_node_id, ring, address_book, extent_datum_id) {
+    return response;
+  }
+  let payload = seisin_protocol::encode_extent_page(offset, limit);
+  match pool.run_index_query(extent_datum_id, "extent".to_string(), payload) {
+    Ok(bytes) => match seisin_protocol::decode_extent_result(&bytes) {
+      Ok((total, pks)) => Response::ExtentResult { total, pks },
+      Err(e) => Response::OpError {
+        message: format!("malformed extent result: {e}"),
       },
     },
     Err(message) => Response::OpError { message },

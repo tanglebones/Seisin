@@ -93,6 +93,7 @@ impl WorkerPool {
         },
         // Client-only, never carried over a peer-link.
         seisin_protocol::Request::FkPending { .. } => return,
+        seisin_protocol::Request::ExtentQuery { .. } => return,
         seisin_protocol::Request::IndexUpdate {
           target,
           op_id,

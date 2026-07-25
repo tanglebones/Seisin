@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use seisin_core::datum::DatumId;
 use seisin_ops::context::{Expectation, FkMissingPolicy, OpContext};
-use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
+use seisin_protocol::{encode_extent_op, encode_fk_pending_op, ExtentOp, FkPendingOp};
 
+use crate::extent::extent_key;
 use crate::field::FieldValue;
 use crate::fk::{fk_deleted_key, fk_pending_key};
 use crate::rk_index::{encode_rank_key, encode_rk_index_op, rk_key, RkIndexOp};
@@ -267,6 +268,25 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
             let target = rk_key(&tracked.def.name, field);
             self.ctx.schedule_index_update(target, "rk", payload);
           }
+        }
+      }
+
+      // Extent maintenance for tracked types: creates insert, real
+      // deletes remove.
+      if tracked.def.track_extent {
+        let target = extent_key(&tracked.def.name);
+        if tracked.before.is_none() && tracked.after.is_some() {
+          self.ctx.schedule_index_update(
+            target,
+            "extent",
+            encode_extent_op(&ExtentOp::Insert { pk: pk_id }),
+          );
+        } else if tracked.before.is_some() && tracked.after.is_none() {
+          self.ctx.schedule_index_update(
+            target,
+            "extent",
+            encode_extent_op(&ExtentOp::Remove { pk: pk_id }),
+          );
         }
       }
 
@@ -1057,6 +1077,59 @@ mod tests {
     let mut bad = ok;
     bad[2] = FieldValue::F64(1.5);
     assert!(tctx.set(DatumId::new(), &def, bad).is_err());
+  }
+
+  #[test]
+  fn tracked_types_schedule_extent_inserts_on_create_and_removes_on_delete() {
+    use crate::extent::extent_key;
+    let def = DatumTypeDef::new("user")
+      .field("name", FieldType::String)
+      .track_extent();
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let pk = DatumId::new();
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx
+        .set(pk, &def, vec![FieldValue::String("x".to_string())])
+        .unwrap();
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].target, extent_key("user"));
+    assert_eq!(updates[0].index_kind, "extent");
+    assert!(matches!(
+      seisin_protocol::decode_extent_op(&updates[0].payload).unwrap(),
+      seisin_protocol::ExtentOp::Insert { pk: p } if p == pk
+    ));
+
+    // A real delete removes; an untracked type schedules nothing.
+    commit_initial(&mut cache, &def, pk, &[FieldValue::String("x".to_string())]);
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.delete(pk, &def).unwrap();
+    }
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    assert!(matches!(
+      seisin_protocol::decode_extent_op(&updates[0].payload).unwrap(),
+      seisin_protocol::ExtentOp::Remove { pk: p } if p == pk
+    ));
+
+    let untracked = DatumTypeDef::new("user").field("name", FieldType::String);
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx
+        .set(
+          DatumId::new(),
+          &untracked,
+          vec![FieldValue::String("y".to_string())],
+        )
+        .unwrap();
+    }
+    assert!(ctx.take_pending_index_updates().is_empty());
   }
 
   #[test]

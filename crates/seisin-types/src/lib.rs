@@ -1,4 +1,5 @@
 pub mod encoding;
+pub mod extent;
 pub mod field;
 pub mod fk;
 pub mod lb;

@@ -107,6 +107,22 @@ pub enum Request {
     pending_datum_id: DatumId,
     op: FkPendingOp,
   },
+  /// A page of a type's extent (the set of its datum pks) — client-
+  /// facing only, the rescan driver's enumeration surface.
+  ExtentQuery {
+    extent_datum_id: DatumId,
+    offset: u64,
+    limit: u32,
+  },
+}
+
+/// An extent maintenance op — the apply payload the write path
+/// dispatches to the "extent" kind on create/delete of a tracked
+/// type's datum. Never carried on a client-facing request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtentOp {
+  Insert { pk: DatumId },
+  Remove { pk: DatumId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +297,12 @@ pub enum Response {
   FkPendingResult {
     entries: Vec<(DatumId, DatumId)>,
   },
+  /// Reply to `ExtentQuery`: the type's total population and the
+  /// requested page of pks (ascending by pk bytes).
+  ExtentResult {
+    total: u64,
+    pks: Vec<DatumId>,
+  },
 }
 
 /// The wire protocol version, carried as the first byte of every
@@ -332,6 +354,11 @@ const TK_Q_SNAPSHOT_AT: u8 = 4;
 const OP_EXISTS_CHECK: u8 = 11;
 const OP_FK_PENDING: u8 = 12;
 
+const OP_EXTENT_QUERY: u8 = 13;
+
+const EXTENT_OP_INSERT: u8 = 0;
+const EXTENT_OP_REMOVE: u8 = 1;
+
 const FK_PENDING_LIST: u8 = 0;
 const FK_PENDING_REMOVE: u8 = 1;
 const FK_PENDING_INSERT: u8 = 2;
@@ -352,6 +379,7 @@ const RESP_LB_RESULT: u8 = 8;
 const RESP_TK_RESULT: u8 = 9;
 const RESP_EXISTS: u8 = 10;
 const RESP_FK_PENDING_RESULT: u8 = 11;
+const RESP_EXTENT_RESULT: u8 = 12;
 
 const ID_LEN: usize = 16;
 
@@ -469,6 +497,15 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.extend_from_slice(&pending_datum_id.as_bytes());
       buf.extend_from_slice(&encode_fk_pending_op(op));
     }
+    Request::ExtentQuery {
+      extent_datum_id,
+      offset,
+      limit,
+    } => {
+      buf.push(OP_EXTENT_QUERY);
+      buf.extend_from_slice(&extent_datum_id.as_bytes());
+      buf.extend_from_slice(&encode_extent_page(*offset, *limit));
+    }
   }
   buf
 }
@@ -508,6 +545,16 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
       Ok(Request::FkPending {
         pending_datum_id,
         op,
+      })
+    }
+    OP_EXTENT_QUERY => {
+      let mut cursor = 1;
+      let extent_datum_id = take_id(buf, &mut cursor)?;
+      let (offset, limit) = decode_extent_page(&buf[cursor..])?;
+      Ok(Request::ExtentQuery {
+        extent_datum_id,
+        offset,
+        limit,
       })
     }
     op => bail!("unknown request opcode: {op}"),
@@ -1217,6 +1264,83 @@ pub fn decode_fk_entries(buf: &[u8]) -> Result<Vec<(DatumId, DatumId)>> {
   Ok(entries)
 }
 
+pub fn encode_extent_op(op: &ExtentOp) -> Vec<u8> {
+  let mut buf = Vec::new();
+  match op {
+    ExtentOp::Insert { pk } => {
+      buf.push(EXTENT_OP_INSERT);
+      put_id(&mut buf, *pk);
+    }
+    ExtentOp::Remove { pk } => {
+      buf.push(EXTENT_OP_REMOVE);
+      put_id(&mut buf, *pk);
+    }
+  }
+  buf
+}
+
+pub fn decode_extent_op(buf: &[u8]) -> Result<ExtentOp> {
+  if buf.is_empty() {
+    bail!("empty extent op");
+  }
+  let mut offset = 1;
+  let op = match buf[0] {
+    EXTENT_OP_INSERT => ExtentOp::Insert {
+      pk: take_id(buf, &mut offset)?,
+    },
+    EXTENT_OP_REMOVE => ExtentOp::Remove {
+      pk: take_id(buf, &mut offset)?,
+    },
+    tag => bail!("unknown extent op tag: {tag}"),
+  };
+  if offset != buf.len() {
+    bail!("extent op has {} trailing bytes", buf.len() - offset);
+  }
+  Ok(op)
+}
+
+/// The 12-byte extent page query payload (offset u64 LE ++ limit u32
+/// LE) and its result codec — shared by `server.rs` routing and the
+/// extent kind's `query` implementation.
+pub fn encode_extent_page(offset: u64, limit: u32) -> Vec<u8> {
+  let mut buf = offset.to_le_bytes().to_vec();
+  buf.extend_from_slice(&limit.to_le_bytes());
+  buf
+}
+
+pub fn decode_extent_page(buf: &[u8]) -> Result<(u64, u32)> {
+  if buf.len() != 12 {
+    bail!("extent page query must be 12 bytes, got {}", buf.len());
+  }
+  Ok((
+    u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+    u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+  ))
+}
+
+pub fn encode_extent_result(total: u64, pks: &[DatumId]) -> Vec<u8> {
+  let mut buf = total.to_le_bytes().to_vec();
+  buf.extend_from_slice(&(pks.len() as u32).to_le_bytes());
+  for pk in pks {
+    put_id(&mut buf, *pk);
+  }
+  buf
+}
+
+pub fn decode_extent_result(buf: &[u8]) -> Result<(u64, Vec<DatumId>)> {
+  let mut offset = 0;
+  let total = take_u64(buf, &mut offset)?;
+  let count = take_u32(buf, &mut offset)? as usize;
+  let mut pks = Vec::with_capacity(count);
+  for _ in 0..count {
+    pks.push(take_id(buf, &mut offset)?);
+  }
+  if offset != buf.len() {
+    bail!("extent result has {} trailing bytes", buf.len() - offset);
+  }
+  Ok((total, pks))
+}
+
 pub fn encode_lb_result(result: &LbResult) -> Vec<u8> {
   let mut buf = result.total.to_le_bytes().to_vec();
   match result.player_rank {
@@ -1327,6 +1451,10 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
       buf.push(RESP_FK_PENDING_RESULT);
       buf.extend_from_slice(&encode_fk_entries(entries));
     }
+    Response::ExtentResult { total, pks } => {
+      buf.push(RESP_EXTENT_RESULT);
+      buf.extend_from_slice(&encode_extent_result(*total, pks));
+    }
   }
   buf
 }
@@ -1398,6 +1526,10 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
     RESP_FK_PENDING_RESULT => Ok(Response::FkPendingResult {
       entries: decode_fk_entries(&buf[1..])?,
     }),
+    RESP_EXTENT_RESULT => {
+      let (total, pks) = decode_extent_result(&buf[1..])?;
+      Ok(Response::ExtentResult { total, pks })
+    }
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -1767,6 +1899,29 @@ mod tests {
     let mut buf = encode_fk_entries(&[(DatumId::new(), DatumId::new())]);
     buf.truncate(buf.len() - 1);
     assert!(decode_fk_entries(&buf).is_err());
+  }
+
+  #[test]
+  fn round_trips_extent_queries_ops_and_results() {
+    let req = Request::ExtentQuery {
+      extent_datum_id: DatumId::new(),
+      offset: 42,
+      limit: 100,
+    };
+    assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    for op in [
+      ExtentOp::Insert { pk: DatumId::new() },
+      ExtentOp::Remove { pk: DatumId::new() },
+    ] {
+      assert_eq!(decode_extent_op(&encode_extent_op(&op)).unwrap(), op);
+    }
+    for pks in [vec![], vec![DatumId::new(), DatumId::new()]] {
+      let resp = Response::ExtentResult {
+        total: 7,
+        pks: pks.clone(),
+      };
+      assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+    }
   }
 
   #[test]

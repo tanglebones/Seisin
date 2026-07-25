@@ -103,6 +103,14 @@ pub struct DatumTypeDef {
   pub constraints: Vec<RelationalConstraintDef>,
   pub guards: Vec<GuardRef>,
   pub checks: Vec<FieldCheckDef>,
+  /// When true, `TypedOpContext` maintains this type's extent (the
+  /// `"extent"` kind) on create/delete — required for the driver's
+  /// full-validation rescan to enumerate the type.
+  pub track_extent: bool,
+  /// Driver guidance only: how often a full-validation rescan of this
+  /// type should run. The framework never runs scans on a timer —
+  /// cadence and acting on findings are the scan driver's job.
+  pub rescan_every_millis: Option<u64>,
 }
 
 /// What an FK-constrained field references — always a declared
@@ -179,7 +187,21 @@ impl DatumTypeDef {
       constraints: Vec::new(),
       guards: Vec::new(),
       checks: Vec::new(),
+      track_extent: false,
+      rescan_every_millis: None,
     }
+  }
+
+  /// Enables extent tracking — see the `track_extent` field.
+  pub fn track_extent(mut self) -> Self {
+    self.track_extent = true;
+    self
+  }
+
+  /// Declares the rescan cadence — see `rescan_every_millis`.
+  pub fn rescan_every_millis(mut self, millis: u64) -> Self {
+    self.rescan_every_millis = Some(millis);
+    self
   }
 
   /// Declares a field validity check — see `FieldCheck`.
