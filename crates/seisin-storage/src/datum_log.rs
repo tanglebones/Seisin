@@ -31,6 +31,9 @@ const KIND_TOMBSTONE: u8 = 3;
 /// read-time replay and pre-shrinking compaction (Part C).
 const MAX_DELTA_CHAIN: usize = 8;
 
+/// A decoded record: (kind, id, body, next_offset).
+type RawRecord = (u8, [u8; 16], Vec<u8>, u64);
+
 pub enum PatchOutcome {
   Applied,
   /// The log has no base for this id — the caller must send full bytes
@@ -143,7 +146,7 @@ impl DatumLog {
     &mut self,
     offset: u64,
     file_len: u64,
-  ) -> Result<Option<(u8, [u8; 16], Vec<u8>, u64)>> {
+  ) -> Result<Option<RawRecord>> {
     if offset + 4 > file_len {
       return Ok(None);
     }
