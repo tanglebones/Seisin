@@ -471,7 +471,51 @@ commit and push immediately, since work sessions may end abruptly.
   TypedOpContext sugar, transaction-time audit, no-gaps opt-in,
   TOAST for wide values, file consolidation (Storage Tier).
 
-As of this entry: 10 crates, 364 tests passing, `cargo fmt --check` and
+- **Datum Type System, Part 5 — relational (FK) constraints & pk
+  identity discipline.** Per
+  `specs/2026-07-24-fk-constraints-design.md` and
+  `plans/2026-07-24-fk-constraints.md`. **The Datum Type System is now
+  complete (Parts 1-5).** Pk discipline: every typed datum's pk is
+  `PkKind::Uuid` (version-7 enforced at `TypedOpContext`
+  writes/deletes; byte-level `OpContext` stays unrestricted) or
+  `PkKind::Enum(mnemonics)` — well-known names deriving their ids
+  (`enum_pk_id`), derived-on-demand with no seeding, extendable only
+  by schema migration. Constraints
+  (`RelationalConstraintDef { field, references, resolution }`)
+  reference `FkTarget::PkUuid` (runtime check),
+  `FkTarget::PkEnum { mnemonics }` (**zero-dispatch static membership
+  check at `set()`** — the payoff of enum pks), or
+  `FkTarget::SkUnique` (runtime check against the derived sk key;
+  field holds the natural-key value — a spec correction from the
+  earlier Bytes-16 rule, applied to the spec). Lifecycle: new
+  `ExistsCheck`/`ExistsCheckReplied` message pair mirroring
+  `IndexUpdate` (wire `Request::ExistsCheck`/`Response::Exists`,
+  node-to-node AND client-facing), counted in the op's pending-replies
+  state; missing + `Reject` fails the op atomically ("dangling
+  reference"), missing + `Track` dispatches an `IndexUpdate` inserting
+  `(referencing_pk, target)` into the blob-resident `"fk_pending"`
+  kind (pending grows mid-flight) and commits. The commit-or-fail tail
+  was factored into `finish_op_if_settled`, shared by both reply
+  handlers. The eventual scan is pure driver orchestration
+  (`Request::FkPending { List | Remove }` + `ExistsCheck` probes +
+  ordinary `Request::Op` ConflictOp invocation) — no framework
+  threads, no nested op invocation, preserving the Part 2 decision.
+  Documented approximations: write-time `SkUnique` existence is
+  bytes-exist (exact at scan time); fk_pending's driver Remove mutates
+  resident state without write-through (self-healing — ground truth
+  is re-derivable by re-probing). One behavioral wrinkle surfaced by
+  the integration test and kept as-designed: a resolution op that
+  writes another dangling value is simply re-tracked — resolution ops
+  must write a valid reference or delete the datum. Proven end-to-end
+  by `integration_fk_constraints.rs` (enum accept/reject, hard-reject
+  atomic failure, the `_e_`-style out-of-order tracked write with
+  driver-observed natural resolution, and a never-resolved entry
+  driver-resolved via the declared delete-flavored ConflictOp);
+  stress-run 10x plus the standing 20x suites, no flakiness. Deferred
+  per spec: uniqueness defense-in-depth scan, compound/prefix FKs,
+  cascade policies, cross-def type registry.
+
+As of this entry: 10 crates, 388 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -513,14 +557,16 @@ sub-project plans:
 
 - **Datum type system.** Fully designed in
   `specs/2026-07-21-datum-type-system-design.md` (schema, pk/sk/rk/tk,
-  uniqueness/relational constraint enforcement). Parts 1 (schema
-  declaration & field encoding), 2 (sk index + uniqueness constraint),
-  3 (rk — counted-B+Tree leaderboard), and 4 (tk — decomposed
-  bitemporal valid-time field storage, plus the lb leaderboard class
-  built between 3 and 4) are done — see "Done" above. Part 5
-  (relational/FK constraint enforcement) is the remaining
-  not-yet-started plan; after it, the original sequence resumes with
-  Sub-project 4 (Storage Tier).
+  uniqueness/relational constraint enforcement). **Complete**: Parts 1
+  (schema declaration & field encoding), 2 (sk index + uniqueness),
+  3 (rk — counted-B+Tree rank index), 4 (tk — decomposed bitemporal
+  valid-time field storage), and 5 (relational/FK constraints + pk
+  identity discipline), plus the lb leaderboard datum class built
+  between 3 and 4 — see "Done" above. The original sequence resumes
+  with Sub-project 4 (Storage Tier), which now has the full picture of
+  what it must persist: blob datums, self-persisted B+Tree files, the
+  TOAST/free-list requirement, and the datum-grade vs index-grade
+  durability split.
 - **Framework/codegen shape.** Seisin's actual deliverable is base
   libraries a solution uses to define datum types + operations in code,
   compiling into a server executable and a paired client library. None
