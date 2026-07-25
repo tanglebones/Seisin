@@ -586,7 +586,51 @@ commit and push immediately, since work sessions may end abruptly.
   partition orderings, predicate-declared auto-maintained partitions,
   numeric type ids.
 
-As of this entry: 10 crates, 408 tests passing, `cargo fmt --check` and
+- **Sub-project 4, Part A — Storage Tier (delta log, store wire,
+  RemoteStore).** Per `specs/2026-07-25-storage-tier-part-a-design.md`
+  and `plans/2026-07-25-storage-tier-part-a.md`. The durable source of
+  truth over a **static capacity-weighted storage ring** (the existing
+  `Ring` reused with weight units in place of thread counts; gossip/
+  migration are Part B/C). Decision record honored: **storage stays
+  content-agnostic** — semantic field-path patches were re-homed to a
+  future compute-side typed-patch surface; the storage layer speaks
+  only structure-blind byte deltas. Pieces: (1) `seisin-storage::
+  delta` — prefix/suffix-trim `Delta` (diff/apply with strict bounds,
+  codec; copy/insert is a drop-in later), model-tested `apply(old,
+  diff(old,new)) == new` over an LCG corpus; (2) `seisin-storage::
+  datum_log` — append-only Full/Delta/Tombstone log, CRC-framed
+  (hand-rolled crc32), `fdatasync` before every ack (write-before-ack,
+  literally), recovery scan with torn-tail truncation, **self-rebasing**
+  (chain > 8 or cumulative delta bytes > half the value consolidates
+  into a Full — bounding replay and pre-shrinking Part C compaction),
+  `NeedFull` when a delta arrives for an unknown id; (3)
+  `seisin-protocol::store_wire` — independently versioned
+  (`STORE_PROTOCOL_VERSION`) Put/Patch/Get/Delete over the existing
+  framing, one plain blocking TCP connection per compute worker thread
+  (no multiplexing — `Store` is synchronous); (4) `Store::
+  put_with_previous` (defaulted) fed by `Cache::put` with the value it
+  overwrites, so `RemoteStore` ships a Patch when the delta is
+  worthwhile and falls back to Put on cold caches/`NeedFull`/poor
+  deltas; (5) role config (`role: Compute|Storage`, `store_address`,
+  `capacity_weight`) and `main.rs` role dispatch (a storage node runs
+  only the store listener over its log). Failure policy: any storage
+  round-trip failure panics the compute worker naming node + datum —
+  v1 fail-stop; coordinated halt is Part B. **Found during
+  integration**: post-op `release_datums` invalidates the owning
+  thread's cache, so blind write-only ops never have a previous value —
+  the delta path lights up for read-modify-write ops, which is exactly
+  the typed layer's shape (`ensure_tracked` always reads first);
+  documented in the test. Proven end-to-end: write through compute →
+  evict all compute caches → read from storage; **storage restart from
+  the same log directory serves every acked write** (the fsync
+  contract); a one-byte change to a 1 MiB datum grows the log by < 10 KB
+  and reads back exactly; weighted ring spread sanity. Stress 10x +
+  standing 20x suites, no flakiness. Deferred: Part B (storage gossip,
+  coordinated halt, add/remove migration), Part C (compaction,
+  reweighting, tk/lb B+Tree durability, CDC dedup, group commit,
+  copy/insert deltas, chunk-aware wire).
+
+As of this entry: 10 crates, 436 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -614,9 +658,12 @@ persist rather than needing a later rework. Storage Tier Part A/B/C
 resume once the type system is designed.
 
 ## Not started — from the original sub-project sequence
-- **Sub-project 4 — Storage tier.** Storage-role servers, capacity-
-  weighted consistent hashing, storage's own gossip pool, write-through-
-  before-ack wiring, fail-stop halt-on-shard-loss.
+- **Sub-project 4 — Storage tier, Parts B & C.** Part A (storage-role
+  servers, capacity-weighted ring, write-through-before-ack over the
+  delta log) is done — see "Done" above. Remaining: Part B (storage's
+  own gossip pool, coordinated fail-stop halt-on-shard-loss, node
+  add/remove migration) and Part C (log compaction, capacity
+  reweighting, tk/lb B+Tree-file durability, group commit).
 - **Sub-project 5 — Deployment & cluster tests.** Containerized
   multi-node harness, plus remaining cross-node correctness tests from
   the design doc's Testing Strategy.
