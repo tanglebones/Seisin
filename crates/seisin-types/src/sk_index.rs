@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use seisin_core::authority::AuthorityIdx;
 use seisin_core::datum::DatumId;
 use seisin_core::sk::{decode_sk_entries, encode_sk_entries};
-use seisin_node::index_handler::{IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex};
+use seisin_node::index_handler::{
+  IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex, WriteThrough,
+};
 
 use crate::field::FieldValue;
 
@@ -143,7 +145,7 @@ impl ResidentIndex for SkResidentIndex {
       Err(e) => {
         return IndexApplyOutcome {
           violation: Some(format!("malformed sk index payload: {e}")),
-          write_through: None,
+          write_through: WriteThrough::None,
         }
       }
     };
@@ -159,7 +161,7 @@ impl ResidentIndex for SkResidentIndex {
           if self.entries.iter().any(|(id, _)| *id != pk_id) {
             return IndexApplyOutcome {
               violation: Some(conflict_op.clone()),
-              write_through: None,
+              write_through: WriteThrough::None,
             };
           }
         }
@@ -170,7 +172,13 @@ impl ResidentIndex for SkResidentIndex {
     }
     IndexApplyOutcome {
       violation: None,
-      write_through: Some(encode_sk_entries(&self.entries)),
+      // An emptied entry list DELETES the stored datum — an sk key with
+      // no entries must not exist, so exists-probes stay exact.
+      write_through: if self.entries.is_empty() {
+        WriteThrough::Delete
+      } else {
+        WriteThrough::Put(encode_sk_entries(&self.entries))
+      },
     }
   }
 }
@@ -295,7 +303,7 @@ mod tests {
     let mut resident = open_sk(None);
     let outcome = resident.apply(&payload);
     assert!(outcome.violation.is_none());
-    let entries = seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap();
+    let entries = seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap_put()).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, pk_id);
   }
@@ -310,10 +318,9 @@ mod tests {
     }));
     let outcome = resident.apply(&encode_sk_index_op(&SkIndexOp::Remove { pk_id }));
     assert!(outcome.violation.is_none());
-    assert_eq!(
-      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap(),
-      vec![]
-    );
+    // Removing the last entry DELETES the stored datum rather than
+    // persisting an empty blob — exists-probes stay exact.
+    assert!(matches!(outcome.write_through, WriteThrough::Delete));
   }
 
   #[test]
@@ -328,7 +335,7 @@ mod tests {
     let outcome = resident.apply(&payload);
     assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap())
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap_put())
         .unwrap()
         .len(),
       1
@@ -349,7 +356,7 @@ mod tests {
     assert_eq!(outcome.violation, Some("resolve".to_string()));
     // A rejected update writes nothing through — resident/stored state
     // must be left untouched.
-    assert!(outcome.write_through.is_none());
+    assert!(matches!(outcome.write_through, WriteThrough::None));
   }
 
   #[test]
@@ -365,7 +372,7 @@ mod tests {
     }));
     assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap())
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap_put())
         .unwrap()
         .len(),
       2
@@ -378,10 +385,7 @@ mod tests {
     let stored = encode_sk_entries(&[(pk_id, AuthorityIdx::Native)]);
     let mut resident = open_sk(Some(stored));
     let outcome = resident.apply(&encode_sk_index_op(&SkIndexOp::Remove { pk_id }));
-    assert_eq!(
-      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap(),
-      vec![]
-    );
+    assert!(matches!(outcome.write_through, WriteThrough::Delete));
   }
 
   #[test]
@@ -408,7 +412,7 @@ mod tests {
     let outcome = resident.apply(&payload);
     assert!(outcome.violation.is_none());
     assert_eq!(
-      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap()).unwrap()[0].0,
+      seisin_core::sk::decode_sk_entries(&outcome.write_through.unwrap_put()).unwrap()[0].0,
       pk_id
     );
   }

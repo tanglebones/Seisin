@@ -8,7 +8,9 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use seisin_core::datum::DatumId;
-use seisin_node::index_handler::{IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex};
+use seisin_node::index_handler::{
+  IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex, WriteThrough,
+};
 use seisin_protocol::{decode_rk_query_kind, encode_rk_entries, RkQueryKind};
 use seisin_storage::btree::BPlusTree;
 
@@ -65,7 +67,7 @@ impl ResidentIndex for RkResidentIndex {
       Err(e) => {
         return IndexApplyOutcome {
           violation: Some(format!("malformed rk index payload: {e}")),
-          write_through: None,
+          write_through: WriteThrough::None,
         }
       }
     };
@@ -74,7 +76,7 @@ impl ResidentIndex for RkResidentIndex {
       if let Err(e) = tree.remove(&composite_key(old, op.pk_id)) {
         return IndexApplyOutcome {
           violation: Some(format!("rk remove failed: {e}")),
-          write_through: None,
+          write_through: WriteThrough::None,
         };
       }
     }
@@ -82,13 +84,13 @@ impl ResidentIndex for RkResidentIndex {
       if let Err(e) = tree.insert(&composite_key(new, op.pk_id), &op.pk_id.as_bytes()) {
         return IndexApplyOutcome {
           violation: Some(format!("rk insert failed: {e}")),
-          write_through: None,
+          write_through: WriteThrough::None,
         };
       }
     }
     IndexApplyOutcome {
       violation: None,
-      write_through: None,
+      write_through: WriteThrough::None,
     }
   }
 
@@ -162,7 +164,7 @@ mod tests {
     });
     let outcome = resident.apply(&payload);
     assert!(outcome.violation.is_none());
-    assert!(outcome.write_through.is_none()); // self-persisted
+    assert!(matches!(outcome.write_through, WriteThrough::None)); // self-persisted
   }
 
   fn top_n(resident: &dyn ResidentIndex, n: u32) -> Vec<DatumId> {

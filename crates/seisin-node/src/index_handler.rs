@@ -20,17 +20,36 @@ use std::collections::HashMap;
 
 use seisin_core::datum::DatumId;
 
+/// What the worker persists after a successful apply.
+pub enum WriteThrough {
+  /// Self-persisted kinds (rk, lb, tk): the worker writes nothing.
+  None,
+  /// Blob kinds with content: written through to cache/storage.
+  Put(Vec<u8>),
+  /// Blob kinds whose state became EMPTY: the stored datum is deleted,
+  /// so an emptied sk key or drained pending list vanishes rather than
+  /// persisting as an empty blob — bytes-exist checks stay exact.
+  Delete,
+}
+
+impl WriteThrough {
+  /// Test-friendly accessor: the `Put` bytes, panicking otherwise.
+  pub fn unwrap_put(self) -> Vec<u8> {
+    match self {
+      WriteThrough::Put(bytes) => bytes,
+      WriteThrough::None => panic!("expected WriteThrough::Put, got None"),
+      WriteThrough::Delete => panic!("expected WriteThrough::Put, got Delete"),
+    }
+  }
+}
+
 /// The outcome of applying one update to a resident index.
 pub struct IndexApplyOutcome {
   /// `Some(message)` if the update was rejected (e.g. a uniqueness
   /// violation) — a rejected update must leave the resident structure
   /// untouched, since the caller keeps it resident for future updates.
   pub violation: Option<String>,
-  /// New serialized content for the index datum, for kinds whose
-  /// persistence is blob-shaped (sk): the worker writes it through to
-  /// cache/storage. Kinds that manage their own persistence (rk's
-  /// B+Tree file) return `None` and the worker writes nothing.
-  pub write_through: Option<Vec<u8>>,
+  pub write_through: WriteThrough,
 }
 
 /// One index's live, per-owning-thread resident structure. Built once
@@ -118,13 +137,13 @@ mod tests {
       if payload == b"reject" {
         return IndexApplyOutcome {
           violation: Some("rejected".to_string()),
-          write_through: None,
+          write_through: WriteThrough::None,
         };
       }
       self.bytes.extend_from_slice(payload);
       IndexApplyOutcome {
         violation: None,
-        write_through: Some(self.bytes.clone()),
+        write_through: WriteThrough::Put(self.bytes.clone()),
       }
     }
   }
@@ -188,7 +207,9 @@ mod tests {
     let mut resident = kind.open(DatumId::new(), Some(b"warm".to_vec())).unwrap();
     let outcome = resident.apply(b"+more");
     assert!(outcome.violation.is_none());
-    assert_eq!(outcome.write_through, Some(b"warm+more".to_vec()));
+    assert!(
+      matches!(outcome.write_through, WriteThrough::Put(ref b) if b == &b"warm+more".to_vec())
+    );
   }
 
   #[test]
@@ -199,7 +220,7 @@ mod tests {
     let mut resident = kind.open(DatumId::new(), None).unwrap();
     resident.apply(b"a");
     let outcome = resident.apply(b"b");
-    assert_eq!(outcome.write_through, Some(b"ab".to_vec()));
+    assert!(matches!(outcome.write_through, WriteThrough::Put(ref b) if b == &b"ab".to_vec()));
   }
 
   #[test]
@@ -210,6 +231,6 @@ mod tests {
     let mut resident = kind.open(DatumId::new(), None).unwrap();
     let outcome = resident.apply(b"reject");
     assert_eq!(outcome.violation, Some("rejected".to_string()));
-    assert!(outcome.write_through.is_none());
+    assert!(matches!(outcome.write_through, WriteThrough::None));
   }
 }

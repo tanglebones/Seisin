@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use seisin_core::datum::DatumId;
-use seisin_node::index_handler::{IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex};
+use seisin_node::index_handler::{
+  IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex, WriteThrough,
+};
 use seisin_protocol::{
   decode_tk_op, decode_tk_query_req, encode_tk_result, TkOp, TkQueryReq, TkResult, TkSpan,
 };
@@ -316,7 +318,7 @@ impl ResidentIndex for TkResidentHistory {
       violation: Some(
         "tk histories are maintained via execute ops, not framework index updates".to_string(),
       ),
-      write_through: None,
+      write_through: WriteThrough::None,
     }
   }
 

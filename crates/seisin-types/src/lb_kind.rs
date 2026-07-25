@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use seisin_core::datum::DatumId;
-use seisin_node::index_handler::{IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex};
+use seisin_node::index_handler::{
+  IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex, WriteThrough,
+};
 use seisin_protocol::{
   decode_lb_execute_op, decode_lb_query_req, encode_lb_result, LbEntry, LbExecuteOp, LbFriendRank,
   LbQueryReq, LbResult,
@@ -192,7 +194,7 @@ impl ResidentIndex for LbResidentBoard {
       violation: Some(
         "lb boards are maintained via execute ops, not framework index updates".to_string(),
       ),
-      write_through: None,
+      write_through: WriteThrough::None,
     }
   }
 

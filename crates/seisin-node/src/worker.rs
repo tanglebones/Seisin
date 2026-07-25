@@ -546,8 +546,10 @@ impl WorkerHandle {
             };
             let outcome = resident.apply(&payload);
             if outcome.violation.is_none() {
-              if let Some(bytes) = outcome.write_through {
-                cache.put(target, bytes);
+              match outcome.write_through {
+                crate::index_handler::WriteThrough::Put(bytes) => cache.put(target, bytes),
+                crate::index_handler::WriteThrough::Delete => cache.delete(target),
+                crate::index_handler::WriteThrough::None => {}
               }
             }
             reply.respond(op_id, target, outcome.violation);
@@ -1263,7 +1265,7 @@ mod tests {
     fn apply(&mut self, payload: &[u8]) -> crate::index_handler::IndexApplyOutcome {
       crate::index_handler::IndexApplyOutcome {
         violation: self.violation.clone(),
-        write_through: Some(payload.to_vec()),
+        write_through: crate::index_handler::WriteThrough::Put(payload.to_vec()),
       }
     }
 

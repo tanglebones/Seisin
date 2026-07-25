@@ -8,7 +8,9 @@
 //! ConflictOp for the still-missing.
 
 use seisin_core::datum::DatumId;
-use seisin_node::index_handler::{IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex};
+use seisin_node::index_handler::{
+  IndexApplyOutcome, IndexKind, IndexKindRegistry, ResidentIndex, WriteThrough,
+};
 use seisin_protocol::{decode_fk_entries, decode_fk_pending_op, encode_fk_entries, FkPendingOp};
 
 use crate::sk_index::derived_id_namespace;
@@ -29,7 +31,13 @@ impl FkPendingResident {
   fn outcome(&self) -> IndexApplyOutcome {
     IndexApplyOutcome {
       violation: None,
-      write_through: Some(encode_fk_entries(&self.entries)),
+      // A drained pending list DELETES the stored datum — exists-probes
+      // and storage stay exact, same policy as sk.
+      write_through: if self.entries.is_empty() {
+        WriteThrough::Delete
+      } else {
+        WriteThrough::Put(encode_fk_entries(&self.entries))
+      },
     }
   }
 }
@@ -41,7 +49,7 @@ impl ResidentIndex for FkPendingResident {
       Err(e) => {
         return IndexApplyOutcome {
           violation: Some(format!("malformed fk_pending payload: {e}")),
-          write_through: None,
+          write_through: WriteThrough::None,
         }
       }
     };
@@ -67,7 +75,7 @@ impl ResidentIndex for FkPendingResident {
       }
       FkPendingOp::List => IndexApplyOutcome {
         violation: Some("fk_pending List is a query, not an apply".to_string()),
-        write_through: None,
+        write_through: WriteThrough::None,
       },
     }
   }
@@ -195,6 +203,21 @@ mod tests {
     assert!(FkPendingKind
       .open(DatumId::new(), Some(vec![0xFF; 3]))
       .is_err());
+  }
+
+  #[test]
+  fn draining_the_pending_list_deletes_the_stored_datum() {
+    let mut resident = open_pending();
+    let pair = (DatumId::new(), DatumId::new());
+    resident.apply(&encode_fk_pending_op(&FkPendingOp::Insert {
+      referencing_pk: pair.0,
+      target: pair.1,
+    }));
+    let outcome = resident.apply(&encode_fk_pending_op(&FkPendingOp::Remove {
+      referencing_pk: pair.0,
+      target: pair.1,
+    }));
+    assert!(matches!(outcome.write_through, WriteThrough::Delete));
   }
 
   #[test]
