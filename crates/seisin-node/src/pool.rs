@@ -85,9 +85,13 @@ impl WorkerPool {
         seisin_protocol::Request::LbQuery { .. } => return,
         seisin_protocol::Request::TkExecute { .. } => return,
         seisin_protocol::Request::TkQuery { .. } => return,
-        // Temporary until the ExistsCheck worker message exists (next
-        // task): treat as unroutable. FkPending stays client-only.
-        seisin_protocol::Request::ExistsCheck { .. } => return,
+        seisin_protocol::Request::ExistsCheck { datum_id } => WorkerMessage::ExistsCheck {
+          datum_id,
+          // Echo-only for Remote replies — never read on the far side.
+          op_id: DatumId::from_bytes([0; 16]),
+          reply: crate::worker::ExistsReply::Remote(Arc::clone(&link), correlation_id),
+        },
+        // Client-only, never carried over a peer-link.
         seisin_protocol::Request::FkPending { .. } => return,
         seisin_protocol::Request::IndexUpdate {
           target,
@@ -173,6 +177,14 @@ impl WorkerPool {
   ) -> Result<Vec<u8>, String> {
     let (_, thread_id) = self.ring.read().unwrap().native(target);
     self.handles[thread_id.0 as usize].run_index_query(target, index_kind, query)
+  }
+
+  /// Routes an existence probe to whichever local thread natively owns
+  /// `datum_id`. Callers must have already confirmed it resolves to
+  /// this node — see `server.rs`'s redirect check.
+  pub fn run_exists_check(&self, datum_id: DatumId) -> bool {
+    let (_, thread_id) = self.ring.read().unwrap().native(datum_id);
+    self.handles[thread_id.0 as usize].run_exists_check(datum_id)
   }
 
   /// Routes a mutate-with-result op to whichever local thread natively

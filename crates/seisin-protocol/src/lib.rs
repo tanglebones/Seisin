@@ -273,10 +273,14 @@ pub enum Response {
   /// Reply to `TkExecute`/`TkQuery`.
   TkResult(TkResult),
   /// Reply to `ExistsCheck`.
-  Exists { exists: bool },
+  Exists {
+    exists: bool,
+  },
   /// Reply to `FkPending`: the (referencing_pk, missing_target)
   /// entries — the full list for `List`, the remainder for `Remove`.
-  FkPendingResult { entries: Vec<(DatumId, DatumId)> },
+  FkPendingResult {
+    entries: Vec<(DatumId, DatumId)>,
+  },
 }
 
 /// The wire protocol version, carried as the first byte of every

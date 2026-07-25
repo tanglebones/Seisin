@@ -137,6 +137,20 @@ fn handle_connection(
         class,
         query,
       ),
+      Request::ExistsCheck { datum_id } => {
+        handle_exists_check(self_node_id, &ring, &address_book, &pool, datum_id)
+      }
+      Request::FkPending {
+        pending_datum_id,
+        op,
+      } => handle_fk_pending(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        pending_datum_id,
+        op,
+      ),
       // Acquire/Recall/Release/IndexUpdate are node-to-node only,
       // carried over a peer-link connection (see peer_link.rs) — a
       // client should never send one on this client-facing connection.
@@ -344,6 +358,62 @@ fn tk_result_response(result: Result<Vec<u8>, String>) -> Response {
       Ok(result) => Response::TkResult(result),
       Err(e) => Response::OpError {
         message: format!("malformed tk result: {e}"),
+      },
+    },
+    Err(message) => Response::OpError { message },
+  }
+}
+
+/// Client-facing existence probe (the FK scan driver's re-check) —
+/// same redirect routing as everything else.
+fn handle_exists_check(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  datum_id: DatumId,
+) -> Response {
+  if let Some(response) = redirect_if_foreign(self_node_id, ring, address_book, datum_id) {
+    return response;
+  }
+  Response::Exists {
+    exists: pool.run_exists_check(datum_id),
+  }
+}
+
+/// Client-facing fk_pending ops (the scan driver's surface): List via
+/// the read-only query path, Remove via execute. Insert never arrives
+/// here — the write path delivers it as an ordinary IndexUpdate.
+fn handle_fk_pending(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  pending_datum_id: DatumId,
+  op: seisin_protocol::FkPendingOp,
+) -> Response {
+  if let Some(response) = redirect_if_foreign(self_node_id, ring, address_book, pending_datum_id) {
+    return response;
+  }
+  let payload = seisin_protocol::encode_fk_pending_op(&op);
+  let result = match op {
+    seisin_protocol::FkPendingOp::List => {
+      pool.run_index_query(pending_datum_id, "fk_pending".to_string(), payload)
+    }
+    seisin_protocol::FkPendingOp::Remove { .. } => {
+      pool.run_index_execute(pending_datum_id, "fk_pending".to_string(), payload)
+    }
+    seisin_protocol::FkPendingOp::Insert { .. } => {
+      return Response::OpError {
+        message: "fk pending inserts arrive via the write path, not this request".to_string(),
+      }
+    }
+  };
+  match result {
+    Ok(bytes) => match seisin_protocol::decode_fk_entries(&bytes) {
+      Ok(entries) => Response::FkPendingResult { entries },
+      Err(e) => Response::OpError {
+        message: format!("malformed fk pending result: {e}"),
       },
     },
     Err(message) => Response::OpError { message },

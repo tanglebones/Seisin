@@ -123,6 +123,52 @@ pub(crate) enum WorkerMessage {
     payload: Vec<u8>,
     reply: Sender<Result<Vec<u8>, String>>,
   },
+  /// Does `datum_id` have stored/cached content on its owning thread?
+  /// Backs relational-constraint existence checks (op lifecycle) and
+  /// the client-facing scan-driver probe. Exact for pk datums; the
+  /// documented approximation for sk key datums (bytes-exist, not
+  /// entries-exist).
+  ExistsCheck {
+    datum_id: DatumId,
+    op_id: DatumId,
+    reply: ExistsReply,
+  },
+  /// Posted into the originating op's thread inbox once a dispatched
+  /// `ExistsCheck` gets its answer.
+  ExistsCheckReplied {
+    op_id: DatumId,
+    target: DatumId,
+    exists: bool,
+  },
+}
+
+/// Where an `ExistsCheck`'s answer goes — the op lifecycle (local or
+/// cross-node), or a synchronous caller (the server's client-facing
+/// path).
+pub(crate) enum ExistsReply {
+  Local(Sender<WorkerMessage>),
+  Remote(Arc<PeerLink>, u64),
+  Sync(Sender<bool>),
+}
+
+impl ExistsReply {
+  fn respond(self, op_id: DatumId, target: DatumId, exists: bool) {
+    match self {
+      ExistsReply::Local(inbox) => {
+        let _ = inbox.send(WorkerMessage::ExistsCheckReplied {
+          op_id,
+          target,
+          exists,
+        });
+      }
+      ExistsReply::Remote(link, correlation_id) => {
+        link.respond(correlation_id, seisin_protocol::Response::Exists { exists });
+      }
+      ExistsReply::Sync(tx) => {
+        let _ = tx.send(exists);
+      }
+    }
+  }
 }
 
 /// Where an `Acquire`'s eventual grant should be delivered — a local
@@ -221,6 +267,10 @@ struct IndexUpdateState {
   /// several index updates; the whole op fails if *any* of them
   /// reports one, but only one message is kept for the reply.
   violation: Option<String>,
+  /// What to do when a scheduled existence check for a target comes
+  /// back missing — consumed on that reply (`Track` grows `pending`
+  /// mid-flight by dispatching the fk_pending index update).
+  exists_policies: HashMap<DatumId, seisin_ops::context::FkMissingPolicy>,
 }
 
 pub struct WorkerHandle {
@@ -552,31 +602,76 @@ impl WorkerHandle {
                 if violation.is_some() && state.violation.is_none() {
                   state.violation = violation;
                 }
-                if state.pending == 0 {
-                  let record = op_records.remove(&op_id).unwrap();
-                  let state = record.index_update_state.unwrap();
-                  if let Some(message) = state.violation {
-                    let _ = record.reply.send(Err(message));
-                  } else {
-                    for (id, content) in state.staged_writes {
-                      match content {
-                        Some(bytes) => cache.put(id, bytes),
-                        None => cache.delete(id),
+              }
+            }
+            finish_op_if_settled(
+              op_id,
+              &mut op_records,
+              &mut cache,
+              &ring,
+              &peers,
+              &peer_links,
+              self_node_id,
+            );
+          }
+          WorkerMessage::ExistsCheck {
+            datum_id,
+            op_id,
+            reply,
+          } => {
+            let exists = cache.get(datum_id).is_some();
+            reply.respond(op_id, datum_id, exists);
+          }
+          WorkerMessage::ExistsCheckReplied {
+            op_id,
+            target,
+            exists,
+          } => {
+            if let Some(record) = op_records.get_mut(&op_id) {
+              if let Some(state) = &mut record.index_update_state {
+                state.pending -= 1;
+                if !exists {
+                  match state.exists_policies.remove(&target) {
+                    Some(seisin_ops::context::FkMissingPolicy::Track {
+                      pending_datum,
+                      index_kind,
+                      entry,
+                    }) => {
+                      // Dangling but tracked: record it in the pending
+                      // structure and keep the op alive — pending grows
+                      // mid-flight.
+                      state.pending += 1;
+                      dispatch_index_update(
+                        &ring,
+                        &peers,
+                        &peer_links,
+                        self_node_id,
+                        op_id,
+                        pending_datum,
+                        index_kind,
+                        entry,
+                        join_sender.clone(),
+                      );
+                    }
+                    _ => {
+                      if state.violation.is_none() {
+                        state.violation =
+                          Some(format!("dangling reference: {target:?} does not exist"));
                       }
                     }
-                    let _ = record.reply.send(Ok(state.op_result));
                   }
-                  release_datums(
-                    record.acquired,
-                    &mut cache,
-                    &ring,
-                    &peers,
-                    &peer_links,
-                    self_node_id,
-                  );
                 }
               }
             }
+            finish_op_if_settled(
+              op_id,
+              &mut op_records,
+              &mut cache,
+              &ring,
+              &peers,
+              &peer_links,
+              self_node_id,
+            );
           }
         }
       }
@@ -648,6 +743,22 @@ impl WorkerHandle {
         index_kind,
         payload,
         reply: reply_tx,
+      })
+      .expect("worker thread exited unexpectedly");
+    reply_rx.recv().expect("worker dropped the reply channel")
+  }
+
+  /// Asks this thread whether `datum_id` has stored content — the
+  /// synchronous server-path sibling of the op lifecycle's dispatched
+  /// checks.
+  pub fn run_exists_check(&self, datum_id: DatumId) -> bool {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    self
+      .sender
+      .send(WorkerMessage::ExistsCheck {
+        datum_id,
+        op_id: DatumId::from_bytes([0; 16]), // echo-only, never read for Sync replies
+        reply: ExistsReply::Sync(reply_tx),
       })
       .expect("worker thread exited unexpectedly");
     reply_rx.recv().expect("worker dropped the reply channel")
@@ -767,6 +878,7 @@ fn try_run_if_ready(
   );
   let staged_writes = ctx.take_staged_writes();
   let pending_index_updates = ctx.take_pending_index_updates();
+  let pending_exists_checks = ctx.take_pending_exists_checks();
 
   let op_result = match result {
     Err(message) => {
@@ -785,7 +897,7 @@ fn try_run_if_ready(
     Ok(op_result) => op_result,
   };
 
-  if pending_index_updates.is_empty() {
+  if pending_index_updates.is_empty() && pending_exists_checks.is_empty() {
     for (id, content) in staged_writes {
       match content {
         Some(bytes) => cache.put(id, bytes),
@@ -805,12 +917,23 @@ fn try_run_if_ready(
     return;
   }
 
-  let pending = pending_index_updates.len();
+  let pending = pending_index_updates.len() + pending_exists_checks.len();
+  let mut exists_policies = HashMap::new();
+  let mut check_targets = Vec::with_capacity(pending_exists_checks.len());
+  for check in pending_exists_checks {
+    // Last policy wins for a duplicate target within one op — the
+    // typed layer schedules one check per constrained field, so real
+    // duplicates only arise from two constraints referencing the same
+    // datum, where any one policy consuming the miss is acceptable.
+    check_targets.push(check.target);
+    exists_policies.insert(check.target, check.on_missing);
+  }
   record.index_update_state = Some(IndexUpdateState {
     staged_writes,
     op_result,
     pending,
     violation: None,
+    exists_policies,
   });
   for update in pending_index_updates {
     dispatch_index_update(
@@ -824,6 +947,108 @@ fn try_run_if_ready(
       update.payload,
       join_sender.clone(),
     );
+  }
+  for target in check_targets {
+    dispatch_exists_check(
+      ring,
+      peers,
+      peer_links,
+      self_node_id,
+      op_id,
+      target,
+      join_sender.clone(),
+    );
+  }
+}
+
+/// If `op_id`'s index-update phase has no replies outstanding, commit
+/// or fail it — shared by the `IndexUpdateReplied` and
+/// `ExistsCheckReplied` handlers, which both drive `pending` toward
+/// zero (and, for a tracked dangling reference, back up mid-flight).
+fn finish_op_if_settled(
+  op_id: DatumId,
+  op_records: &mut HashMap<DatumId, OpRecord>,
+  cache: &mut Cache,
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
+  self_node_id: NodeId,
+) {
+  let settled = op_records
+    .get(&op_id)
+    .and_then(|record| record.index_update_state.as_ref())
+    .is_some_and(|state| state.pending == 0);
+  if !settled {
+    return;
+  }
+  let record = op_records.remove(&op_id).unwrap();
+  let state = record.index_update_state.unwrap();
+  if let Some(message) = state.violation {
+    let _ = record.reply.send(Err(message));
+  } else {
+    for (id, content) in state.staged_writes {
+      match content {
+        Some(bytes) => cache.put(id, bytes),
+        None => cache.delete(id),
+      }
+    }
+    let _ = record.reply.send(Ok(state.op_result));
+  }
+  release_datums(
+    record.acquired,
+    cache,
+    ring,
+    peers,
+    peer_links,
+    self_node_id,
+  );
+}
+
+/// Sends an `ExistsCheck` for `target` on behalf of `op_id` to
+/// whichever thread `ring.native()` currently names — the same
+/// local/remote split as `dispatch_index_update`. A failed or
+/// unroutable cross-node call counts as `exists: false` (the reactive-
+/// failure convention: never assume a reference exists on silence).
+fn dispatch_exists_check(
+  ring: &Arc<RwLock<Ring>>,
+  peers: &Arc<Vec<Sender<WorkerMessage>>>,
+  peer_links: &Arc<StdMutex<PeerLinkRegistry>>,
+  self_node_id: NodeId,
+  op_id: DatumId,
+  target: DatumId,
+  requester_inbox: Sender<WorkerMessage>,
+) {
+  let (native_node, native_thread) = ring.read().unwrap().native(target);
+  if native_node == self_node_id {
+    let _ = peers[native_thread.0 as usize].send(WorkerMessage::ExistsCheck {
+      datum_id: target,
+      op_id,
+      reply: ExistsReply::Local(requester_inbox),
+    });
+  } else {
+    match peer_links.lock().unwrap().get(native_node) {
+      Some(link) => {
+        link.call(
+          native_thread,
+          seisin_protocol::Request::ExistsCheck { datum_id: target },
+          Box::new(move |response| {
+            let exists = matches!(response, seisin_protocol::Response::Exists { exists: true });
+            let _ = requester_inbox.send(WorkerMessage::ExistsCheckReplied {
+              op_id,
+              target,
+              exists,
+            });
+          }),
+        );
+      }
+      None => {
+        let _ = requester_inbox.send(WorkerMessage::ExistsCheckReplied {
+          op_id,
+          target,
+          exists: false,
+        });
+      }
+    }
   }
 }
 
@@ -1320,6 +1545,128 @@ mod tests {
       .unwrap();
     let result = handles[0].run_index_query(index_target, "echo".to_string(), b"q".to_vec());
     assert_eq!(result, Ok(b"Q".to_vec()));
+  }
+
+  #[test]
+  fn an_exists_check_on_a_present_datum_lets_the_op_commit() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let existing = DatumId::new();
+    let mut ops = OpRegistry::new();
+    register_echo_ops(&mut ops);
+    ops.register(
+      "guarded_touch",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"guarded".to_vec());
+        ctx.schedule_exists_check(existing, seisin_ops::context::FkMissingPolicy::Reject);
+        vec![]
+      }),
+    );
+    let handles = spawn_test_pool(1, ring, ops);
+    handles[0]
+      .run_op(
+        DatumId::new(),
+        "put_first".to_string(),
+        vec![existing],
+        b"here".to_vec(),
+      )
+      .unwrap();
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "guarded_touch".to_string(),
+      vec![DatumId::new()],
+      vec![],
+    );
+    assert_eq!(result, Ok(vec![]));
+  }
+
+  #[test]
+  fn a_missing_reference_with_reject_fails_the_whole_op() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let missing = DatumId::new();
+    let mut ops = OpRegistry::new();
+    register_echo_ops(&mut ops);
+    ops.register(
+      "guarded_touch",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"should not land".to_vec());
+        ctx.schedule_exists_check(missing, seisin_ops::context::FkMissingPolicy::Reject);
+        vec![]
+      }),
+    );
+    let handles = spawn_test_pool(1, ring, ops);
+    let id = DatumId::new();
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "guarded_touch".to_string(),
+      vec![id],
+      vec![],
+    );
+    match result {
+      Err(message) => assert!(message.contains("dangling reference"), "{message}"),
+      other => panic!("expected dangling-reference failure, got {other:?}"),
+    }
+    // Nothing committed.
+    let read = handles[0].run_op(DatumId::new(), "get_first".to_string(), vec![id], vec![]);
+    assert_eq!(read, Ok(vec![]));
+  }
+
+  #[test]
+  fn a_missing_reference_with_track_commits_and_records_the_entry() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let missing = DatumId::new();
+    let pending_datum = DatumId::new();
+    let mut ops = OpRegistry::new();
+    register_echo_ops(&mut ops);
+    ops.register(
+      "tracked_touch",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.put(ids[0], b"landed".to_vec());
+        ctx.schedule_exists_check(
+          missing,
+          seisin_ops::context::FkMissingPolicy::Track {
+            pending_datum,
+            index_kind: "echo".to_string(),
+            entry: vec![42],
+          },
+        );
+        vec![]
+      }),
+    );
+    let mut index_kinds = crate::index_handler::IndexKindRegistry::new();
+    index_kinds.register("echo", Box::new(FixedOutcomeKind { violation: None }));
+    let handles = spawn_test_pool_with_index_kinds(1, ring, ops, index_kinds);
+    let id = DatumId::new();
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "tracked_touch".to_string(),
+      vec![id],
+      vec![],
+    );
+    assert_eq!(result, Ok(vec![])); // committed despite the dangling ref
+    let read = handles[0].run_op(DatumId::new(), "get_first".to_string(), vec![id], vec![]);
+    assert_eq!(read, Ok(b"landed".to_vec()));
+    // The tracked entry reached the pending datum's kind (FixedOutcome
+    // write-through makes it visible as stored bytes).
+    assert!(handles[0].run_exists_check(pending_datum));
+  }
+
+  #[test]
+  fn run_exists_check_answers_synchronously() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let mut ops = OpRegistry::new();
+    register_echo_ops(&mut ops);
+    let handles = spawn_test_pool(1, ring, ops);
+    let id = DatumId::new();
+    assert!(!handles[0].run_exists_check(id));
+    handles[0]
+      .run_op(
+        DatumId::new(),
+        "put_first".to_string(),
+        vec![id],
+        b"x".to_vec(),
+      )
+      .unwrap();
+    assert!(handles[0].run_exists_check(id));
   }
 
   #[test]

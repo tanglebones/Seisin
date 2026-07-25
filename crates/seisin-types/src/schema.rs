@@ -420,8 +420,14 @@ mod tests {
 
   #[test]
   fn enum_pk_id_is_stable_and_distinct_per_type_and_mnemonic() {
-    assert_eq!(enum_pk_id("status", "active"), enum_pk_id("status", "active"));
-    assert_ne!(enum_pk_id("status", "active"), enum_pk_id("status", "closed"));
+    assert_eq!(
+      enum_pk_id("status", "active"),
+      enum_pk_id("status", "active")
+    );
+    assert_ne!(
+      enum_pk_id("status", "active"),
+      enum_pk_id("status", "closed")
+    );
     assert_ne!(enum_pk_id("status", "active"), enum_pk_id("kind", "active"));
   }
 
@@ -437,7 +443,10 @@ mod tests {
   #[test]
   fn check_pk_enforces_membership_on_enum_types() {
     let def = DatumTypeDef::new("status")
-      .pk(PkKind::Enum(vec!["active".to_string(), "closed".to_string()]))
+      .pk(PkKind::Enum(vec![
+        "active".to_string(),
+        "closed".to_string(),
+      ]))
       .field("label", FieldType::String);
     assert!(check_pk(enum_pk_id("status", "active"), &def).is_ok());
     assert!(check_pk(enum_pk_id("status", "closed"), &def).is_ok());

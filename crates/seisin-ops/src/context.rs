@@ -27,10 +27,33 @@ pub struct PendingIndexUpdate {
   pub payload: Vec<u8>,
 }
 
+/// What the framework does when a scheduled existence check finds the
+/// referenced datum missing. Framework-internal, like
+/// `PendingIndexUpdate` — the typed layer constructs these.
+pub enum FkMissingPolicy {
+  /// Fail the whole op (a hard relational constraint).
+  Reject,
+  /// Allow the op to commit, recording the dangling reference in the
+  /// named pending-tracking datum via an ordinary index update (the
+  /// `index_kind` string keeps this crate agnostic of what tracks it).
+  Track {
+    pending_datum: DatumId,
+    index_kind: String,
+    entry: Vec<u8>,
+  },
+}
+
+/// One existence check an op wants performed before it may commit.
+pub struct PendingExistsCheck {
+  pub target: DatumId,
+  pub on_missing: FkMissingPolicy,
+}
+
 pub struct OpContext<'a> {
   cache: &'a mut Cache,
   staged: HashMap<DatumId, Option<Vec<u8>>>,
   pending_index_updates: Vec<PendingIndexUpdate>,
+  pending_exists_checks: Vec<PendingExistsCheck>,
 }
 
 impl<'a> OpContext<'a> {
@@ -39,6 +62,7 @@ impl<'a> OpContext<'a> {
       cache,
       staged: HashMap::new(),
       pending_index_updates: Vec::new(),
+      pending_exists_checks: Vec::new(),
     }
   }
 
@@ -87,6 +111,20 @@ impl<'a> OpContext<'a> {
   /// Drains every index update this op scheduled. Framework-internal.
   pub fn take_pending_index_updates(&mut self) -> Vec<PendingIndexUpdate> {
     std::mem::take(&mut self.pending_index_updates)
+  }
+
+  /// Schedules an existence check against `target`'s owning thread,
+  /// resolved before this op may commit. Framework-internal — the
+  /// typed layer calls this for relational constraints.
+  pub fn schedule_exists_check(&mut self, target: DatumId, on_missing: FkMissingPolicy) {
+    self
+      .pending_exists_checks
+      .push(PendingExistsCheck { target, on_missing });
+  }
+
+  /// Drains every scheduled existence check. Framework-internal.
+  pub fn take_pending_exists_checks(&mut self) -> Vec<PendingExistsCheck> {
+    std::mem::take(&mut self.pending_exists_checks)
   }
 }
 
