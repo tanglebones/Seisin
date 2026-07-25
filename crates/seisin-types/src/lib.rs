@@ -1,10 +1,10 @@
 pub mod driver;
 pub mod encoding;
-pub mod extent;
 pub mod field;
 pub mod fk;
 pub mod lb;
 pub mod lb_kind;
+pub mod partition;
 pub mod rk_index;
 pub mod rk_kind;
 pub mod schema;

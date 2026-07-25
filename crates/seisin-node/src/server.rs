@@ -164,6 +164,17 @@ fn handle_connection(
         offset,
         limit,
       ),
+      Request::PartitionUpdate {
+        partition_datum_id,
+        op,
+      } => handle_partition_update(
+        self_node_id,
+        &ring,
+        &address_book,
+        &pool,
+        partition_datum_id,
+        op,
+      ),
       // Acquire/Recall/Release/IndexUpdate are node-to-node only,
       // carried over a peer-link connection (see peer_link.rs) — a
       // client should never send one on this client-facing connection.
@@ -448,11 +459,37 @@ fn handle_extent_query(
     return response;
   }
   let payload = seisin_protocol::encode_extent_page(offset, limit);
-  match pool.run_index_query(extent_datum_id, "extent".to_string(), payload) {
+  match pool.run_index_query(extent_datum_id, "partition".to_string(), payload) {
     Ok(bytes) => match seisin_protocol::decode_extent_result(&bytes) {
       Ok((total, pks)) => Response::ExtentResult { total, pks },
       Err(e) => Response::OpError {
         message: format!("malformed extent result: {e}"),
+      },
+    },
+    Err(message) => Response::OpError { message },
+  }
+}
+
+/// Client-facing partition membership mutation (the driver's
+/// invalid-set maintenance).
+fn handle_partition_update(
+  self_node_id: NodeId,
+  ring: &Arc<RwLock<Ring>>,
+  address_book: &HashMap<NodeId, String>,
+  pool: &WorkerPool,
+  partition_datum_id: DatumId,
+  op: seisin_protocol::ExtentOp,
+) -> Response {
+  if let Some(response) = redirect_if_foreign(self_node_id, ring, address_book, partition_datum_id)
+  {
+    return response;
+  }
+  let payload = seisin_protocol::encode_extent_op(&op);
+  match pool.run_index_execute(partition_datum_id, "partition".to_string(), payload) {
+    Ok(bytes) => match seisin_protocol::decode_extent_result(&bytes) {
+      Ok((total, pks)) => Response::ExtentResult { total, pks },
+      Err(e) => Response::OpError {
+        message: format!("malformed partition result: {e}"),
       },
     },
     Err(message) => Response::OpError { message },

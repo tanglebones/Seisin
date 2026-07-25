@@ -1,10 +1,13 @@
-//! The `"extent"` kind: one counted-B+Tree file per tracked type
-//! listing that type's datum pks — the rescan driver's enumeration
-//! surface. Maintained automatically by `TypedOpContext` for types
-//! declaring `.track_extent()`; paged via `Request::ExtentQuery`. One
-//! extent datum per type is a create/delete-time write funnel — the
-//! same documented single-datum limitation class as rk, same future
-//! sharding answer.
+//! The `"partition"` kind: a named, pk-ordered subset of a type's
+//! datums as one counted-B+Tree file per partition datum. The full
+//! extent is the trivial partition ("all", framework-maintained for
+//! `.track_extent()` types); the validation system's invalid-set is
+//! another ("invalid", driver-maintained via
+//! `Request::PartitionUpdate` — membership IS the datum's
+//! valid/invalid flag, so no flag churns datum content). Paged via
+//! `Request::ExtentQuery`. One partition datum per (type, partition)
+//! is a write funnel — the same documented single-datum limitation
+//! class as rk, same future sharding answer.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -18,19 +21,29 @@ use seisin_storage::btree::BPlusTree;
 
 use crate::sk_index::derived_id_namespace;
 
-const EXTENT_PAGE_SIZE: u32 = 4096;
+const PARTITION_PAGE_SIZE: u32 = 4096;
 
-/// One extent datum per tracked type.
-pub fn extent_key(type_name: &str) -> DatumId {
-  let name = format!("extent:{type_name}");
+/// One partition datum per (type, partition name).
+pub fn partition_key(type_name: &str, partition: &str) -> DatumId {
+  let name = format!("partition:{type_name}:{partition}");
   DatumId::from_name(&derived_id_namespace(), name.as_bytes())
 }
 
-pub struct ExtentKind {
+/// The trivial full partition — every tracked datum of the type.
+pub fn extent_key(type_name: &str) -> DatumId {
+  partition_key(type_name, "all")
+}
+
+/// The validation system's invalid-set partition.
+pub fn invalid_key(type_name: &str) -> DatumId {
+  partition_key(type_name, "invalid")
+}
+
+pub struct PartitionKind {
   data_dir: PathBuf,
 }
 
-impl ExtentKind {
+impl PartitionKind {
   pub fn new(data_dir: PathBuf) -> Self {
     Self { data_dir }
   }
@@ -42,23 +55,23 @@ fn file_name_for(target: DatumId) -> String {
     .iter()
     .map(|b| format!("{b:02x}"))
     .collect();
-  format!("extent_{hex}.btree")
+  format!("partition_{hex}.btree")
 }
 
-pub struct ExtentResident {
+pub struct PartitionResident {
   // RefCell for the same reason as rk/lb/tk: `query` takes `&self`
   // while B+Tree page reads need `&mut`. Single-threaded by
   // construction.
   tree: RefCell<BPlusTree>,
 }
 
-impl ResidentIndex for ExtentResident {
+impl ResidentIndex for PartitionResident {
   fn apply(&mut self, payload: &[u8]) -> IndexApplyOutcome {
     let op = match decode_extent_op(payload) {
       Ok(op) => op,
       Err(e) => {
         return IndexApplyOutcome {
-          violation: Some(format!("malformed extent payload: {e}")),
+          violation: Some(format!("malformed partition payload: {e}")),
           write_through: WriteThrough::None,
         }
       }
@@ -69,7 +82,7 @@ impl ResidentIndex for ExtentResident {
       ExtentOp::Remove { pk } => tree.remove(&pk.as_bytes()).map(|_| ()),
     };
     IndexApplyOutcome {
-      violation: result.err().map(|e| format!("extent apply failed: {e}")),
+      violation: result.err().map(|e| format!("partition apply failed: {e}")),
       write_through: WriteThrough::None, // self-persisted
     }
   }
@@ -82,14 +95,29 @@ impl ResidentIndex for ExtentResident {
       .scan_from_rank(offset, limit as usize)
       .map_err(|e| e.to_string())?
       .into_iter()
-      .map(|(key, _)| DatumId::from_bytes(key.try_into().expect("extent keys are 16 bytes")))
+      .map(|(key, _)| DatumId::from_bytes(key.try_into().expect("partition keys are 16 bytes")))
       .collect();
     Ok(encode_extent_result(total, &pks))
   }
+
+  /// Driver/solution-maintained membership: Insert/Remove over the
+  /// wire (`Request::PartitionUpdate`), returning the new total. Same
+  /// no-write-through-on-execute note as fk_pending — self-persisted
+  /// here, so it doesn't apply.
+  fn execute(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let op = decode_extent_op(payload).map_err(|e| e.to_string())?;
+    let tree = self.tree.get_mut();
+    match op {
+      ExtentOp::Insert { pk } => tree.insert(&pk.as_bytes(), &[0u8]),
+      ExtentOp::Remove { pk } => tree.remove(&pk.as_bytes()).map(|_| ()),
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(encode_extent_result(tree.len() as u64, &[]))
+  }
 }
 
-impl IndexKind for ExtentKind {
-  /// `stored` is ignored: the extent persists in its own page file.
+impl IndexKind for PartitionKind {
+  /// `stored` is ignored: a partition persists in its own page file.
   fn open(
     &self,
     target: DatumId,
@@ -99,21 +127,26 @@ impl IndexKind for ExtentKind {
     let tree = if path.exists() {
       BPlusTree::open(&path)
     } else {
-      std::fs::create_dir_all(&self.data_dir)
-        .map_err(|e| format!("failed to create extent data dir {:?}: {e}", self.data_dir))?;
-      BPlusTree::create(&path, 16, 1, EXTENT_PAGE_SIZE)
+      std::fs::create_dir_all(&self.data_dir).map_err(|e| {
+        format!(
+          "failed to create partition data dir {:?}: {e}",
+          self.data_dir
+        )
+      })?;
+      BPlusTree::create(&path, 16, 1, PARTITION_PAGE_SIZE)
     }
-    .map_err(|e| format!("failed to open extent file {path:?}: {e}"))?;
-    Ok(Box::new(ExtentResident {
+    .map_err(|e| format!("failed to open partition file {path:?}: {e}"))?;
+    Ok(Box::new(PartitionResident {
       tree: RefCell::new(tree),
     }))
   }
 }
 
-/// Registers the `"extent"` kind — call once at the composition root
-/// wherever `.track_extent()` types exist.
-pub fn register_extent_kind(registry: &mut IndexKindRegistry, data_dir: PathBuf) {
-  registry.register("extent", Box::new(ExtentKind::new(data_dir)));
+/// Registers the `"partition"` kind — call once at the composition
+/// root wherever `.track_extent()` types or driver-maintained
+/// partitions exist.
+pub fn register_partition_kind(registry: &mut IndexKindRegistry, data_dir: PathBuf) {
+  registry.register("partition", Box::new(PartitionKind::new(data_dir)));
 }
 
 #[cfg(test)]
@@ -122,7 +155,7 @@ mod tests {
   use seisin_protocol::{decode_extent_result, encode_extent_op, encode_extent_page};
 
   fn open_extent(dir: &std::path::Path) -> Box<dyn ResidentIndex> {
-    ExtentKind::new(dir.to_path_buf())
+    PartitionKind::new(dir.to_path_buf())
       .open(DatumId::new(), None)
       .unwrap()
   }
@@ -173,7 +206,7 @@ mod tests {
   fn cold_reopen_answers_from_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let target = DatumId::new();
-    let kind = ExtentKind::new(dir.path().to_path_buf());
+    let kind = PartitionKind::new(dir.path().to_path_buf());
     let pk = DatumId::new();
     {
       let mut extent = kind.open(target, None).unwrap();
@@ -183,6 +216,23 @@ mod tests {
     let (total, listed) = page(extent.as_ref(), 0, 10);
     assert_eq!(total, 1);
     assert_eq!(listed, vec![pk]);
+  }
+
+  #[test]
+  fn execute_insert_and_remove_return_the_new_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut partition = open_extent(dir.path());
+    let pk = DatumId::new();
+    let result = partition
+      .execute(&encode_extent_op(&ExtentOp::Insert { pk }))
+      .unwrap();
+    let (total, _) = decode_extent_result(&result).unwrap();
+    assert_eq!(total, 1);
+    let result = partition
+      .execute(&encode_extent_op(&ExtentOp::Remove { pk }))
+      .unwrap();
+    let (total, _) = decode_extent_result(&result).unwrap();
+    assert_eq!(total, 0);
   }
 
   #[test]

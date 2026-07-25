@@ -107,12 +107,21 @@ pub enum Request {
     pending_datum_id: DatumId,
     op: FkPendingOp,
   },
-  /// A page of a type's extent (the set of its datum pks) — client-
-  /// facing only, the rescan driver's enumeration surface.
+  /// A page of a partition (a named, pk-ordered subset of a type's
+  /// datums; the extent is the "all" partition) — client-facing only,
+  /// the rescan driver's enumeration surface. Addresses any partition
+  /// datum by id.
   ExtentQuery {
     extent_datum_id: DatumId,
     offset: u64,
     limit: u32,
+  },
+  /// Driver/solution-maintained partition membership (e.g. the
+  /// "invalid" partition) — client-facing only. Replies with
+  /// `ExtentResult { total, pks: [] }` (the new population).
+  PartitionUpdate {
+    partition_datum_id: DatumId,
+    op: ExtentOp,
   },
 }
 
@@ -355,6 +364,7 @@ const OP_EXISTS_CHECK: u8 = 11;
 const OP_FK_PENDING: u8 = 12;
 
 const OP_EXTENT_QUERY: u8 = 13;
+const OP_PARTITION_UPDATE: u8 = 14;
 
 const EXTENT_OP_INSERT: u8 = 0;
 const EXTENT_OP_REMOVE: u8 = 1;
@@ -506,6 +516,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.extend_from_slice(&extent_datum_id.as_bytes());
       buf.extend_from_slice(&encode_extent_page(*offset, *limit));
     }
+    Request::PartitionUpdate {
+      partition_datum_id,
+      op,
+    } => {
+      buf.push(OP_PARTITION_UPDATE);
+      buf.extend_from_slice(&partition_datum_id.as_bytes());
+      buf.extend_from_slice(&encode_extent_op(op));
+    }
   }
   buf
 }
@@ -555,6 +573,15 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
         extent_datum_id,
         offset,
         limit,
+      })
+    }
+    OP_PARTITION_UPDATE => {
+      let mut cursor = 1;
+      let partition_datum_id = take_id(buf, &mut cursor)?;
+      let op = decode_extent_op(&buf[cursor..])?;
+      Ok(Request::PartitionUpdate {
+        partition_datum_id,
+        op,
       })
     }
     op => bail!("unknown request opcode: {op}"),
@@ -1921,6 +1948,20 @@ mod tests {
         pks: pks.clone(),
       };
       assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+    }
+  }
+
+  #[test]
+  fn round_trips_partition_updates() {
+    for op in [
+      ExtentOp::Insert { pk: DatumId::new() },
+      ExtentOp::Remove { pk: DatumId::new() },
+    ] {
+      let req = Request::PartitionUpdate {
+        partition_datum_id: DatumId::new(),
+        op: op.clone(),
+      };
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
     }
   }
 

@@ -12,9 +12,9 @@ use seisin_core::datum::DatumId;
 use seisin_ops::context::{Expectation, FkMissingPolicy, OpContext};
 use seisin_protocol::{encode_extent_op, encode_fk_pending_op, ExtentOp, FkPendingOp};
 
-use crate::extent::extent_key;
 use crate::field::FieldValue;
 use crate::fk::{fk_deleted_key, fk_pending_key};
+use crate::partition::extent_key;
 use crate::rk_index::{encode_rank_key, encode_rk_index_op, rk_key, RkIndexOp};
 use crate::schema::{decode_datum, encode_datum, DatumTypeDef, FieldCheck, IndexDef, OnDelete};
 use crate::sk_index::{encode_sk_index_op, sk_key, SkIndexOp};
@@ -278,13 +278,13 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
         if tracked.before.is_none() && tracked.after.is_some() {
           self.ctx.schedule_index_update(
             target,
-            "extent",
+            "partition",
             encode_extent_op(&ExtentOp::Insert { pk: pk_id }),
           );
         } else if tracked.before.is_some() && tracked.after.is_none() {
           self.ctx.schedule_index_update(
             target,
-            "extent",
+            "partition",
             encode_extent_op(&ExtentOp::Remove { pk: pk_id }),
           );
         }
@@ -1081,7 +1081,7 @@ mod tests {
 
   #[test]
   fn tracked_types_schedule_extent_inserts_on_create_and_removes_on_delete() {
-    use crate::extent::extent_key;
+    use crate::partition::extent_key;
     let def = DatumTypeDef::new("user")
       .field("name", FieldType::String)
       .track_extent();
@@ -1097,7 +1097,7 @@ mod tests {
     let updates = ctx.take_pending_index_updates();
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].target, extent_key("user"));
-    assert_eq!(updates[0].index_kind, "extent");
+    assert_eq!(updates[0].index_kind, "partition");
     assert!(matches!(
       seisin_protocol::decode_extent_op(&updates[0].payload).unwrap(),
       seisin_protocol::ExtentOp::Insert { pk: p } if p == pk

@@ -13,10 +13,12 @@ use seisin_ops::context::OpContext;
 use seisin_ops::registry::OpRegistry;
 use seisin_protocol::{FkPendingOp, Request, Response};
 use seisin_ring::ring::Ring;
-use seisin_types::driver::validate_type;
-use seisin_types::extent::register_extent_kind;
+use seisin_types::driver::{
+  clear_invalid, mark_invalid, revalidate_invalid, scan_order, validate_type,
+};
 use seisin_types::field::{FieldType, FieldValue};
 use seisin_types::fk::{fk_deleted_key, register_fk_pending_kind};
+use seisin_types::partition::register_partition_kind;
 use seisin_types::schema::{
   ConflictOp, DatumTypeDef, FieldCheck, FkTarget, GuardRef, IndexDef, OnDelete,
   RelationalConstraintDef,
@@ -142,7 +144,7 @@ fn start_node(data_dir: std::path::PathBuf) -> String {
   let mut index_kinds = IndexKindRegistry::new();
   register_sk_index_kind(&mut index_kinds);
   register_fk_pending_kind(&mut index_kinds);
-  register_extent_kind(&mut index_kinds, data_dir);
+  register_partition_kind(&mut index_kinds, data_dir);
 
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let addr = listener.local_addr().unwrap().to_string();
@@ -334,6 +336,32 @@ fn delete_guards_and_rescan_work_over_the_wire() {
     2
   );
   assert!(findings.iter().all(|f| f.pk == foo2));
+
+  // INVALID PARTITION: mark the bad datum from the findings; the fast
+  // path re-checks only that partition, still fails, keeps membership.
+  mark_invalid(&addr, &foo_type(), &[foo2]).unwrap();
+  let still = revalidate_invalid(&addr, &foo_type(), "read", 2).unwrap();
+  assert_eq!(still.len(), 3);
+  assert!(still.iter().all(|f| f.pk == foo2));
+  // Fix the datum (typed write restores validity), re-run: cleared.
+  ok(run_op(
+    &addr,
+    "write_foo",
+    vec![foo2],
+    foo_payload(user2, team2, 7),
+  ));
+  let still = revalidate_invalid(&addr, &foo_type(), "read", 2).unwrap();
+  assert!(still.is_empty(), "{still:?}");
+  // Membership cleared: another pass sees an empty partition.
+  let still = revalidate_invalid(&addr, &foo_type(), "read", 2).unwrap();
+  assert!(still.is_empty());
+  let _ = clear_invalid; // (exercised inside revalidate_invalid)
+
+  // SCAN ORDER: user and team (referenced) come before foo (referencer).
+  let defs = vec![foo_type(), user_type(), team_type()];
+  let order = scan_order(&defs);
+  let names: Vec<&str> = order.iter().map(|&i| defs[i].name.as_str()).collect();
+  assert_eq!(names[2], "foo");
 
   // Guard-requirement sanity: the probe key derivation the guards use
   // matches sk reality (foo declared the sk index on user_id).

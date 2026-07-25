@@ -556,7 +556,37 @@ commit and push immediately, since work sessions may end abruptly.
   spec: macro DSL (three forcing functions now), extent sharding,
   framework-scheduled rescans, cross-def declaration validation.
 
-As of this entry: 10 crates, 403 tests passing, `cargo fmt --check` and
+- **Part 5c — partition index & validation scan order.** Per
+  `specs/2026-07-25-partition-index-and-scan-order-design.md`. The
+  extent generalizes into the **`"partition"` kind**: a named,
+  pk-ordered subset of a type's datums (`partition:{type}:{name}`) —
+  the extent is the trivial `all` partition (framework-maintained,
+  unchanged), and the validation system's invalid-set is the
+  `invalid` partition, **membership being the datum's valid/invalid
+  flag** (a validation verdict must never be a content write churning
+  indexes/versions). Driver-maintained partitions mutate via the new
+  client-facing `Request::PartitionUpdate` (the kind gained
+  `execute`); `Request::ExtentQuery` already addressed any partition
+  datum by id. Driver additions: `mark_invalid`/`clear_invalid`
+  (thin PartitionUpdate wrappers) and `revalidate_invalid` — the
+  checker's fast path, paging only the invalid partition, clearing
+  entries that pass, returning the still-failing (careful pagination:
+  cleared entries shift ranks left). `scan_order(defs)` computes the
+  full-sweep type order from the schema graph: most incoming runtime
+  references first (fixing the most-depended-on data first can
+  resolve the references pointing at it), ties by least outgoing,
+  further ties by derived type id (deterministic; numeric type ids
+  are future schema-registry/DSL work); PkEnum refs excluded
+  everywhere — static refs never dangle. Proven by extending
+  `integration_delete_side_and_rescan.rs` (mark → fast-path re-check
+  keeps membership while broken → typed-write fix → re-check clears →
+  empty partition; scan order putting referenced types before the
+  referencer) plus unit coverage of all three tie-break levels;
+  stress 10x + standing 20x suites, no flakiness. Deferred: custom
+  partition orderings, predicate-declared auto-maintained partitions,
+  numeric type ids.
+
+As of this entry: 10 crates, 408 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
