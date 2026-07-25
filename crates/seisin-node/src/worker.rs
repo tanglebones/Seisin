@@ -267,10 +267,10 @@ struct IndexUpdateState {
   /// several index updates; the whole op fails if *any* of them
   /// reports one, but only one message is kept for the reply.
   violation: Option<String>,
-  /// What to do when a scheduled existence check for a target comes
-  /// back missing — consumed on that reply (`Track` grows `pending`
-  /// mid-flight by dispatching the fk_pending index update).
-  exists_policies: HashMap<DatumId, seisin_ops::context::FkMissingPolicy>,
+  /// What each scheduled existence check asserts — consumed on its
+  /// reply (a missing-but-tracked reference grows `pending` mid-flight
+  /// by dispatching the fk_pending index update).
+  exists_expectations: HashMap<DatumId, seisin_ops::context::Expectation>,
 }
 
 pub struct WorkerHandle {
@@ -632,36 +632,49 @@ impl WorkerHandle {
             if let Some(record) = op_records.get_mut(&op_id) {
               if let Some(state) = &mut record.index_update_state {
                 state.pending -= 1;
-                if !exists {
-                  match state.exists_policies.remove(&target) {
-                    Some(seisin_ops::context::FkMissingPolicy::Track {
+                use seisin_ops::context::{Expectation, FkMissingPolicy};
+                match (exists, state.exists_expectations.remove(&target)) {
+                  (true, Some(Expectation::Present { .. })) => {}
+                  (false, Some(Expectation::Absent { .. })) => {}
+                  (true, Some(Expectation::Absent { message })) => {
+                    if state.violation.is_none() {
+                      state.violation = Some(message);
+                    }
+                  }
+                  (
+                    false,
+                    Some(Expectation::Present {
+                      on_missing:
+                        FkMissingPolicy::Track {
+                          pending_datum,
+                          index_kind,
+                          entry,
+                        },
+                    }),
+                  ) => {
+                    // Dangling but tracked: record it in the pending
+                    // structure and keep the op alive — pending grows
+                    // mid-flight.
+                    state.pending += 1;
+                    dispatch_index_update(
+                      &ring,
+                      &peers,
+                      &peer_links,
+                      self_node_id,
+                      op_id,
                       pending_datum,
                       index_kind,
                       entry,
-                    }) => {
-                      // Dangling but tracked: record it in the pending
-                      // structure and keep the op alive — pending grows
-                      // mid-flight.
-                      state.pending += 1;
-                      dispatch_index_update(
-                        &ring,
-                        &peers,
-                        &peer_links,
-                        self_node_id,
-                        op_id,
-                        pending_datum,
-                        index_kind,
-                        entry,
-                        join_sender.clone(),
-                      );
-                    }
-                    _ => {
-                      if state.violation.is_none() {
-                        state.violation =
-                          Some(format!("dangling reference: {target:?} does not exist"));
-                      }
+                      join_sender.clone(),
+                    );
+                  }
+                  (false, _) => {
+                    if state.violation.is_none() {
+                      state.violation =
+                        Some(format!("dangling reference: {target:?} does not exist"));
                     }
                   }
+                  (true, None) => {}
                 }
               }
             }
@@ -920,22 +933,22 @@ fn try_run_if_ready(
   }
 
   let pending = pending_index_updates.len() + pending_exists_checks.len();
-  let mut exists_policies = HashMap::new();
+  let mut exists_expectations = HashMap::new();
   let mut check_targets = Vec::with_capacity(pending_exists_checks.len());
   for check in pending_exists_checks {
-    // Last policy wins for a duplicate target within one op — the
-    // typed layer schedules one check per constrained field, so real
-    // duplicates only arise from two constraints referencing the same
-    // datum, where any one policy consuming the miss is acceptable.
+    // Last expectation wins for a duplicate target within one op — the
+    // typed layer schedules one check per constrained field/guard, so
+    // real duplicates only arise from two declarations naming the same
+    // datum, where any one consuming the reply is acceptable.
     check_targets.push(check.target);
-    exists_policies.insert(check.target, check.on_missing);
+    exists_expectations.insert(check.target, check.expect);
   }
   record.index_update_state = Some(IndexUpdateState {
     staged_writes,
     op_result,
     pending,
     violation: None,
-    exists_policies,
+    exists_expectations,
   });
   for update in pending_index_updates {
     dispatch_index_update(
@@ -1559,7 +1572,12 @@ mod tests {
       "guarded_touch",
       Box::new(move |ctx: &mut OpContext, ids, _payload| {
         ctx.put(ids[0], b"guarded".to_vec());
-        ctx.schedule_exists_check(existing, seisin_ops::context::FkMissingPolicy::Reject);
+        ctx.schedule_exists_check(
+          existing,
+          seisin_ops::context::Expectation::Present {
+            on_missing: seisin_ops::context::FkMissingPolicy::Reject,
+          },
+        );
         vec![]
       }),
     );
@@ -1591,7 +1609,12 @@ mod tests {
       "guarded_touch",
       Box::new(move |ctx: &mut OpContext, ids, _payload| {
         ctx.put(ids[0], b"should not land".to_vec());
-        ctx.schedule_exists_check(missing, seisin_ops::context::FkMissingPolicy::Reject);
+        ctx.schedule_exists_check(
+          missing,
+          seisin_ops::context::Expectation::Present {
+            on_missing: seisin_ops::context::FkMissingPolicy::Reject,
+          },
+        );
         vec![]
       }),
     );
@@ -1625,10 +1648,12 @@ mod tests {
         ctx.put(ids[0], b"landed".to_vec());
         ctx.schedule_exists_check(
           missing,
-          seisin_ops::context::FkMissingPolicy::Track {
-            pending_datum,
-            index_kind: "echo".to_string(),
-            entry: vec![42],
+          seisin_ops::context::Expectation::Present {
+            on_missing: seisin_ops::context::FkMissingPolicy::Track {
+              pending_datum,
+              index_kind: "echo".to_string(),
+              entry: vec![42],
+            },
           },
         );
         vec![]
@@ -1669,6 +1694,56 @@ mod tests {
       )
       .unwrap();
     assert!(handles[0].run_exists_check(id));
+  }
+
+  #[test]
+  fn an_absent_expectation_fails_when_the_target_exists_and_passes_when_missing() {
+    let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let guarded = DatumId::new();
+    let mut ops = OpRegistry::new();
+    register_echo_ops(&mut ops);
+    ops.register(
+      "delete_guarded",
+      Box::new(move |ctx: &mut OpContext, ids, _payload| {
+        ctx.delete(ids[0]);
+        ctx.schedule_exists_check(
+          guarded,
+          seisin_ops::context::Expectation::Absent {
+            message: "delete restricted: still referenced".to_string(),
+          },
+        );
+        vec![]
+      }),
+    );
+    let handles = spawn_test_pool(1, ring, ops);
+    let id = DatumId::new();
+    // While `guarded` is missing, the Absent expectation passes.
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "delete_guarded".to_string(),
+      vec![id],
+      vec![],
+    );
+    assert_eq!(result, Ok(vec![]));
+    // Once `guarded` exists, the same op is restricted.
+    handles[0]
+      .run_op(
+        DatumId::new(),
+        "put_first".to_string(),
+        vec![guarded],
+        b"ref".to_vec(),
+      )
+      .unwrap();
+    let result = handles[0].run_op(
+      DatumId::new(),
+      "delete_guarded".to_string(),
+      vec![id],
+      vec![],
+    );
+    match result {
+      Err(message) => assert!(message.contains("delete restricted"), "{message}"),
+      other => panic!("expected restriction failure, got {other:?}"),
+    }
   }
 
   #[test]

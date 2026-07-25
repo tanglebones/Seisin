@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use seisin_core::datum::DatumId;
-use seisin_ops::context::{FkMissingPolicy, OpContext};
+use seisin_ops::context::{Expectation, FkMissingPolicy, OpContext};
 use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
 
 use crate::field::FieldValue;
@@ -282,7 +282,9 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
             }),
           },
         };
-        self.ctx.schedule_exists_check(target, on_missing);
+        self
+          .ctx
+          .schedule_exists_check(target, Expectation::Present { on_missing });
       }
     }
   }

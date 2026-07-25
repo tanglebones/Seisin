@@ -44,10 +44,21 @@ pub enum FkMissingPolicy {
   },
 }
 
+/// The polarity a scheduled existence check asserts.
+#[derive(Debug)]
+pub enum Expectation {
+  /// The target must exist (Part 5's write-time FK checks); if it
+  /// doesn't, apply the policy.
+  Present { on_missing: FkMissingPolicy },
+  /// The target must NOT exist (delete-side restrict: "no one may
+  /// still reference me"); if it does, fail the op with `message`.
+  Absent { message: String },
+}
+
 /// One existence check an op wants performed before it may commit.
 pub struct PendingExistsCheck {
   pub target: DatumId,
-  pub on_missing: FkMissingPolicy,
+  pub expect: Expectation,
 }
 
 pub struct OpContext<'a> {
@@ -116,11 +127,12 @@ impl<'a> OpContext<'a> {
 
   /// Schedules an existence check against `target`'s owning thread,
   /// resolved before this op may commit. Framework-internal — the
-  /// typed layer calls this for relational constraints.
-  pub fn schedule_exists_check(&mut self, target: DatumId, on_missing: FkMissingPolicy) {
+  /// typed layer calls this for relational constraints and delete
+  /// guards.
+  pub fn schedule_exists_check(&mut self, target: DatumId, expect: Expectation) {
     self
       .pending_exists_checks
-      .push(PendingExistsCheck { target, on_missing });
+      .push(PendingExistsCheck { target, expect });
   }
 
   /// Drains every scheduled existence check. Framework-internal.
