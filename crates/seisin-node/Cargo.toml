@@ -12,6 +12,7 @@ ron = "0.8"
 seisin-ring = { path = "../seisin-ring" }
 seisin-gossip = { path = "../seisin-gossip" }
 seisin-ops = { path = "../seisin-ops" }
+seisin-storage = { path = "../seisin-storage" }
 
 [dev-dependencies]
 seisin-client = { path = "../seisin-client" }

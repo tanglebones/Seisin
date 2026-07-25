@@ -213,6 +213,7 @@ dependencies = [
  "seisin-ops",
  "seisin-protocol",
  "seisin-ring",
+ "seisin-storage",
  "serde",
 ]
 
@@ -229,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "seisin-core",
+ "seisin-storage",
 ]
 
 [[package]]

@@ -8,5 +8,7 @@ pub mod gossip_state;
 pub mod index_handler;
 pub mod peer_link;
 pub mod pool;
+pub mod remote_store;
 pub mod server;
+pub mod store_server;
 pub mod worker;

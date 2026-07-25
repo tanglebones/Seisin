@@ -142,11 +142,7 @@ impl DatumLog {
 
   /// Reads the record at `offset`, returning `(kind, id, body,
   /// next_offset)` — `None`/`Err` for anything torn or corrupt.
-  fn read_record_at(
-    &mut self,
-    offset: u64,
-    file_len: u64,
-  ) -> Result<Option<RawRecord>> {
+  fn read_record_at(&mut self, offset: u64, file_len: u64) -> Result<Option<RawRecord>> {
     if offset + 4 > file_len {
       return Ok(None);
     }

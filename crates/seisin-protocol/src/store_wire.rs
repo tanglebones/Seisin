@@ -16,12 +16,22 @@ pub const STORE_PROTOCOL_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreRequest {
   /// Full content write — fsynced before the ack.
-  Put { id: DatumId, bytes: Vec<u8> },
+  Put {
+    id: DatumId,
+    bytes: Vec<u8>,
+  },
   /// Byte-delta write against the current value — fsynced before the
   /// ack. `NeedFull` answers a patch for an id the log doesn't know.
-  Patch { id: DatumId, delta: Delta },
-  Get { id: DatumId },
-  Delete { id: DatumId },
+  Patch {
+    id: DatumId,
+    delta: Delta,
+  },
+  Get {
+    id: DatumId,
+  },
+  Delete {
+    id: DatumId,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +39,9 @@ pub enum StoreResponse {
   Ack,
   /// The log has no base for the patched id — resend as `Put`.
   NeedFull,
-  Value { bytes: Option<Vec<u8>> },
+  Value {
+    bytes: Option<Vec<u8>>,
+  },
 }
 
 const REQ_PUT: u8 = 1;

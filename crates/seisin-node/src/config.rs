@@ -7,6 +7,16 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub enum NodeRole {
+  Compute,
+  Storage,
+}
+
+fn default_role() -> NodeRole {
+  NodeRole::Compute
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MemberConfig {
   pub node_id: u64,
@@ -14,6 +24,16 @@ pub struct MemberConfig {
   pub gossip_address: String,
   pub peer_link_address: String,
   pub thread_count: u32,
+  /// Which tier this member serves — compute (default) or storage.
+  #[serde(default = "default_role")]
+  pub role: NodeRole,
+  /// Storage members only: the store-protocol listener address.
+  #[serde(default)]
+  pub store_address: Option<String>,
+  /// Storage members only: virtual-bucket weight in the storage ring —
+  /// nodes with more free space claim proportionally more buckets.
+  #[serde(default)]
+  pub capacity_weight: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +62,28 @@ impl NodeConfig {
   /// Panics if `self_node_id` isn't present in `members` — a config
   /// file that doesn't list itself is a startup-time configuration bug,
   /// not a runtime condition to recover from.
+  /// The storage ring's members: every storage-role member as
+  /// (node_id, capacity_weight) — the same `Ring` type as compute,
+  /// with weight units in place of thread counts.
+  pub fn storage_ring_members(&self) -> Vec<(u64, u32)> {
+    self
+      .members
+      .iter()
+      .filter(|m| m.role == NodeRole::Storage)
+      .map(|m| (m.node_id, m.capacity_weight.unwrap_or(1)))
+      .collect()
+  }
+
+  /// node_id -> store_address for every storage-role member.
+  pub fn store_address_book(&self) -> std::collections::HashMap<u64, String> {
+    self
+      .members
+      .iter()
+      .filter(|m| m.role == NodeRole::Storage)
+      .filter_map(|m| m.store_address.clone().map(|a| (m.node_id, a)))
+      .collect()
+  }
+
   pub fn self_address(&self) -> &str {
     self
       .members
@@ -62,6 +104,7 @@ mod tests {
     members: [
         (node_id: 1, address: "127.0.0.1:7878", gossip_address: "127.0.0.1:8878", peer_link_address: "127.0.0.1:9878", thread_count: 2),
         (node_id: 2, address: "127.0.0.1:7879", gossip_address: "127.0.0.1:8879", peer_link_address: "127.0.0.1:9879", thread_count: 4),
+        (node_id: 3, address: "127.0.0.1:7880", gossip_address: "127.0.0.1:8880", peer_link_address: "127.0.0.1:9880", thread_count: 1, role: Storage, store_address: Some("127.0.0.1:6880"), capacity_weight: Some(4)),
     ],
     data_dir: "/tmp/seisin-data",
 )
@@ -77,7 +120,7 @@ mod tests {
   fn parses_a_well_formed_config() {
     let config = NodeConfig::parse(SAMPLE).unwrap();
     assert_eq!(config.self_node_id, 1);
-    assert_eq!(config.members.len(), 2);
+    assert_eq!(config.members.len(), 3);
     assert_eq!(config.members[1].thread_count, 4);
   }
 
@@ -85,6 +128,18 @@ mod tests {
   fn self_address_finds_the_matching_member() {
     let config = NodeConfig::parse(SAMPLE).unwrap();
     assert_eq!(config.self_address(), "127.0.0.1:7878");
+  }
+
+  #[test]
+  fn parses_roles_weights_and_storage_helpers() {
+    let config = NodeConfig::parse(SAMPLE).unwrap();
+    assert_eq!(config.members[0].role, NodeRole::Compute); // defaulted
+    assert_eq!(config.members[2].role, NodeRole::Storage);
+    assert_eq!(config.storage_ring_members(), vec![(3, 4)]);
+    assert_eq!(
+      config.store_address_book().get(&3).map(|s| s.as_str()),
+      Some("127.0.0.1:6880")
+    );
   }
 
   #[test]

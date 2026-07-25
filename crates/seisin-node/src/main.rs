@@ -22,6 +22,31 @@ fn main() -> Result<()> {
   let config = NodeConfig::load(&config_path)?;
 
   let self_node_id = NodeId(config.self_node_id);
+
+  // Storage-role nodes run only the store listener over the delta log
+  // — no compute listeners, no gossip in Part A (static storage ring).
+  let self_member = config
+    .members
+    .iter()
+    .find(|m| m.node_id == config.self_node_id)
+    .with_context(|| format!("self_node_id {} not in members", config.self_node_id))?;
+  if self_member.role == seisin_node::config::NodeRole::Storage {
+    let store_address = self_member
+      .store_address
+      .clone()
+      .context("storage members must set store_address")?;
+    std::fs::create_dir_all(&config.data_dir)
+      .with_context(|| format!("failed to create data_dir {}", config.data_dir))?;
+    let log_path = std::path::Path::new(&config.data_dir).join("datum_log.dlog");
+    let log = std::sync::Arc::new(std::sync::Mutex::new(
+      seisin_storage::datum_log::DatumLog::open(&log_path)?,
+    ));
+    let listener = TcpListener::bind(&store_address)
+      .with_context(|| format!("failed to bind {store_address}"))?;
+    println!("seisin-node {self_node_id:?} STORAGE role, store listener on {store_address}");
+    seisin_node::store_server::serve_store(listener, log);
+    return Ok(());
+  }
   let self_address = config.self_address().to_string();
   let self_gossip_address = config
     .members
@@ -97,7 +122,28 @@ fn main() -> Result<()> {
     .with_context(|| format!("failed to bind {self_peer_link_address}"))?;
   println!("seisin-node {self_node_id:?} peer-link listener on {self_peer_link_address}");
 
-  let store = Arc::new(InMemoryStore::new());
+  // With storage members configured, compute writes through to the
+  // storage tier (write-before-ack); without any, the in-memory store
+  // keeps single-process deployments working.
+  let storage_members: Vec<(NodeId, u32)> = config
+    .storage_ring_members()
+    .into_iter()
+    .map(|(id, w)| (NodeId(id), w))
+    .collect();
+  let store: Arc<dyn seisin_core::store::Store> = if storage_members.is_empty() {
+    Arc::new(InMemoryStore::new())
+  } else {
+    let storage_ring = Arc::new(RwLock::new(Ring::from_members(&storage_members)));
+    let store_addresses: HashMap<NodeId, String> = config
+      .store_address_book()
+      .into_iter()
+      .map(|(id, addr)| (NodeId(id), addr))
+      .collect();
+    Arc::new(seisin_node::remote_store::RemoteStore::new(
+      storage_ring,
+      Arc::new(store_addresses),
+    ))
+  };
   // No solution has been wired up yet — empty op and index-kind
   // registries until a real solution built on this framework registers
   // its ops and index kinds (e.g. seisin_types::rk_kind::
