@@ -13,6 +13,16 @@ pub trait Store: Send + Sync {
   fn get(&self, id: DatumId) -> Option<Vec<u8>>;
   fn put(&self, id: DatumId, content: Vec<u8>);
   fn delete(&self, id: DatumId);
+
+  /// A put that also carries the caller's previous value for `id`, if
+  /// it holds one — a networked store uses it to ship a byte delta
+  /// instead of the full content (see the Storage Tier design doc).
+  /// The default ignores `previous`; in-memory stores need nothing
+  /// more.
+  fn put_with_previous(&self, id: DatumId, content: Vec<u8>, previous: Option<&[u8]>) {
+    let _ = previous;
+    self.put(id, content);
+  }
 }
 
 #[derive(Default)]

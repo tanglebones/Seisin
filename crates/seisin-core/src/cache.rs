@@ -35,9 +35,14 @@ impl Cache {
   }
 
   /// Writes through to the store, then updates the local cache. Returns
-  /// only after the store write completes.
+  /// only after the store write completes. The value being overwritten
+  /// (if cached) rides along so a networked store can send a byte
+  /// delta rather than the full content.
   pub fn put(&mut self, id: DatumId, content: Vec<u8>) {
-    self.store.put(id, content.clone());
+    let previous = self.entries.get(&id).cloned();
+    self
+      .store
+      .put_with_previous(id, content.clone(), previous.as_deref());
     self.entries.insert(id, content);
   }
 
