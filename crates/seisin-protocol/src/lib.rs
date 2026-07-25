@@ -9,6 +9,8 @@
 //! token wound-wait collation (a later sub-project) uses to resolve
 //! contention between two ops' collation attempts.
 
+pub mod store_wire;
+
 use std::io::{self, Read, Write};
 
 use anyhow::{bail, Context, Result};
