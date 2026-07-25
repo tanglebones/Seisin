@@ -63,6 +63,26 @@ pub fn check_pk(pk_id: DatumId, def: &DatumTypeDef) -> Result<()> {
   Ok(())
 }
 
+/// A declared value-validity check, beyond the field's type — enforced
+/// synchronously at `TypedOpContext::set` and re-verified by the
+/// driver's full-validation rescan (which also catches byte-level
+/// writes that bypassed the typed layer).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldCheck {
+  Gt(FieldValue),
+  Ge(FieldValue),
+  Lt(FieldValue),
+  Le(FieldValue),
+  MinLen(u32),
+  MaxLen(u32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldCheckDef {
+  pub field: String,
+  pub check: FieldCheck,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatumTypeDef {
   pub name: String,
@@ -82,6 +102,7 @@ pub struct DatumTypeDef {
   pub indexes: Vec<IndexDef>,
   pub constraints: Vec<RelationalConstraintDef>,
   pub guards: Vec<GuardRef>,
+  pub checks: Vec<FieldCheckDef>,
 }
 
 /// What an FK-constrained field references — always a declared
@@ -157,7 +178,51 @@ impl DatumTypeDef {
       indexes: Vec::new(),
       constraints: Vec::new(),
       guards: Vec::new(),
+      checks: Vec::new(),
     }
+  }
+
+  /// Declares a field validity check — see `FieldCheck`.
+  ///
+  /// # Panics
+  /// Panics on a schema declaration bug: unknown field, a comparison
+  /// check whose field and bound aren't both I64 or both F64, or a
+  /// length check on a non-String/Bytes field.
+  pub fn check(mut self, field: impl Into<String>, check: FieldCheck) -> Self {
+    let field = field.into();
+    let Some((_, field_ty)) = self.fields.iter().find(|(name, _)| name == &field) else {
+      panic!(
+        "check field {:?} on type {:?} is not a declared field",
+        field, self.name
+      );
+    };
+    match &check {
+      FieldCheck::Gt(bound)
+      | FieldCheck::Ge(bound)
+      | FieldCheck::Lt(bound)
+      | FieldCheck::Le(bound) => {
+        let compatible = matches!(
+          (field_ty, bound),
+          (FieldType::I64, FieldValue::I64(_)) | (FieldType::F64, FieldValue::F64(_))
+        );
+        if !compatible {
+          panic!(
+            "comparison check on field {:?} of type {:?} requires field and bound both I64 or both F64",
+            field, self.name
+          );
+        }
+      }
+      FieldCheck::MinLen(_) | FieldCheck::MaxLen(_) => {
+        if !matches!(field_ty, FieldType::String | FieldType::Bytes) {
+          panic!(
+            "length check on field {:?} of type {:?} requires a String or Bytes field",
+            field, self.name
+          );
+        }
+      }
+    }
+    self.checks.push(FieldCheckDef { field, check });
+    self
   }
 
   /// Declares an incoming-reference guard — see `GuardRef`.
@@ -557,6 +622,28 @@ mod tests {
         },
         resolution: None,
       });
+  }
+
+  #[test]
+  #[should_panic(expected = "not a declared field")]
+  fn a_check_on_an_unknown_field_panics() {
+    DatumTypeDef::new("t").check("nope", FieldCheck::Gt(FieldValue::I64(0)));
+  }
+
+  #[test]
+  #[should_panic(expected = "both I64 or both F64")]
+  fn a_comparison_check_on_a_string_field_panics() {
+    DatumTypeDef::new("t")
+      .field("name", FieldType::String)
+      .check("name", FieldCheck::Gt(FieldValue::I64(0)));
+  }
+
+  #[test]
+  #[should_panic(expected = "String or Bytes")]
+  fn a_length_check_on_an_i64_field_panics() {
+    DatumTypeDef::new("t")
+      .field("age", FieldType::I64)
+      .check("age", FieldCheck::MinLen(1));
   }
 
   #[test]

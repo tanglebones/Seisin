@@ -15,7 +15,7 @@ use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
 use crate::field::FieldValue;
 use crate::fk::{fk_deleted_key, fk_pending_key};
 use crate::rk_index::{encode_rank_key, encode_rk_index_op, rk_key, RkIndexOp};
-use crate::schema::{decode_datum, encode_datum, DatumTypeDef, IndexDef, OnDelete};
+use crate::schema::{decode_datum, encode_datum, DatumTypeDef, FieldCheck, IndexDef, OnDelete};
 use crate::sk_index::{encode_sk_index_op, sk_key, SkIndexOp};
 
 struct TrackedDatum {
@@ -157,6 +157,43 @@ fn check_static_constraints(def: &DatumTypeDef, values: &[FieldValue]) -> Result
         }
       }
       crate::schema::FkTarget::SkUnique { .. } => {}
+    }
+  }
+  for check_def in &def.checks {
+    let Some(field_idx) = def
+      .fields
+      .iter()
+      .position(|(name, _)| name == &check_def.field)
+    else {
+      continue; // declaration validation guarantees presence
+    };
+    let Some(value) = values.get(field_idx) else {
+      continue;
+    };
+    let pass = match (&check_def.check, value) {
+      (FieldCheck::Gt(FieldValue::I64(b)), FieldValue::I64(v)) => v > b,
+      (FieldCheck::Ge(FieldValue::I64(b)), FieldValue::I64(v)) => v >= b,
+      (FieldCheck::Lt(FieldValue::I64(b)), FieldValue::I64(v)) => v < b,
+      (FieldCheck::Le(FieldValue::I64(b)), FieldValue::I64(v)) => v <= b,
+      (FieldCheck::Gt(FieldValue::F64(b)), FieldValue::F64(v)) => v > b,
+      (FieldCheck::Ge(FieldValue::F64(b)), FieldValue::F64(v)) => v >= b,
+      (FieldCheck::Lt(FieldValue::F64(b)), FieldValue::F64(v)) => v < b,
+      (FieldCheck::Le(FieldValue::F64(b)), FieldValue::F64(v)) => v <= b,
+      (FieldCheck::MinLen(n), FieldValue::String(s)) => s.len() >= *n as usize,
+      (FieldCheck::MaxLen(n), FieldValue::String(s)) => s.len() <= *n as usize,
+      (FieldCheck::MinLen(n), FieldValue::Bytes(b)) => b.len() >= *n as usize,
+      (FieldCheck::MaxLen(n), FieldValue::Bytes(b)) => b.len() <= *n as usize,
+      // Declaration validation makes other combinations unreachable;
+      // treat any drift as a failure rather than a silent pass.
+      _ => false,
+    };
+    if !pass {
+      bail!(
+        "field {:?} failed its declared check {:?} with value {:?}",
+        check_def.field,
+        check_def.check,
+        value
+      );
     }
   }
   Ok(())
@@ -986,6 +1023,40 @@ mod tests {
     }
     assert!(ctx.take_pending_exists_checks().is_empty());
     assert!(ctx.take_pending_index_updates().is_empty());
+  }
+
+  #[test]
+  fn field_checks_enforce_boundaries_at_set_time() {
+    use crate::schema::FieldCheck;
+    let def = DatumTypeDef::new("account")
+      .field("balance", FieldType::I64)
+      .field("name", FieldType::String)
+      .field("ratio", FieldType::F64)
+      .check("balance", FieldCheck::Gt(FieldValue::I64(0)))
+      .check("name", FieldCheck::MinLen(1))
+      .check("ratio", FieldCheck::Le(FieldValue::F64(1.0)));
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let mut tctx = TypedOpContext::new(&mut ctx);
+    let ok = vec![
+      FieldValue::I64(1),
+      FieldValue::String("a".to_string()),
+      FieldValue::F64(1.0), // Le boundary accepted
+    ];
+    assert!(tctx.set(DatumId::new(), &def, ok.clone()).is_ok());
+    // Gt(0) rejects 0.
+    let mut bad = ok.clone();
+    bad[0] = FieldValue::I64(0);
+    let err = tctx.set(DatumId::new(), &def, bad).unwrap_err();
+    assert!(err.to_string().contains("balance"), "{err}");
+    // MinLen(1) rejects "".
+    let mut bad = ok.clone();
+    bad[1] = FieldValue::String(String::new());
+    assert!(tctx.set(DatumId::new(), &def, bad).is_err());
+    // Le(1.0) rejects 1.5.
+    let mut bad = ok;
+    bad[2] = FieldValue::F64(1.5);
+    assert!(tctx.set(DatumId::new(), &def, bad).is_err());
   }
 
   #[test]
