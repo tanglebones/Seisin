@@ -215,6 +215,7 @@ dependencies = [
  "seisin-ring",
  "seisin-storage",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
