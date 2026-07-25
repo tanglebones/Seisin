@@ -21,6 +21,14 @@ pub fn fk_pending_key(type_name: &str, field: &str) -> DatumId {
   DatumId::from_name(&derived_id_namespace(), name.as_bytes())
 }
 
+/// One deleted-reference marker datum per (referencing type, field) —
+/// entries are `(deleted_pk, sk_probe_key)`, reusing the `fk_pending`
+/// pair-set kind (documented dual use).
+pub fn fk_deleted_key(type_name: &str, field: &str) -> DatumId {
+  let name = format!("deleted_refs:{type_name}.{field}");
+  DatumId::from_name(&derived_id_namespace(), name.as_bytes())
+}
+
 pub struct FkPendingKind;
 
 pub struct FkPendingResident {

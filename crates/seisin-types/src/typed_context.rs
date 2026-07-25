@@ -13,9 +13,9 @@ use seisin_ops::context::{Expectation, FkMissingPolicy, OpContext};
 use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
 
 use crate::field::FieldValue;
-use crate::fk::fk_pending_key;
+use crate::fk::{fk_deleted_key, fk_pending_key};
 use crate::rk_index::{encode_rank_key, encode_rk_index_op, rk_key, RkIndexOp};
-use crate::schema::{decode_datum, encode_datum, DatumTypeDef, IndexDef};
+use crate::schema::{decode_datum, encode_datum, DatumTypeDef, IndexDef, OnDelete};
 use crate::sk_index::{encode_sk_index_op, sk_key, SkIndexOp};
 
 struct TrackedDatum {
@@ -233,12 +233,52 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
         }
       }
 
+      // Delete-side guards: a real delete (existed before, gone after)
+      // of a guarded datum probes or marks each declared incoming ref.
+      if tracked.after.is_none() {
+        if tracked.before.is_some() {
+          for guard in &tracked.def.guards {
+            let Ok(probe) = sk_key(
+              &guard.type_name,
+              &guard.field,
+              &FieldValue::Bytes(pk_id.as_bytes().to_vec()),
+            ) else {
+              continue;
+            };
+            match guard.on_delete {
+              OnDelete::Restrict => {
+                self.ctx.schedule_exists_check(
+                  probe,
+                  Expectation::Absent {
+                    message: format!(
+                      "delete restricted: {}.{} still references {:?}",
+                      guard.type_name, guard.field, pk_id
+                    ),
+                  },
+                );
+              }
+              OnDelete::Track => {
+                self.ctx.schedule_index_update(
+                  fk_deleted_key(&guard.type_name, &guard.field),
+                  "fk_pending",
+                  encode_fk_pending_op(&FkPendingOp::Insert {
+                    referencing_pk: pk_id,
+                    target: probe,
+                  }),
+                );
+              }
+            }
+          }
+        }
+        continue; // deletes don't create outgoing references
+      }
+
       // Relational constraints: schedule an existence check whenever a
       // constrained field changed (or the datum is new) and holds a
       // value. PkEnum needs no runtime check — membership was already
       // validated synchronously at set().
       let Some(new_values) = tracked.after.as_ref() else {
-        continue; // deletes don't create references
+        continue;
       };
       for constraint in &tracked.def.constraints {
         let Some(field_idx) = tracked
@@ -698,7 +738,7 @@ mod tests {
 
   #[test]
   fn fk_constraints_schedule_exists_checks_with_the_right_policy() {
-    use crate::fk::fk_pending_key;
+    use crate::fk::{fk_deleted_key, fk_pending_key};
     use crate::schema::{FkTarget, RelationalConstraintDef};
     use seisin_ops::context::{Expectation, FkMissingPolicy};
 
@@ -863,6 +903,89 @@ mod tests {
         on_missing: FkMissingPolicy::Reject
       }
     ));
+  }
+
+  #[test]
+  fn delete_side_guards_schedule_restrict_probes_and_track_markers() {
+    use crate::fk::fk_deleted_key;
+    use crate::schema::{GuardRef, OnDelete};
+    use seisin_ops::context::Expectation;
+
+    let user = DatumTypeDef::new("user")
+      .field("name", FieldType::String)
+      .guard(GuardRef {
+        type_name: "foo".to_string(),
+        field: "user_id".to_string(),
+        on_delete: OnDelete::Restrict,
+      })
+      .guard(GuardRef {
+        type_name: "bar".to_string(),
+        field: "user_id".to_string(),
+        on_delete: OnDelete::Track,
+      });
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let pk = DatumId::new();
+    commit_initial(
+      &mut cache,
+      &user,
+      pk,
+      &[FieldValue::String("Cliff".to_string())],
+    );
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.delete(pk, &user).unwrap();
+    }
+    // Restrict guard: an Absent probe at foo's sk key for this pk.
+    let checks = ctx.take_pending_exists_checks();
+    assert_eq!(checks.len(), 1);
+    let expected_probe =
+      sk_key("foo", "user_id", &FieldValue::Bytes(pk.as_bytes().to_vec())).unwrap();
+    assert_eq!(checks[0].target, expected_probe);
+    match &checks[0].expect {
+      Expectation::Absent { message } => {
+        assert!(message.contains("delete restricted"), "{message}")
+      }
+      other => panic!("expected Absent, got {other:?}"),
+    }
+    // Track guard: a marker IndexUpdate at bar's deleted_refs datum.
+    let updates = ctx.take_pending_index_updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].target, fk_deleted_key("bar", "user_id"));
+    assert_eq!(updates[0].index_kind, "fk_pending");
+    match seisin_protocol::decode_fk_pending_op(&updates[0].payload).unwrap() {
+      seisin_protocol::FkPendingOp::Insert {
+        referencing_pk,
+        target,
+      } => {
+        assert_eq!(referencing_pk, pk);
+        assert_eq!(
+          target,
+          sk_key("bar", "user_id", &FieldValue::Bytes(pk.as_bytes().to_vec())).unwrap()
+        );
+      }
+      other => panic!("expected Insert marker, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn deleting_a_nonexistent_guarded_datum_schedules_nothing() {
+    use crate::schema::{GuardRef, OnDelete};
+    let user = DatumTypeDef::new("user")
+      .field("name", FieldType::String)
+      .guard(GuardRef {
+        type_name: "foo".to_string(),
+        field: "user_id".to_string(),
+        on_delete: OnDelete::Restrict,
+      });
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.delete(DatumId::new(), &user).unwrap(); // never existed
+    }
+    assert!(ctx.take_pending_exists_checks().is_empty());
+    assert!(ctx.take_pending_index_updates().is_empty());
   }
 
   #[test]

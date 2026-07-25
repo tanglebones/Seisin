@@ -17,8 +17,12 @@ pub enum PkKind {
   /// A closed set of well-known mnemonics ("active", "closed", ...),
   /// each deterministically deriving its DatumId — the shared-status-
   /// set case, where entities FK by mnemonic rather than uuid.
-  /// Extending the set is a schema migration (a code deploy under the
-  /// n -> n+1 rollout model), never a runtime operation.
+  /// **Append-only**: extending the set is a schema migration (a code
+  /// deploy under the n -> n+1 rollout model), and removing a mnemonic
+  /// is not a legal migration at all — it would orphan every mnemonic
+  /// FK with no tracking machinery to notice. Consequence: enum-pk
+  /// types need no delete-side FK handling; a statically valid
+  /// mnemonic reference stays valid forever.
   Enum(Vec<String>),
 }
 
@@ -77,6 +81,7 @@ pub struct DatumTypeDef {
   pub fields: Vec<(String, FieldType)>,
   pub indexes: Vec<IndexDef>,
   pub constraints: Vec<RelationalConstraintDef>,
+  pub guards: Vec<GuardRef>,
 }
 
 /// What an FK-constrained field references — always a declared
@@ -103,6 +108,33 @@ pub enum FkTarget {
   SkUnique { type_name: String, field: String },
 }
 
+/// Delete-side behavior for an incoming reference — declared on the
+/// REFERENCED type (where the delete runs), the same
+/// cross-def-knowledge compromise as `FkTarget::PkEnum`'s embedded
+/// mnemonics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnDelete {
+  /// Reject the delete while any reference exists.
+  Restrict,
+  /// Allow the delete; leave a marker in `deleted_refs:{type}.{field}`
+  /// for the scan driver, which chains the referencing constraint's
+  /// declared ConflictOp (cascade-delete / rewrite-to-valid are that
+  /// op's policy) one hop per scan pass.
+  Track,
+}
+
+/// One incoming-reference guard on a referenced type. Requirement
+/// (documented, not cross-validatable in v1): the referencing type
+/// must declare a (non-unique) sk index on `field` — the sk key
+/// `sk:{type_name}.{field}:<referenced_pk>` is both the restrict probe
+/// target and the cascade enumeration source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardRef {
+  pub type_name: String,
+  pub field: String,
+  pub on_delete: OnDelete,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalConstraintDef {
   pub field: String,
@@ -124,7 +156,23 @@ impl DatumTypeDef {
       fields: Vec::new(),
       indexes: Vec::new(),
       constraints: Vec::new(),
+      guards: Vec::new(),
     }
+  }
+
+  /// Declares an incoming-reference guard — see `GuardRef`.
+  ///
+  /// # Panics
+  /// Panics on empty names (a schema declaration bug).
+  pub fn guard(mut self, guard: GuardRef) -> Self {
+    if guard.type_name.is_empty() || guard.field.is_empty() {
+      panic!(
+        "guard on type {:?} must name a referencing type and field",
+        self.name
+      );
+    }
+    self.guards.push(guard);
+    self
   }
 
   /// Declares a relational constraint — see `RelationalConstraintDef`.
