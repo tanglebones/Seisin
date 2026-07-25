@@ -1,3 +1,4 @@
+pub mod driver;
 pub mod encoding;
 pub mod extent;
 pub mod field;

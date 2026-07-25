@@ -69,7 +69,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   /// tracked — the datum and its indexes never diverge.
   pub fn set(&mut self, pk_id: DatumId, def: &DatumTypeDef, values: Vec<FieldValue>) -> Result<()> {
     crate::schema::check_pk(pk_id, def)?;
-    check_static_constraints(def, &values)?;
+    run_field_checks(def, &values)?;
     let bytes = encode_datum(def, &values)?;
     self.ensure_tracked(pk_id, def)?;
     self.ctx.put(pk_id, bytes);
@@ -116,11 +116,11 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   }
 }
 
-/// The schema-local constraint checks that need no runtime dispatch —
-/// enforced synchronously at `set` time, before anything is staged:
-/// `PkEnum` membership (the whole point of enum pks — FK validity is
-/// static) and `PkUuid` value shape (exactly 16 bytes, a DatumId).
-fn check_static_constraints(def: &DatumTypeDef, values: &[FieldValue]) -> Result<()> {
+/// The schema-local validity checks that need no runtime dispatch —
+/// enforced synchronously at `set` time before anything is staged, and
+/// re-run by the driver's rescan (`driver::validate_type`): `PkEnum`
+/// membership, `PkUuid` value shape, and declared `FieldCheck`s.
+pub fn run_field_checks(def: &DatumTypeDef, values: &[FieldValue]) -> Result<()> {
   for constraint in &def.constraints {
     let Some(field_idx) = def
       .fields

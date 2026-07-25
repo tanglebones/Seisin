@@ -9,9 +9,9 @@ seisin-node = { path = "../seisin-node" }
 seisin-ops = { path = "../seisin-ops" }
 seisin-protocol = { path = "../seisin-protocol" }
 seisin-storage = { path = "../seisin-storage" }
+seisin-client = { path = "../seisin-client" }
 anyhow = "1"
 
 [dev-dependencies]
 seisin-ring = { path = "../seisin-ring" }
-seisin-client = { path = "../seisin-client" }
 tempfile = "3"
