@@ -515,7 +515,48 @@ commit and push immediately, since work sessions may end abruptly.
   per spec: uniqueness defense-in-depth scan, compound/prefix FKs,
   cascade policies, cross-def type registry.
 
-As of this entry: 10 crates, 388 tests passing, `cargo fmt --check` and
+- **Part 5b — delete-side FK enforcement, field checks, extent &
+  rescan.** Per `specs/2026-07-25-fk-delete-side-and-validation-design.md`
+  and `plans/2026-07-25-fk-delete-side-and-validation.md`. Closes the
+  FK/validation story. (1) **`WriteThrough` enum** (None/Put/Delete):
+  emptied sk entry lists and drained fk_pending lists now DELETE their
+  stored datum instead of persisting empty blobs — Part 5's bytes-exist
+  approximation retired; every exists-probe is exact. (2)
+  **`Expectation`** generalizes exists checks to both polarities
+  (Present-with-policy = write-time FKs; Absent-with-message =
+  delete-side restrict). (3) **Delete-side guards** declared on the
+  referenced type (`GuardRef { type_name, field, on_delete:
+  Restrict|Track }` — the referencing type must declare an sk index on
+  the FK field): Restrict schedules an Absent probe at
+  `sk:{type}.{field}:<pk>` and the delete fails atomically while
+  references exist; Track inserts a `(deleted_pk, sk_probe_key)`
+  marker into `deleted_refs:{type}.{field}` (the fk_pending pair-set
+  kind, documented dual use) and the scan driver chains the
+  referencing constraint's ConflictOp one hop per pass. PkEnum is now
+  documented **append-only** (mnemonic removal is not a legal
+  migration), so enum-pk types need no delete side at all. (4)
+  **Field checks** (`FieldCheck::Gt/Ge/Lt/Le/MinLen/MaxLen`, validated
+  at declaration, enforced at set(), re-run by the rescan). (5)
+  **Type extent**: the `"extent"` kind (self-persisted B+Tree of pks,
+  opt-in `.track_extent()`, maintained automatically on
+  create/delete), paged via `Request::ExtentQuery`/`ExtentResult`;
+  single-datum-per-type funnel documented (rk's limitation class).
+  (6) **Driver rescan**: `rescan_every_millis` declared per type
+  (driver guidance only) and `driver::validate_type(addr, def,
+  read_op, page_size) -> Vec<ValidationFinding>` — pages the extent,
+  re-runs field checks/enum membership, probes every runtime FK
+  target; incoming validation falls out of every type's outgoing scan
+  plus the delete markers. Proven end-to-end by
+  `integration_delete_side_and_rescan.rs`: a restricted delete
+  rejected then succeeding after the driver-run cascade (marker → sk
+  enumeration → ConflictOp → WriteThrough::Delete emptying the sk
+  key), and the rescan finding exactly the check violation + two
+  dangling refs seeded by a byte-level write that bypassed the typed
+  layer. Stress 10x + standing 20x suites, no flakiness. Deferred per
+  spec: macro DSL (three forcing functions now), extent sharding,
+  framework-scheduled rescans, cross-def declaration validation.
+
+As of this entry: 10 crates, 403 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
