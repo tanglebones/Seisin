@@ -738,7 +738,7 @@ mod tests {
 
   #[test]
   fn fk_constraints_schedule_exists_checks_with_the_right_policy() {
-    use crate::fk::{fk_deleted_key, fk_pending_key};
+    use crate::fk::fk_pending_key;
     use crate::schema::{FkTarget, RelationalConstraintDef};
     use seisin_ops::context::{Expectation, FkMissingPolicy};
 
