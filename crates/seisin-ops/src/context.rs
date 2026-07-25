@@ -30,6 +30,7 @@ pub struct PendingIndexUpdate {
 /// What the framework does when a scheduled existence check finds the
 /// referenced datum missing. Framework-internal, like
 /// `PendingIndexUpdate` — the typed layer constructs these.
+#[derive(Debug)]
 pub enum FkMissingPolicy {
   /// Fail the whole op (a hard relational constraint).
   Reject,

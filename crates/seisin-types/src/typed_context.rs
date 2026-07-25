@@ -9,9 +9,11 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use seisin_core::datum::DatumId;
-use seisin_ops::context::OpContext;
+use seisin_ops::context::{FkMissingPolicy, OpContext};
+use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
 
 use crate::field::FieldValue;
+use crate::fk::fk_pending_key;
 use crate::rk_index::{encode_rank_key, encode_rk_index_op, rk_key, RkIndexOp};
 use crate::schema::{decode_datum, encode_datum, DatumTypeDef, IndexDef};
 use crate::sk_index::{encode_sk_index_op, sk_key, SkIndexOp};
@@ -230,6 +232,58 @@ impl<'a, 'b> Drop for TypedOpContext<'a, 'b> {
           }
         }
       }
+
+      // Relational constraints: schedule an existence check whenever a
+      // constrained field changed (or the datum is new) and holds a
+      // value. PkEnum needs no runtime check — membership was already
+      // validated synchronously at set().
+      let Some(new_values) = tracked.after.as_ref() else {
+        continue; // deletes don't create references
+      };
+      for constraint in &tracked.def.constraints {
+        let Some(field_idx) = tracked
+          .def
+          .fields
+          .iter()
+          .position(|(name, _)| name == &constraint.field)
+        else {
+          continue;
+        };
+        let old_value = tracked.before.as_ref().map(|v| v[field_idx].clone());
+        if old_value.as_ref() == Some(&new_values[field_idx]) {
+          continue; // unchanged reference — already checked when set
+        }
+        let target = match &constraint.references {
+          crate::schema::FkTarget::PkEnum { .. } => continue,
+          crate::schema::FkTarget::PkUuid { .. } => {
+            let FieldValue::Bytes(bytes) = &new_values[field_idx] else {
+              continue;
+            };
+            let Ok(raw) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+              continue; // shape enforced at set(); belt and braces
+            };
+            DatumId::from_bytes(raw)
+          }
+          crate::schema::FkTarget::SkUnique { type_name, field } => {
+            match sk_key(type_name, field, &new_values[field_idx]) {
+              Ok(id) => id,
+              Err(_) => continue, // non-primitive rejected at declaration
+            }
+          }
+        };
+        let on_missing = match &constraint.resolution {
+          None => FkMissingPolicy::Reject,
+          Some(_) => FkMissingPolicy::Track {
+            pending_datum: fk_pending_key(&tracked.def.name, &constraint.field),
+            index_kind: "fk_pending".to_string(),
+            entry: encode_fk_pending_op(&FkPendingOp::Insert {
+              referencing_pk: pk_id,
+              target,
+            }),
+          },
+        };
+        self.ctx.schedule_exists_check(target, on_missing);
+      }
     }
   }
 }
@@ -243,7 +297,8 @@ mod tests {
   use crate::sk_index::{decode_sk_index_op, sk_key, SkIndexOp};
   use seisin_core::cache::Cache;
   use seisin_core::store::InMemoryStore;
-  use seisin_ops::context::OpContext;
+  use seisin_ops::context::{FkMissingPolicy, OpContext};
+  use seisin_protocol::{encode_fk_pending_op, FkPendingOp};
   use std::sync::Arc;
 
   fn user_type() -> DatumTypeDef {
@@ -638,6 +693,162 @@ mod tests {
         ],
       )
       .is_ok());
+  }
+
+  #[test]
+  fn fk_constraints_schedule_exists_checks_with_the_right_policy() {
+    use crate::fk::fk_pending_key;
+    use crate::schema::{FkTarget, RelationalConstraintDef};
+    use seisin_ops::context::FkMissingPolicy;
+
+    let customer_id = DatumId::new();
+    let order_reject = DatumTypeDef::new("order")
+      .field("customer_id", FieldType::Bytes)
+      .constraint(RelationalConstraintDef {
+        field: "customer_id".to_string(),
+        references: FkTarget::PkUuid {
+          type_name: "customer".to_string(),
+        },
+        resolution: None,
+      });
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx
+        .set(
+          DatumId::new(),
+          &order_reject,
+          vec![FieldValue::Bytes(customer_id.as_bytes().to_vec())],
+        )
+        .unwrap();
+    }
+    let checks = ctx.take_pending_exists_checks();
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].target, customer_id);
+    assert!(matches!(checks[0].on_missing, FkMissingPolicy::Reject));
+
+    // With a resolution declared: Track, aimed at the right pending
+    // datum, carrying a decodable Insert entry.
+    let order_track = DatumTypeDef::new("order")
+      .field("customer_id", FieldType::Bytes)
+      .constraint(RelationalConstraintDef {
+        field: "customer_id".to_string(),
+        references: FkTarget::PkUuid {
+          type_name: "customer".to_string(),
+        },
+        resolution: Some(ConflictOp("null_customer".to_string())),
+      });
+    let pk = DatumId::new();
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx
+        .set(
+          pk,
+          &order_track,
+          vec![FieldValue::Bytes(customer_id.as_bytes().to_vec())],
+        )
+        .unwrap();
+    }
+    let checks = ctx.take_pending_exists_checks();
+    assert_eq!(checks.len(), 1);
+    match &checks[0].on_missing {
+      FkMissingPolicy::Track {
+        pending_datum,
+        index_kind,
+        entry,
+      } => {
+        assert_eq!(*pending_datum, fk_pending_key("order", "customer_id"));
+        assert_eq!(index_kind, "fk_pending");
+        match seisin_protocol::decode_fk_pending_op(entry).unwrap() {
+          seisin_protocol::FkPendingOp::Insert {
+            referencing_pk,
+            target,
+          } => {
+            assert_eq!(referencing_pk, pk);
+            assert_eq!(target, customer_id);
+          }
+          other => panic!("expected Insert, got {other:?}"),
+        }
+      }
+      other => panic!("expected Track, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn unchanged_and_enum_fk_fields_schedule_no_exists_checks() {
+    use crate::schema::{FkTarget, RelationalConstraintDef};
+    let def = DatumTypeDef::new("order")
+      .field("status", FieldType::String)
+      .field("customer_id", FieldType::Bytes)
+      .constraint(RelationalConstraintDef {
+        field: "status".to_string(),
+        references: FkTarget::PkEnum {
+          type_name: "status".to_string(),
+          mnemonics: vec!["active".to_string()],
+        },
+        resolution: None,
+      })
+      .constraint(RelationalConstraintDef {
+        field: "customer_id".to_string(),
+        references: FkTarget::PkUuid {
+          type_name: "customer".to_string(),
+        },
+        resolution: None,
+      });
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let pk = DatumId::new();
+    let values = vec![
+      FieldValue::String("active".to_string()),
+      FieldValue::Bytes(DatumId::new().as_bytes().to_vec()),
+    ];
+    commit_initial(&mut cache, &def, pk, &values);
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx.get(pk, &def).unwrap();
+      tctx.set(pk, &def, values).unwrap(); // nothing changed
+    }
+    // Enum constraint never schedules; unchanged uuid FK skipped.
+    assert!(ctx.take_pending_exists_checks().is_empty());
+  }
+
+  #[test]
+  fn sk_unique_constraints_target_the_derived_sk_key() {
+    use crate::schema::{FkTarget, RelationalConstraintDef};
+    use seisin_ops::context::FkMissingPolicy;
+    let def = DatumTypeDef::new("order")
+      .field("user_email", FieldType::String)
+      .constraint(RelationalConstraintDef {
+        field: "user_email".to_string(),
+        references: FkTarget::SkUnique {
+          type_name: "user".to_string(),
+          field: "email".to_string(),
+        },
+        resolution: None,
+      });
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx
+        .set(
+          DatumId::new(),
+          &def,
+          vec![FieldValue::String("a@example.com".to_string())],
+        )
+        .unwrap();
+    }
+    let checks = ctx.take_pending_exists_checks();
+    assert_eq!(checks.len(), 1);
+    let expected = sk_key(
+      "user",
+      "email",
+      &FieldValue::String("a@example.com".to_string()),
+    )
+    .unwrap();
+    assert_eq!(checks[0].target, expected);
+    assert!(matches!(checks[0].on_missing, FkMissingPolicy::Reject));
   }
 
   #[test]

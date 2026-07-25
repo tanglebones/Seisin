@@ -1,5 +1,6 @@
 pub mod encoding;
 pub mod field;
+pub mod fk;
 pub mod lb;
 pub mod lb_kind;
 pub mod rk_index;
