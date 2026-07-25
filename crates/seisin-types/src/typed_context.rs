@@ -700,7 +700,7 @@ mod tests {
   fn fk_constraints_schedule_exists_checks_with_the_right_policy() {
     use crate::fk::fk_pending_key;
     use crate::schema::{FkTarget, RelationalConstraintDef};
-    use seisin_ops::context::FkMissingPolicy;
+    use seisin_ops::context::{Expectation, FkMissingPolicy};
 
     let customer_id = DatumId::new();
     let order_reject = DatumTypeDef::new("order")
@@ -727,7 +727,12 @@ mod tests {
     let checks = ctx.take_pending_exists_checks();
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].target, customer_id);
-    assert!(matches!(checks[0].on_missing, FkMissingPolicy::Reject));
+    assert!(matches!(
+      checks[0].expect,
+      Expectation::Present {
+        on_missing: FkMissingPolicy::Reject
+      }
+    ));
 
     // With a resolution declared: Track, aimed at the right pending
     // datum, carrying a decodable Insert entry.
@@ -753,11 +758,14 @@ mod tests {
     }
     let checks = ctx.take_pending_exists_checks();
     assert_eq!(checks.len(), 1);
-    match &checks[0].on_missing {
-      FkMissingPolicy::Track {
-        pending_datum,
-        index_kind,
-        entry,
+    match &checks[0].expect {
+      Expectation::Present {
+        on_missing:
+          FkMissingPolicy::Track {
+            pending_datum,
+            index_kind,
+            entry,
+          },
       } => {
         assert_eq!(*pending_datum, fk_pending_key("order", "customer_id"));
         assert_eq!(index_kind, "fk_pending");
@@ -817,7 +825,7 @@ mod tests {
   #[test]
   fn sk_unique_constraints_target_the_derived_sk_key() {
     use crate::schema::{FkTarget, RelationalConstraintDef};
-    use seisin_ops::context::FkMissingPolicy;
+    use seisin_ops::context::{Expectation, FkMissingPolicy};
     let def = DatumTypeDef::new("order")
       .field("user_email", FieldType::String)
       .constraint(RelationalConstraintDef {
@@ -849,7 +857,12 @@ mod tests {
     )
     .unwrap();
     assert_eq!(checks[0].target, expected);
-    assert!(matches!(checks[0].on_missing, FkMissingPolicy::Reject));
+    assert!(matches!(
+      checks[0].expect,
+      Expectation::Present {
+        on_missing: FkMissingPolicy::Reject
+      }
+    ));
   }
 
   #[test]
