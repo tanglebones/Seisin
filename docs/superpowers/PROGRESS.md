@@ -630,7 +630,45 @@ commit and push immediately, since work sessions may end abruptly.
   reweighting, tk/lb B+Tree durability, CDC dedup, group commit,
   copy/insert deltas, chunk-aware wire).
 
-As of this entry: 10 crates, 436 tests passing, `cargo fmt --check` and
+- **Sub-project 4, Part B — Storage membership & coordinated fail-stop
+  halt.** Per `specs/2026-07-26-storage-tier-part-b-design.md` and
+  `plans/2026-07-26-storage-tier-part-b.md`. Storage nodes join the
+  **one existing gossip network, role-tagged** rather than getting a
+  second pool: `MemberRole::{Compute,Storage}` plus `capacity_weight`
+  and `store_address` on `MemberUpdate`/`MemberRecord` and the wire
+  codec (`GOSSIP_PROTOCOL_VERSION = 2`; v1 decoding deliberately
+  dropped — pre-first-release, so the n±1 keep-old-decoder policy binds
+  from the first deployed release, not from v1). Pieces: (1)
+  `ClusterState { compute_ring, storage_ring, store_addresses, halt }`
+  threaded through gossip server/loop; `apply_ready_mutations` routes
+  by role — compute Join/Leave mutate the compute ring (plus eviction
+  and lock release) exactly as before, a storage Join extends the
+  storage ring (`weight.max(1)`) and address book live, and a
+  **storage Leave engages the halt** (no ring mutation — the ring must
+  keep naming the dead node's shards so nothing silently re-homes;
+  no replication in v1 means shard loss is unrecoverable, so the only
+  safe move is stopping the world with a reason). (2)
+  `HaltState` (first reason wins) gates `serve` before dispatch: every
+  client op on a halted node gets `OpError` carrying the halt reason.
+  (3) `serve_gossip_storage` — storage nodes run an ack-only gossip
+  responder (merge incoming, reply with piggyback; no rings, no pool),
+  so compute failure detectors probe them like any member while
+  storage stays out of the mutation business; `main.rs` storage branch
+  runs store listener + this responder. RemoteStore's address book is
+  now the shared `Arc<RwLock<...>>` so gossip-discovered storage nodes
+  become routable without restart. Proven end-to-end in
+  `integration_storage_halt.rs`: a real storage node (log + store +
+  gossip responder) serves write-through while healthy and the halt
+  stays disengaged; a compute node whose config names a
+  silent-from-the-start storage member confirms it dead via the
+  standard SWIM path → halt engages naming the node → client ops
+  return the "cluster halted" reason → the compute ring is untouched.
+  Stress 10x + standing 20x suites, no flakiness. Deferred to Part C:
+  add/remove migration (a storage Join rebalances nothing yet — new
+  weight only affects new placement), storage-side self-halt,
+  auto-resume with log identity.
+
+As of this entry: 10 crates, 440 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -658,12 +696,12 @@ persist rather than needing a later rework. Storage Tier Part A/B/C
 resume once the type system is designed.
 
 ## Not started — from the original sub-project sequence
-- **Sub-project 4 — Storage tier, Parts B & C.** Part A (storage-role
-  servers, capacity-weighted ring, write-through-before-ack over the
-  delta log) is done — see "Done" above. Remaining: Part B (storage's
-  own gossip pool, coordinated fail-stop halt-on-shard-loss, node
-  add/remove migration) and Part C (log compaction, capacity
-  reweighting, tk/lb B+Tree-file durability, group commit).
+- **Sub-project 4 — Storage tier, Part C.** Parts A (delta log,
+  store wire, RemoteStore) and B (role-tagged gossip membership,
+  coordinated fail-stop halt) are done — see "Done" above. Remaining:
+  Part C (node add/remove migration + capacity reweighting as one
+  unified mechanism, log compaction, tk/lb B+Tree-file durability,
+  group commit).
 - **Sub-project 5 — Deployment & cluster tests.** Containerized
   multi-node harness, plus remaining cross-node correctness tests from
   the design doc's Testing Strategy.
