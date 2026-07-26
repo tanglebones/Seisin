@@ -7,7 +7,7 @@ use std::time::Duration;
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
 use seisin_core::store::InMemoryStore;
-use seisin_gossip::membership::{Incarnation, MemberStatus, MemberUpdate};
+use seisin_gossip::membership::{Incarnation, MemberRole, MemberStatus, MemberUpdate};
 use seisin_node::gossip_client::run_gossip_loop;
 use seisin_node::gossip_server::serve_gossip;
 use seisin_node::gossip_state::GossipState;
@@ -54,6 +54,9 @@ fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String, String)]
         client_address: member.2.clone(),
         gossip_address: member.3.clone(),
         thread_count: member.1,
+        role: MemberRole::Compute,
+        capacity_weight: 0,
+        store_address: String::new(),
       });
     }
   }

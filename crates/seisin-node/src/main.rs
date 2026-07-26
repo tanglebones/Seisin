@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use seisin_core::authority::NodeId;
 use seisin_core::store::InMemoryStore;
-use seisin_gossip::membership::{Incarnation, MemberStatus, MemberUpdate};
+use seisin_gossip::membership::{Incarnation, MemberRole, MemberStatus, MemberUpdate};
 use seisin_node::config::NodeConfig;
 use seisin_node::gossip_client::run_gossip_loop;
 use seisin_node::gossip_server::serve_gossip;
@@ -114,6 +114,12 @@ fn main() -> Result<()> {
         client_address: member.address.clone(),
         gossip_address: member.gossip_address.clone(),
         thread_count: member.thread_count,
+        role: match member.role {
+          seisin_node::config::NodeRole::Compute => MemberRole::Compute,
+          seisin_node::config::NodeRole::Storage => MemberRole::Storage,
+        },
+        capacity_weight: member.capacity_weight.unwrap_or(1),
+        store_address: member.store_address.clone().unwrap_or_default(),
       });
     }
   }

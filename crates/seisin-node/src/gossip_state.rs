@@ -123,7 +123,7 @@ pub fn apply_ready_mutations(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use seisin_gossip::membership::{Incarnation, MemberStatus};
+  use seisin_gossip::membership::{Incarnation, MemberRole, MemberStatus};
 
   fn sample_update(node_id: u64) -> MemberUpdate {
     MemberUpdate {
@@ -133,6 +133,9 @@ mod tests {
       client_address: "127.0.0.1:7878".to_string(),
       gossip_address: "127.0.0.1:8878".to_string(),
       thread_count: 1,
+      role: MemberRole::Compute,
+      capacity_weight: 0,
+      store_address: String::new(),
     }
   }
 

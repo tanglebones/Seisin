@@ -34,6 +34,16 @@ impl MemberStatus {
   }
 }
 
+/// Which tier a member serves — compute (the default) or storage.
+/// Storage members carry a `capacity_weight` (virtual-bucket count in
+/// the storage ring) and a `store_address` (their store-protocol
+/// listener); both are zero/empty for compute members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberRole {
+  Compute,
+  Storage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberUpdate {
   pub node_id: NodeId,
@@ -42,11 +52,17 @@ pub struct MemberUpdate {
   pub client_address: String,
   pub gossip_address: String,
   pub thread_count: u32,
+  pub role: MemberRole,
+  pub capacity_weight: u32,
+  pub store_address: String,
 }
 
 struct MemberRecord {
   incarnation: Incarnation,
   status: MemberStatus,
+  role: MemberRole,
+  capacity_weight: u32,
+  store_address: String,
   client_address: String,
   gossip_address: String,
   thread_count: u32,
@@ -61,6 +77,9 @@ impl MemberRecord {
       client_address: self.client_address.clone(),
       gossip_address: self.gossip_address.clone(),
       thread_count: self.thread_count,
+      role: self.role,
+      capacity_weight: self.capacity_weight,
+      store_address: self.store_address.clone(),
     }
   }
 }
@@ -87,6 +106,9 @@ impl MemberTable {
         slot.insert(MemberRecord {
           incarnation: update.incarnation,
           status: update.status,
+          role: update.role,
+          capacity_weight: update.capacity_weight,
+          store_address: update.store_address,
           client_address: update.client_address,
           gossip_address: update.gossip_address,
           thread_count: update.thread_count,
@@ -102,6 +124,9 @@ impl MemberTable {
           slot.insert(MemberRecord {
             incarnation: update.incarnation,
             status: update.status,
+            role: update.role,
+            capacity_weight: update.capacity_weight,
+            store_address: update.store_address,
             client_address: update.client_address,
             gossip_address: update.gossip_address,
             thread_count: update.thread_count,
@@ -196,6 +221,9 @@ mod tests {
       client_address: "127.0.0.1:7878".to_string(),
       gossip_address: "127.0.0.1:8878".to_string(),
       thread_count: 2,
+      role: MemberRole::Compute,
+      capacity_weight: 0,
+      store_address: String::new(),
     }
   }
 

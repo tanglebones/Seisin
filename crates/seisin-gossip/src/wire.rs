@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use seisin_core::authority::NodeId;
 
-use crate::membership::{Incarnation, MemberStatus, MemberUpdate};
+use crate::membership::{Incarnation, MemberRole, MemberStatus, MemberUpdate};
 use crate::sequencer::RingMutation;
 
 const STATUS_ALIVE: u8 = 0;
@@ -25,8 +25,14 @@ pub fn encode_member_update(update: &MemberUpdate) -> Vec<u8> {
     MemberStatus::Dead => STATUS_DEAD,
   });
   buf.extend_from_slice(&update.thread_count.to_le_bytes());
+  buf.push(match update.role {
+    MemberRole::Compute => 0,
+    MemberRole::Storage => 1,
+  });
+  buf.extend_from_slice(&update.capacity_weight.to_le_bytes());
   encode_string(&mut buf, &update.client_address);
   encode_string(&mut buf, &update.gossip_address);
+  encode_string(&mut buf, &update.store_address);
   buf
 }
 
@@ -43,9 +49,19 @@ pub fn decode_member_update(buf: &[u8]) -> Result<MemberUpdate> {
     tag => bail!("invalid member status tag byte: {tag}"),
   };
   let thread_count = u32::from_le_bytes(buf[17..21].try_into().unwrap());
-  let mut offset = 21;
+  if buf.len() < 26 {
+    bail!("member update payload too short for role/weight");
+  }
+  let role = match buf[21] {
+    0 => MemberRole::Compute,
+    1 => MemberRole::Storage,
+    tag => bail!("invalid member role tag byte: {tag}"),
+  };
+  let capacity_weight = u32::from_le_bytes(buf[22..26].try_into().unwrap());
+  let mut offset = 26;
   let client_address = decode_string(buf, &mut offset).context("decoding client_address")?;
   let gossip_address = decode_string(buf, &mut offset).context("decoding gossip_address")?;
+  let store_address = decode_string(buf, &mut offset).context("decoding store_address")?;
   Ok(MemberUpdate {
     node_id,
     incarnation,
@@ -53,6 +69,9 @@ pub fn decode_member_update(buf: &[u8]) -> Result<MemberUpdate> {
     client_address,
     gossip_address,
     thread_count,
+    role,
+    capacity_weight,
+    store_address,
   })
 }
 
@@ -140,7 +159,11 @@ fn decode_string(buf: &[u8], offset: &mut usize) -> Result<String> {
 /// keep the version-n decoder alive for one release so mixed-version
 /// clusters mid-rollout still gossip. Versioned independently of the
 /// main protocol since the two evolve independently.
-pub const GOSSIP_PROTOCOL_VERSION: u8 = 1;
+// Bumped to 2 when member updates gained role/capacity_weight/
+// store_address (Storage Tier Part B). The keep-the-old-decoder n±1
+// policy binds from the first deployed release — there have been none,
+// so version-1 decoding is deliberately dropped rather than preserved.
+pub const GOSSIP_PROTOCOL_VERSION: u8 = 2;
 
 const MSG_PING: u8 = 0;
 const MSG_PING_REQ: u8 = 1;
@@ -290,6 +313,9 @@ mod tests {
       client_address: "127.0.0.1:7878".to_string(),
       gossip_address: "127.0.0.1:8878".to_string(),
       thread_count: 4,
+      role: MemberRole::Storage,
+      capacity_weight: 8,
+      store_address: "127.0.0.1:6878".to_string(),
     }
   }
 
