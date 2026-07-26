@@ -60,7 +60,16 @@ fn start_single_node_server() -> String {
     Arc::new(seisin_node::index_handler::IndexKindRegistry::new()),
   ));
 
-  thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
+  thread::spawn(move || {
+    serve(
+      listener,
+      node_id,
+      ring,
+      address_book,
+      pool,
+      Arc::new(seisin_node::halt::HaltState::new()),
+    )
+  });
   addr
 }
 

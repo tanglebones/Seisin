@@ -10,6 +10,16 @@ use seisin_core::store::InMemoryStore;
 use seisin_gossip::membership::{Incarnation, MemberRole, MemberStatus, MemberUpdate};
 use seisin_node::gossip_client::run_gossip_loop;
 use seisin_node::gossip_server::serve_gossip;
+use seisin_node::gossip_state::ClusterState;
+
+fn test_cluster(compute_ring: Arc<RwLock<Ring>>) -> Arc<ClusterState> {
+  Arc::new(ClusterState {
+    compute_ring,
+    storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
+    store_addresses: Arc::new(RwLock::new(std::collections::HashMap::new())),
+    halt: Arc::new(seisin_node::halt::HaltState::new()),
+  })
+}
 use seisin_node::gossip_state::GossipState;
 use seisin_node::pool::WorkerPool;
 use seisin_node::server::serve;
@@ -84,20 +94,30 @@ fn start_node(node_id: NodeId, members: &[(NodeId, u32, String, String, String)]
     let ring = Arc::clone(&ring);
     let address_book = Arc::clone(&address_book);
     let pool = Arc::clone(&pool);
-    thread::spawn(move || serve(client_listener, node_id, ring, address_book, pool));
+    thread::spawn(move || {
+      serve(
+        client_listener,
+        node_id,
+        ring,
+        address_book,
+        pool,
+        Arc::new(seisin_node::halt::HaltState::new()),
+      )
+    });
   }
   {
     let gossip = Arc::clone(&gossip);
     let ring = Arc::clone(&ring);
     let pool = Arc::clone(&pool);
-    thread::spawn(move || serve_gossip(gossip_listener, node_id, gossip, ring, pool));
+    let cluster = test_cluster(ring);
+    thread::spawn(move || serve_gossip(gossip_listener, node_id, gossip, cluster, pool));
   }
   {
     thread::spawn(move || {
       run_gossip_loop(
         node_id,
         gossip,
-        ring,
+        test_cluster(ring),
         pool,
         PROBE_INTERVAL_MILLIS,
         PROBE_TIMEOUT_MILLIS,

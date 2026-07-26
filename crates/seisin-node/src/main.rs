@@ -44,6 +44,33 @@ fn main() -> Result<()> {
     let listener = TcpListener::bind(&store_address)
       .with_context(|| format!("failed to bind {store_address}"))?;
     println!("seisin-node {self_node_id:?} STORAGE role, store listener on {store_address}");
+    // Join the gossip fabric as an ack-only responder so compute
+    // nodes' failure detectors can track this member's liveness.
+    let gossip = Arc::new(GossipState::new());
+    {
+      let mut table = gossip.member_table.lock().unwrap();
+      for member in &config.members {
+        table.merge_update(MemberUpdate {
+          node_id: NodeId(member.node_id),
+          incarnation: Incarnation(0),
+          status: MemberStatus::Alive,
+          client_address: member.address.clone(),
+          gossip_address: member.gossip_address.clone(),
+          thread_count: member.thread_count,
+          role: match member.role {
+            seisin_node::config::NodeRole::Compute => MemberRole::Compute,
+            seisin_node::config::NodeRole::Storage => MemberRole::Storage,
+          },
+          capacity_weight: member.capacity_weight.unwrap_or(1),
+          store_address: member.store_address.clone().unwrap_or_default(),
+        });
+      }
+    }
+    let gossip_listener = TcpListener::bind(&self_member.gossip_address)
+      .with_context(|| format!("failed to bind {}", self_member.gossip_address))?;
+    thread::spawn(move || {
+      seisin_node::gossip_server::serve_gossip_storage(gossip_listener, gossip)
+    });
     seisin_node::store_server::serve_store(listener, log);
     return Ok(());
   }
@@ -136,18 +163,27 @@ fn main() -> Result<()> {
     .into_iter()
     .map(|(id, w)| (NodeId(id), w))
     .collect();
-  let store: Arc<dyn seisin_core::store::Store> = if storage_members.is_empty() {
-    Arc::new(InMemoryStore::new())
-  } else {
-    let storage_ring = Arc::new(RwLock::new(Ring::from_members(&storage_members)));
-    let store_addresses: HashMap<NodeId, String> = config
+  let storage_ring = Arc::new(RwLock::new(Ring::from_members(&storage_members)));
+  let store_addresses: Arc<RwLock<HashMap<NodeId, String>>> = Arc::new(RwLock::new(
+    config
       .store_address_book()
       .into_iter()
       .map(|(id, addr)| (NodeId(id), addr))
-      .collect();
+      .collect(),
+  ));
+  let halt = Arc::new(seisin_node::halt::HaltState::new());
+  let cluster = Arc::new(seisin_node::gossip_state::ClusterState {
+    compute_ring: Arc::clone(&ring),
+    storage_ring: Arc::clone(&storage_ring),
+    store_addresses: Arc::clone(&store_addresses),
+    halt: Arc::clone(&halt),
+  });
+  let store: Arc<dyn seisin_core::store::Store> = if storage_members.is_empty() {
+    Arc::new(InMemoryStore::new())
+  } else {
     Arc::new(seisin_node::remote_store::RemoteStore::new(
       storage_ring,
-      Arc::new(store_addresses),
+      store_addresses,
     ))
   };
   // No solution has been wired up yet — empty op and index-kind
@@ -174,7 +210,17 @@ fn main() -> Result<()> {
     let ring = Arc::clone(&ring);
     let address_book = Arc::clone(&address_book);
     let pool = Arc::clone(&pool);
-    thread::spawn(move || serve(client_listener, self_node_id, ring, address_book, pool));
+    let halt = Arc::clone(&halt);
+    thread::spawn(move || {
+      serve(
+        client_listener,
+        self_node_id,
+        ring,
+        address_book,
+        pool,
+        halt,
+      )
+    });
   }
 
   let gossip_listener = TcpListener::bind(&self_gossip_address)
@@ -182,15 +228,15 @@ fn main() -> Result<()> {
   println!("seisin-node {self_node_id:?} gossip listener on {self_gossip_address}");
   {
     let gossip = Arc::clone(&gossip);
-    let ring = Arc::clone(&ring);
+    let cluster = Arc::clone(&cluster);
     let pool = Arc::clone(&pool);
-    thread::spawn(move || serve_gossip(gossip_listener, self_node_id, gossip, ring, pool));
+    thread::spawn(move || serve_gossip(gossip_listener, self_node_id, gossip, cluster, pool));
   }
 
   run_gossip_loop(
     self_node_id,
     gossip,
-    ring,
+    cluster,
     pool,
     seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS,
     seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS,

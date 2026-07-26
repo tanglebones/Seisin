@@ -29,7 +29,10 @@ fn remote_store(storage_addr: &str) -> Arc<RemoteStore> {
   let storage_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(100), 1)])));
   let mut addresses = HashMap::new();
   addresses.insert(NodeId(100), storage_addr.to_string());
-  Arc::new(RemoteStore::new(storage_ring, Arc::new(addresses)))
+  Arc::new(RemoteStore::new(
+    storage_ring,
+    Arc::new(RwLock::new(addresses)),
+  ))
 }
 
 /// A compute pool backed by the given store, with byte read/write ops.

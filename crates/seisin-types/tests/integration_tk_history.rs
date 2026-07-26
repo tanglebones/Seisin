@@ -50,7 +50,16 @@ fn start_node(data_dir: std::path::PathBuf) -> String {
     Arc::new(index_kinds),
   ));
   let address_book = Arc::new(std::collections::HashMap::new());
-  thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
+  thread::spawn(move || {
+    serve(
+      listener,
+      node_id,
+      ring,
+      address_book,
+      pool,
+      Arc::new(seisin_node::halt::HaltState::new()),
+    )
+  });
   thread::sleep(std::time::Duration::from_millis(100));
   addr
 }

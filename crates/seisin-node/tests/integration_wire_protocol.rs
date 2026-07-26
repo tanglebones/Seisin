@@ -65,7 +65,16 @@ fn start_test_server() -> SocketAddr {
     Arc::new(HashMap::new()),
     Arc::new(seisin_node::index_handler::IndexKindRegistry::new()),
   ));
-  thread::spawn(move || serve(listener, node_id, ring, address_book, pool));
+  thread::spawn(move || {
+    serve(
+      listener,
+      node_id,
+      ring,
+      address_book,
+      pool,
+      Arc::new(seisin_node::halt::HaltState::new()),
+    )
+  });
   addr
 }
 

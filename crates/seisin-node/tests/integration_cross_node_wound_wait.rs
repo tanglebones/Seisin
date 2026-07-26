@@ -73,12 +73,30 @@ fn start_two_node_cluster() -> (String, String, Arc<RwLock<Ring>>) {
   {
     let ring = Arc::clone(&ring);
     let address_book = Arc::clone(&address_book);
-    thread::spawn(move || serve(listener_a, node_a, ring, address_book, pool_a));
+    thread::spawn(move || {
+      serve(
+        listener_a,
+        node_a,
+        ring,
+        address_book,
+        pool_a,
+        Arc::new(seisin_node::halt::HaltState::new()),
+      )
+    });
   }
   {
     let ring = Arc::clone(&ring);
     let address_book = Arc::clone(&address_book);
-    thread::spawn(move || serve(listener_b, node_b, ring, address_book, pool_b));
+    thread::spawn(move || {
+      serve(
+        listener_b,
+        node_b,
+        ring,
+        address_book,
+        pool_b,
+        Arc::new(seisin_node::halt::HaltState::new()),
+      )
+    });
   }
 
   (addr_a, addr_b, ring)

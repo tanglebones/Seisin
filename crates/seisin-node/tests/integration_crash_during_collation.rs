@@ -108,7 +108,16 @@ fn a_recall_against_a_peer_that_dies_mid_flight_still_releases_via_the_reactive_
     Arc::new(seisin_node::index_handler::IndexKindRegistry::new()),
   ));
   let address_book = Arc::new(HashMap::new());
-  thread::spawn(move || serve(listener_a, node_a, ring, address_book, pool));
+  thread::spawn(move || {
+    serve(
+      listener_a,
+      node_a,
+      ring,
+      address_book,
+      pool,
+      Arc::new(seisin_node::halt::HaltState::new()),
+    )
+  });
 
   // Give the eager dial-out, handshake, and fake op2 grant time to
   // land before op1 arrives.
@@ -185,7 +194,16 @@ fn start_node_a_with_unreachable_peer(
   ));
 
   let serve_ring = Arc::clone(&ring);
-  thread::spawn(move || serve(listener_a, node_a, serve_ring, address_book, pool));
+  thread::spawn(move || {
+    serve(
+      listener_a,
+      node_a,
+      serve_ring,
+      address_book,
+      pool,
+      Arc::new(seisin_node::halt::HaltState::new()),
+    )
+  });
   (addr_a, ring)
 }
 

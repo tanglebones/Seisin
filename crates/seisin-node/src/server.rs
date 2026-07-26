@@ -19,6 +19,7 @@ use seisin_protocol::{
 };
 use seisin_ring::ring::Ring;
 
+use crate::halt::HaltState;
 use crate::pool::WorkerPool;
 
 /// Runs the accept loop on `listener`, spawning one handler thread per
@@ -29,6 +30,7 @@ pub fn serve(
   ring: Arc<RwLock<Ring>>,
   address_book: Arc<HashMap<NodeId, String>>,
   pool: Arc<WorkerPool>,
+  halt: Arc<HaltState>,
 ) {
   for stream in listener.incoming() {
     let stream = match stream {
@@ -38,7 +40,8 @@ pub fn serve(
     let ring = Arc::clone(&ring);
     let address_book = Arc::clone(&address_book);
     let pool = Arc::clone(&pool);
-    thread::spawn(move || handle_connection(stream, self_node_id, ring, address_book, pool));
+    let halt = Arc::clone(&halt);
+    thread::spawn(move || handle_connection(stream, self_node_id, ring, address_book, pool, halt));
   }
 }
 
@@ -48,6 +51,7 @@ fn handle_connection(
   ring: Arc<RwLock<Ring>>,
   address_book: Arc<HashMap<NodeId, String>>,
   pool: Arc<WorkerPool>,
+  halt: Arc<HaltState>,
 ) {
   loop {
     let payload = match read_frame(&mut stream) {
@@ -58,6 +62,23 @@ fn handle_connection(
       Ok(r) => r,
       Err(_) => return, // malformed request: drop the connection
     };
+    // The coordinated fail-stop gate: once any storage member is
+    // confirmed dead, every request answers with the halt reason
+    // rather than risking service from a partially-lost dataset.
+    if halt.is_halted() {
+      let message = halt
+        .reason()
+        .unwrap_or_else(|| "cluster halted".to_string());
+      if write_frame(
+        &mut stream,
+        &encode_response(&Response::OpError { message }),
+      )
+      .is_err()
+      {
+        return;
+      }
+      continue;
+    }
     let response = match request {
       Request::Op {
         op_id,

@@ -30,7 +30,9 @@ pub struct RemoteStore {
   /// The storage ring — `Ring` reused with capacity weights in place
   /// of thread counts; the thread half of `native()` is ignored.
   storage_ring: Arc<RwLock<Ring>>,
-  addresses: Arc<HashMap<NodeId, String>>,
+  /// RwLock so gossip can extend the book when a storage member joins
+  /// (Part B) — lookups read-lock.
+  addresses: Arc<RwLock<HashMap<NodeId, String>>>,
 }
 
 thread_local! {
@@ -38,7 +40,10 @@ thread_local! {
 }
 
 impl RemoteStore {
-  pub fn new(storage_ring: Arc<RwLock<Ring>>, addresses: Arc<HashMap<NodeId, String>>) -> Self {
+  pub fn new(
+    storage_ring: Arc<RwLock<Ring>>,
+    addresses: Arc<RwLock<HashMap<NodeId, String>>>,
+  ) -> Self {
     Self {
       storage_ring,
       addresses,
@@ -54,6 +59,8 @@ impl RemoteStore {
   fn call(&self, node: NodeId, id: DatumId, request: &StoreRequest) -> StoreResponse {
     let address = self
       .addresses
+      .read()
+      .unwrap()
       .get(&node)
       .unwrap_or_else(|| panic!("no store address configured for storage node {node:?}"))
       .clone();
@@ -177,7 +184,10 @@ mod tests {
     let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
     let mut addresses = HashMap::new();
     addresses.insert(NodeId(1), addr);
-    (RemoteStore::new(ring, Arc::new(addresses)), dir)
+    (
+      RemoteStore::new(ring, Arc::new(RwLock::new(addresses))),
+      dir,
+    )
   }
 
   #[test]
