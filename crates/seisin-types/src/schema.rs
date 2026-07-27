@@ -111,6 +111,12 @@ pub struct DatumTypeDef {
   /// type should run. The framework never runs scans on a timer —
   /// cadence and acting on findings are the scan driver's job.
   pub rescan_every_millis: Option<u64>,
+  /// How many distinct storage nodes hold this type's datum content.
+  /// Default 1 (single copy, fail-stop on loss). A type opts into
+  /// replication by declaring a higher factor; the typed write/read path
+  /// carries it to storage. Index datums are always single-copy
+  /// (rebuildable), regardless of this.
+  pub replication_factor: u16,
 }
 
 /// What an FK-constrained field references — always a declared
@@ -189,12 +195,20 @@ impl DatumTypeDef {
       checks: Vec::new(),
       track_extent: false,
       rescan_every_millis: None,
+      replication_factor: 1,
     }
   }
 
   /// Enables extent tracking — see the `track_extent` field.
   pub fn track_extent(mut self) -> Self {
     self.track_extent = true;
+    self
+  }
+
+  /// Declares this type's storage replication factor — see the
+  /// `replication_factor` field. Default 1 (single copy).
+  pub fn replicated(mut self, factor: u16) -> Self {
+    self.replication_factor = factor;
     self
   }
 

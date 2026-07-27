@@ -46,7 +46,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   /// would let an op silently overwrite real data and compute index
   /// diffs from a false "before" state, stranding stale index entries.
   pub fn get(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Result<Option<Vec<FieldValue>>> {
-    let values = match self.ctx.get(pk_id) {
+    let values = match self.ctx.get_replicated(pk_id, def.replication_factor) {
       Some(bytes) => Some(
         decode_datum(def, &bytes)
           .with_context(|| format!("existing content for datum {pk_id:?} failed to decode"))?,
@@ -72,7 +72,9 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
     run_field_checks(def, &values)?;
     let bytes = encode_datum(def, &values)?;
     self.ensure_tracked(pk_id, def)?;
-    self.ctx.put(pk_id, bytes);
+    self
+      .ctx
+      .put_replicated(pk_id, bytes, def.replication_factor);
     let entry = self.tracked.get_mut(&pk_id).unwrap();
     entry.after = Some(values);
     entry.touched = true;
@@ -85,7 +87,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
   pub fn delete(&mut self, pk_id: DatumId, def: &DatumTypeDef) -> Result<()> {
     crate::schema::check_pk(pk_id, def)?;
     self.ensure_tracked(pk_id, def)?;
-    self.ctx.delete(pk_id);
+    self.ctx.delete_replicated(pk_id, def.replication_factor);
     let entry = self.tracked.get_mut(&pk_id).unwrap();
     entry.after = None;
     entry.touched = true;
@@ -96,7 +98,7 @@ impl<'a, 'b> TypedOpContext<'a, 'b> {
     if self.tracked.contains_key(&pk_id) {
       return Ok(());
     }
-    let before = match self.ctx.get(pk_id) {
+    let before = match self.ctx.get_replicated(pk_id, def.replication_factor) {
       Some(bytes) => Some(
         decode_datum(def, &bytes)
           .with_context(|| format!("existing content for datum {pk_id:?} failed to decode"))?,
@@ -434,6 +436,32 @@ mod tests {
       SkIndexOp::Insert { pk_id: id, .. } => assert_eq!(id, pk_id),
       other => panic!("expected an Insert op, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn a_replicated_types_write_carries_its_replication_factor() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let def = user_type().replicated(3);
+    let pk_id = DatumId::new();
+    let mut ctx = OpContext::new(&mut cache);
+    {
+      let mut tctx = TypedOpContext::new(&mut ctx);
+      tctx
+        .set(
+          pk_id,
+          &def,
+          vec![FieldValue::String("cliff".to_string()), FieldValue::I64(41)],
+        )
+        .unwrap();
+    }
+    // The pk datum's staged write carries the type's replication factor;
+    // a default (n=1) type would stage it single-copy.
+    let staged = ctx.take_staged_writes();
+    let entry = staged
+      .iter()
+      .find(|(id, _, _)| *id == pk_id)
+      .expect("the pk datum should be staged");
+    assert_eq!(entry.2, 3);
   }
 
   #[test]
