@@ -83,6 +83,7 @@ fn main() -> Result<()> {
       self_halt_threshold: std::time::Duration::from_millis(
         seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS,
       ),
+      transfers: Arc::new(seisin_node::transfer::TransferManager::default()),
     });
     seisin_node::store_server::serve_store(listener, store_node);
     return Ok(());

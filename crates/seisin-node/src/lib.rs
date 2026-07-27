@@ -13,4 +13,5 @@ pub mod pool;
 pub mod remote_store;
 pub mod server;
 pub mod store_server;
+pub mod transfer;
 pub mod worker;

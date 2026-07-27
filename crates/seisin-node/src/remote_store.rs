@@ -183,6 +183,7 @@ mod tests {
       node_id: NodeId(1),
       heartbeat: Arc::new(crate::heartbeat::Heartbeat::new()),
       self_halt_threshold: std::time::Duration::from_secs(3600),
+      transfers: Arc::new(crate::transfer::TransferManager::default()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();

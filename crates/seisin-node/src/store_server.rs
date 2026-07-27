@@ -16,12 +16,13 @@ use std::time::Duration;
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
 use seisin_protocol::store_wire::{
-  decode_store_request, encode_store_response, StoreRequest, StoreResponse,
+  decode_store_request, encode_store_response, store_call, StoreRequest, StoreResponse,
 };
 use seisin_protocol::{read_frame, write_frame};
 use seisin_storage::datum_log::{DatumLog, PatchOutcome};
 
 use crate::heartbeat::Heartbeat;
+use crate::transfer::TransferManager;
 
 /// Everything the store request loop needs beyond a single connection.
 pub struct StoreNode {
@@ -32,6 +33,7 @@ pub struct StoreNode {
   /// (answers `Error` instead of serving). Default: the suspicion
   /// timeout.
   pub self_halt_threshold: Duration,
+  pub transfers: Arc<TransferManager>,
 }
 
 pub fn serve_store(listener: TcpListener, node: Arc<StoreNode>) {
@@ -75,41 +77,134 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
       }
       continue;
     }
-    let response = {
-      let mut log = node.log.lock().unwrap();
-      match request {
-        StoreRequest::Put { id, bytes } => match log.put_full(id.as_bytes(), &bytes) {
-          Ok(()) => StoreResponse::Ack,
+    // The log lock is taken per-arm (not across the whole match) so the
+    // transfer arms — which lock the log themselves via helpers — never
+    // deadlock against an outer guard.
+    let response = match request {
+      StoreRequest::Put { id, bytes } => {
+        match node.log.lock().unwrap().put_full(id.as_bytes(), &bytes) {
+          Ok(()) => {
+            node.transfers.note_write(id);
+            StoreResponse::Ack
+          }
           Err(_) => return, // disk failure: fail-stop, drop the conn
-        },
-        StoreRequest::Patch { id, delta } => match log.put_delta(id.as_bytes(), &delta) {
-          Ok(PatchOutcome::Applied) => StoreResponse::Ack,
+        }
+      }
+      StoreRequest::Patch { id, delta } => {
+        match node.log.lock().unwrap().put_delta(id.as_bytes(), &delta) {
+          Ok(PatchOutcome::Applied) => {
+            node.transfers.note_write(id);
+            StoreResponse::Ack
+          }
           Ok(PatchOutcome::NeedFull) => StoreResponse::NeedFull,
           Err(_) => return,
+        }
+      }
+      StoreRequest::Get { id } => match node.log.lock().unwrap().get(id.as_bytes()) {
+        Ok(bytes) => StoreResponse::Value { bytes },
+        Err(_) => return,
+      },
+      StoreRequest::Delete { id } => match node.log.lock().unwrap().delete(id.as_bytes()) {
+        Ok(()) => {
+          node.transfers.note_write(id);
+          StoreResponse::Ack
+        }
+        Err(_) => return,
+      },
+      StoreRequest::Identify => StoreResponse::Identity {
+        node_id: node.node_id,
+        log_id: DatumId::from_bytes(node.log.lock().unwrap().log_id()),
+      },
+      StoreRequest::ListIds { after, limit } => {
+        let after_bytes = after.map(|id| id.as_bytes());
+        let ids = node
+          .log
+          .lock()
+          .unwrap()
+          .list_ids(after_bytes, limit as usize);
+        let done = ids.len() < limit as usize;
+        StoreResponse::IdList {
+          ids: ids.into_iter().map(DatumId::from_bytes).collect(),
+          done,
+        }
+      }
+      StoreRequest::Transfer {
+        transfer_id,
+        ids,
+        dest_address,
+      } => {
+        node.transfers.start(transfer_id, ids, dest_address);
+        let worker = Arc::clone(&node);
+        thread::spawn(move || run_transfer_copy(worker, transfer_id));
+        StoreResponse::Ack
+      }
+      StoreRequest::TransferStatus { transfer_id } => match node.transfers.status(transfer_id) {
+        Some((copied, dirty, done)) => StoreResponse::TransferProgress {
+          copied,
+          dirty,
+          done,
         },
-        StoreRequest::Get { id } => match log.get(id.as_bytes()) {
-          Ok(bytes) => StoreResponse::Value { bytes },
-          Err(_) => return,
+        None => StoreResponse::Error {
+          message: format!("unknown transfer {transfer_id:?}"),
         },
-        StoreRequest::Delete { id } => match log.delete(id.as_bytes()) {
-          Ok(()) => StoreResponse::Ack,
-          Err(_) => return,
-        },
-        StoreRequest::Identify => StoreResponse::Identity {
-          node_id: node.node_id,
-          log_id: DatumId::from_bytes(log.log_id()),
-        },
-        // The transfer surface (ListIds/Transfer/TransferStatus/
-        // FinishTransfer/Retire) is wired in Storage C-1 Task 4.
-        _ => StoreResponse::Error {
-          message: "store transfer surface not supported until Storage C-1 Task 4".to_string(),
-        },
+      },
+      StoreRequest::FinishTransfer { transfer_id } => finish_transfer(&node, transfer_id),
+      StoreRequest::Retire { transfer_id } => {
+        for id in node.transfers.retire(transfer_id) {
+          if node.log.lock().unwrap().delete(id.as_bytes()).is_err() {
+            return; // disk failure: fail-stop
+          }
+        }
+        StoreResponse::Ack
       }
     };
     if write_frame(&mut stream, &encode_store_response(&response)).is_err() {
       return;
     }
   }
+}
+
+/// Reads the current value of `id` from the log (materializing any delta
+/// chain), releasing the lock before the caller does any network I/O.
+fn read_value(node: &StoreNode, id: DatumId) -> Option<Vec<u8>> {
+  node.log.lock().unwrap().get(id.as_bytes()).ok().flatten()
+}
+
+/// The async bulk copy: snapshot-read each transfer id and `Put` it to
+/// the destination over the store wire. A best-effort copy — the dirty
+/// tail (`FinishTransfer`) re-sends anything written during it, and a
+/// crashed driver simply re-runs the whole transfer.
+fn run_transfer_copy(node: Arc<StoreNode>, transfer_id: DatumId) {
+  let Some(dest) = node.transfers.dest(transfer_id) else {
+    return;
+  };
+  for id in node.transfers.ids(transfer_id) {
+    if let Some(bytes) = read_value(&node, id) {
+      let _ = store_call(&dest, &StoreRequest::Put { id, bytes });
+    }
+    node.transfers.bump_copied(transfer_id, 1);
+  }
+  node.transfers.mark_done(transfer_id);
+}
+
+/// Re-sends the dirty tail: for each id written during the copy, `Put`
+/// its current value (or `Delete` it if it was removed) to the
+/// destination, so the destination ends the pause holding the latest
+/// value of every moved id.
+fn finish_transfer(node: &Arc<StoreNode>, transfer_id: DatumId) -> StoreResponse {
+  let Some(dest) = node.transfers.dest(transfer_id) else {
+    return StoreResponse::Error {
+      message: format!("unknown transfer {transfer_id:?}"),
+    };
+  };
+  for id in node.transfers.take_dirty(transfer_id) {
+    let request = match read_value(node, id) {
+      Some(bytes) => StoreRequest::Put { id, bytes },
+      None => StoreRequest::Delete { id },
+    };
+    let _ = store_call(&dest, &request);
+  }
+  StoreResponse::Ack
 }
 
 #[cfg(test)]
@@ -131,6 +226,7 @@ mod tests {
       node_id,
       heartbeat: Arc::new(Heartbeat::new()),
       self_halt_threshold: Duration::from_secs(3600),
+      transfers: Arc::new(TransferManager::default()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -181,6 +277,7 @@ mod tests {
       node_id: NodeId(9),
       heartbeat: Arc::new(Heartbeat::new()),
       self_halt_threshold: Duration::from_millis(0),
+      transfers: Arc::new(TransferManager::default()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -189,5 +286,99 @@ mod tests {
       StoreResponse::Error { message } => assert!(message.contains("self-halted"), "{message}"),
       other => panic!("expected Error, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn transfer_copies_then_tails_a_dirty_write() {
+    let (src_addr, _src, _src_dir) = store_node(NodeId(1));
+    let (dst_addr, _dst, _dst_dir) = store_node(NodeId(2));
+
+    // Seed the source with three datums.
+    let ids: Vec<DatumId> = (0..3).map(|_| DatumId::new()).collect();
+    for id in &ids {
+      assert_eq!(
+        store_call(
+          &src_addr,
+          &StoreRequest::Put {
+            id: *id,
+            bytes: b"v0".to_vec()
+          }
+        )
+        .unwrap(),
+        StoreResponse::Ack
+      );
+    }
+
+    // Start the transfer and wait for the async bulk copy to finish.
+    let transfer_id = DatumId::new();
+    assert_eq!(
+      store_call(
+        &src_addr,
+        &StoreRequest::Transfer {
+          transfer_id,
+          ids: ids.clone(),
+          dest_address: dst_addr.clone(),
+        }
+      )
+      .unwrap(),
+      StoreResponse::Ack
+    );
+    wait_until(|| {
+      matches!(
+        store_call(&src_addr, &StoreRequest::TransferStatus { transfer_id }).unwrap(),
+        StoreResponse::TransferProgress { done: true, .. }
+      )
+    });
+
+    // A concurrent write to one transferred id lands in the dirty tail.
+    assert_eq!(
+      store_call(
+        &src_addr,
+        &StoreRequest::Put {
+          id: ids[0],
+          bytes: b"v1".to_vec()
+        }
+      )
+      .unwrap(),
+      StoreResponse::Ack
+    );
+    assert_eq!(
+      store_call(&src_addr, &StoreRequest::FinishTransfer { transfer_id }).unwrap(),
+      StoreResponse::Ack
+    );
+
+    // Destination now holds every id, with the tailed value for ids[0].
+    assert_eq!(get(&dst_addr, ids[0]), Some(b"v1".to_vec()));
+    assert_eq!(get(&dst_addr, ids[1]), Some(b"v0".to_vec()));
+    assert_eq!(get(&dst_addr, ids[2]), Some(b"v0".to_vec()));
+
+    // Retire tombstones the moved ids on the source.
+    assert_eq!(
+      store_call(&src_addr, &StoreRequest::Retire { transfer_id }).unwrap(),
+      StoreResponse::Ack
+    );
+    for id in &ids {
+      assert_eq!(get(&src_addr, *id), None);
+    }
+  }
+
+  fn get(addr: &str, id: DatumId) -> Option<Vec<u8>> {
+    match store_call(addr, &StoreRequest::Get { id }).unwrap() {
+      StoreResponse::Value { bytes } => bytes,
+      other => panic!("expected Value, got {other:?}"),
+    }
+  }
+
+  /// Polls `cond` up to ~2s (the async copy is fast; this just avoids a
+  /// fixed sleep). Uses a bounded spin rather than a real clock — good
+  /// enough for a hermetic in-process test.
+  fn wait_until(cond: impl Fn() -> bool) {
+    for _ in 0..2000 {
+      if cond() {
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("condition not met within the deadline");
   }
 }

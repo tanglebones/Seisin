@@ -47,6 +47,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     node_id: storage_id,
     heartbeat: Arc::clone(&storage_heartbeat),
     self_halt_threshold: Duration::from_secs(3600),
+    transfers: Arc::new(seisin_node::transfer::TransferManager::default()),
   });
   thread::spawn(move || serve_store(store_listener, store_node));
 

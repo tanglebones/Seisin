@@ -26,6 +26,7 @@ fn start_storage(dir: &std::path::Path) -> String {
     node_id: NodeId(100),
     heartbeat: Arc::new(Heartbeat::new()),
     self_halt_threshold: Duration::from_secs(3600),
+    transfers: Arc::new(seisin_node::transfer::TransferManager::default()),
   });
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let addr = listener.local_addr().unwrap().to_string();
