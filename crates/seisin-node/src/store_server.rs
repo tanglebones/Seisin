@@ -55,6 +55,11 @@ fn handle_connection(mut stream: TcpStream, log: Arc<Mutex<DatumLog>>) {
           Ok(()) => StoreResponse::Ack,
           Err(_) => return,
         },
+        // The migration surface (Identify/ListIds/Transfer/...) is wired
+        // in Storage C-1 Tasks 3–4; until then it is not served.
+        _ => StoreResponse::Error {
+          message: "store request not supported until Storage C-1 Tasks 3-4".to_string(),
+        },
       }
     };
     if write_frame(&mut stream, &encode_store_response(&response)).is_err() {
