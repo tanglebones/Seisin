@@ -720,7 +720,52 @@ commit and push immediately, since work sessions may end abruptly.
   durability, group commit, copy/insert deltas, chunk-aware wire,
   hot-value LRU.
 
-As of this entry: 11 crates, 479 tests passing, `cargo fmt --check` and
+- **Sub-project 4, Part C-2 — Per-datum-type storage replication.** Per
+  `specs/2026-07-27-storage-replication-design.md` and
+  `plans/2026-07-27-storage-replication.md`. Replication is a **per-type
+  schema property** (`DatumTypeDef.replication_factor`, default 1;
+  `.replicated(n)` builder) — app-aware, selective, the thing Seisin
+  uniquely offers; whole-disk durability is deliberately out of scope
+  (external block-device tooling). Pieces:
+  (1) `Ring::replicas(id, n)` — up to n distinct nodes, rank 0 ==
+  `native` (so n=1 is exactly today), salted re-hash for ranks 1.. with
+  a `node_ids()` completeness sweep, capacity-weighted.
+  (2) N stored per datum: the typed write path tags each write, the
+  `DatumLog` record header carries a u16 factor (`FORMAT_VERSION 3`),
+  `ListIds` returns `(id, n)` pairs — so the type-blind migration driver
+  stays uniform. Store wire v3 (`STORE_PROTOCOL_VERSION 3`) carries n on
+  Put/Patch.
+  (3) N threads through `Store`/`Cache`/`OpContext` via `*_replicated`
+  methods with N=1 back-compat wrappers, so every existing single-copy
+  path is byte-for-byte unchanged.
+  (4) `RemoteStore` writes to every alive, non-stale replica (≥1 to ack;
+  a failing replica is marked stale), reads the primary with failover,
+  and trips the coordinated whole-cluster halt **point-of-use** only on
+  total shard loss (every replica gone) — for an N=1 datum, exactly its
+  one node being gone, so single-copy still fail-stops. The membership-
+  time storage-Leave halt is gone; `apply_ready_mutations` now maintains
+  `ClusterState.storage_alive`/`storage_stale` (a confirmed-dead node is
+  dropped from serving and stays stale, never auto-re-trusted, until a
+  driver re-replication re-admits it).
+  (5) A pool drain barrier makes the migration `Pause` a true barrier
+  (in-flight ops settle before the dirty tail is captured — fixes a
+  write-loss race under concurrent writes).
+  (6) `seisin-migrate`: `plan_moves` over replica sets (copy to each new
+  replica, source rerouted off unreachable nodes); superseded copies on
+  dropped nodes deleted after the flip; new `recover` verb drops
+  unreachable nodes and restores replication onto survivors. `resume` /
+  `InstallStorageRing` re-admit nodes from the stale set.
+  Proven in `integration_storage_replication.rs` (replicated write +
+  read-one, read failover, degraded write, total-loss point-of-use halt,
+  N=1 fail-stop, `recover` re-replication, stale-not-served), 10x stress
+  + standing 20x wound-wait, no flakiness. Wire bumps (pre-first-release,
+  old decoders dropped): `STORE_PROTOCOL_VERSION 3`, `DatumLog
+  FORMAT_VERSION 3`. Deferred: incremental catch-up of a returned
+  replica (v1 does a full driver resync), rack/zone-aware placement,
+  read load-balancing across replicas, changing a type's N on
+  already-written data.
+
+As of this entry: 11 crates, 500 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -750,12 +795,14 @@ resume once the type system is designed.
 ## Not started — from the original sub-project sequence
 - **Sub-project 4 — Storage tier, Part C (remainder).** Parts A (delta
   log, store wire, RemoteStore), B (role-tagged gossip membership,
-  coordinated fail-stop halt), and C-1 (add/remove/reweight migration,
-  log identity, pause, storage self-halt, resume) are done — see "Done"
-  above. Remaining Part C: replication (until then crashes still halt;
-  recovery is log-dir restore + `seisin-migrate resume`), log
-  compaction, tk/lb B+Tree-file datum-grade durability, group commit,
-  copy/insert deltas, chunk-aware wire, hot-value LRU.
+  coordinated fail-stop halt), C-1 (add/remove/reweight migration, log
+  identity, pause, storage self-halt, resume), and C-2 (per-datum-type
+  replication with failover + driver `recover`) are done — see "Done"
+  above. Remaining Part C: incremental catch-up of a returned replica
+  (v1 does a full driver resync), rack/zone-aware placement, read
+  load-balancing across replicas, changing a type's N on already-written
+  data, log compaction, tk/lb B+Tree-file datum-grade durability, group
+  commit, copy/insert deltas, chunk-aware wire, hot-value LRU.
 - **Sub-project 5 — Deployment & cluster tests.** Containerized
   multi-node harness, plus remaining cross-node correctness tests from
   the design doc's Testing Strategy.
