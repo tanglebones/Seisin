@@ -33,6 +33,7 @@ pub fn encode_member_update(update: &MemberUpdate) -> Vec<u8> {
   encode_string(&mut buf, &update.client_address);
   encode_string(&mut buf, &update.gossip_address);
   encode_string(&mut buf, &update.store_address);
+  buf.extend_from_slice(&update.log_id);
   buf
 }
 
@@ -62,6 +63,10 @@ pub fn decode_member_update(buf: &[u8]) -> Result<MemberUpdate> {
   let client_address = decode_string(buf, &mut offset).context("decoding client_address")?;
   let gossip_address = decode_string(buf, &mut offset).context("decoding gossip_address")?;
   let store_address = decode_string(buf, &mut offset).context("decoding store_address")?;
+  if buf.len() < offset + 16 {
+    bail!("member update payload too short for a log id");
+  }
+  let log_id: [u8; 16] = buf[offset..offset + 16].try_into().unwrap();
   Ok(MemberUpdate {
     node_id,
     incarnation,
@@ -72,6 +77,7 @@ pub fn decode_member_update(buf: &[u8]) -> Result<MemberUpdate> {
     role,
     capacity_weight,
     store_address,
+    log_id,
   })
 }
 
@@ -160,10 +166,11 @@ fn decode_string(buf: &[u8], offset: &mut usize) -> Result<String> {
 /// clusters mid-rollout still gossip. Versioned independently of the
 /// main protocol since the two evolve independently.
 // Bumped to 2 when member updates gained role/capacity_weight/
-// store_address (Storage Tier Part B). The keep-the-old-decoder n±1
+// store_address (Storage Tier Part B), then to 3 when they gained a
+// 16-byte log_id (Storage Tier Part C-1). The keep-the-old-decoder n±1
 // policy binds from the first deployed release — there have been none,
-// so version-1 decoding is deliberately dropped rather than preserved.
-pub const GOSSIP_PROTOCOL_VERSION: u8 = 2;
+// so older decoders are deliberately dropped rather than preserved.
+pub const GOSSIP_PROTOCOL_VERSION: u8 = 3;
 
 const MSG_PING: u8 = 0;
 const MSG_PING_REQ: u8 = 1;
@@ -316,6 +323,7 @@ mod tests {
       role: MemberRole::Storage,
       capacity_weight: 8,
       store_address: "127.0.0.1:6878".to_string(),
+      log_id: [7u8; 16],
     }
   }
 

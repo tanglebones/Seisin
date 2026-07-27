@@ -72,6 +72,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
       role: MemberRole::Compute,
       capacity_weight: 0,
       store_address: String::new(),
+      log_id: [0u8; 16],
     });
     table.merge_update(MemberUpdate {
       node_id: storage_id,
@@ -83,6 +84,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
       role: MemberRole::Storage,
       capacity_weight: 1,
       store_address: store_addr.clone(),
+      log_id: [0u8; 16],
     });
   };
 
@@ -105,6 +107,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     compute_ring: Arc::clone(&compute_ring),
     storage_ring: Arc::clone(&storage_ring),
     store_addresses: Arc::clone(&store_addresses),
+    identity_book: Arc::new(RwLock::new(HashMap::new())),
     halt: Arc::clone(&halt),
   });
 
@@ -213,6 +216,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     compute_ring: Arc::clone(&compute2_ring),
     storage_ring: Arc::new(RwLock::new(Ring::from_members(&[(storage_id, 1)]))),
     store_addresses: Arc::new(RwLock::new(HashMap::new())),
+    identity_book: Arc::new(RwLock::new(HashMap::new())),
     halt: Arc::clone(&halt2),
   });
   let mut ops2 = OpRegistry::new();
@@ -246,6 +250,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
       role: MemberRole::Compute,
       capacity_weight: 0,
       store_address: String::new(),
+      log_id: [0u8; 16],
     });
     // The storage member exists in config but nothing listens on its
     // gossip address — a storage node that died before this compute
@@ -260,6 +265,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
       role: MemberRole::Storage,
       capacity_weight: 1,
       store_address: "127.0.0.1:1".to_string(),
+      log_id: [0u8; 16],
     });
   }
   {

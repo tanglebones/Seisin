@@ -7,6 +7,8 @@
 //! This type doesn't care where its slots came from, so that later
 //! change doesn't require rewriting it.
 
+use std::collections::HashMap;
+
 use seisin_core::authority::{NodeId, ThreadId};
 use seisin_core::datum::DatumId;
 
@@ -63,6 +65,34 @@ impl Ring {
         i += 1;
       }
     }
+  }
+
+  /// Whether `node_id` currently holds any slot in the ring. Used by
+  /// the storage-death halt gate: a departed node that already left the
+  /// ring (drained by a migration) must not re-trigger the halt.
+  pub fn contains(&self, node_id: NodeId) -> bool {
+    self.slots.iter().any(|(n, _)| *n == node_id)
+  }
+
+  /// `(node_id, slot_count)` per distinct node, in first-appearance
+  /// order. `Ring::from_members(&ring.weights())` reproduces this ring's
+  /// placement exactly — the storage ring's members-with-weights view
+  /// the admin control plane reports and the migration driver rebuilds.
+  pub fn weights(&self) -> Vec<(NodeId, u32)> {
+    let mut order: Vec<NodeId> = Vec::new();
+    let mut counts: HashMap<NodeId, u32> = HashMap::new();
+    for (node, _) in &self.slots {
+      if !counts.contains_key(node) {
+        order.push(*node);
+      }
+      *counts.entry(*node).or_insert(0) += 1;
+    }
+    order.into_iter().map(|n| (n, counts[&n])).collect()
+  }
+
+  /// The distinct node ids in the ring, first-appearance order.
+  pub fn node_ids(&self) -> Vec<NodeId> {
+    self.weights().into_iter().map(|(n, _)| n).collect()
   }
 
   /// Returns the datum's current native (node, thread).
@@ -184,5 +214,31 @@ mod tests {
     let mut ring = Ring::from_members(&[(NodeId(1), 1)]);
     ring.apply_leave(NodeId(1));
     ring.native(DatumId::new());
+  }
+
+  #[test]
+  fn contains_reports_ring_membership() {
+    let ring = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 1)]);
+    assert!(ring.contains(NodeId(1)));
+    assert!(ring.contains(NodeId(2)));
+    assert!(!ring.contains(NodeId(3)));
+    assert!(!Ring::from_members(&[]).contains(NodeId(1)));
+  }
+
+  #[test]
+  fn weights_counts_slots_per_node_in_first_appearance_order() {
+    let ring = Ring::from_members(&[(NodeId(5), 3), (NodeId(2), 1)]);
+    assert_eq!(ring.weights(), vec![(NodeId(5), 3), (NodeId(2), 1)]);
+    assert_eq!(ring.node_ids(), vec![NodeId(5), NodeId(2)]);
+  }
+
+  #[test]
+  fn weights_round_trip_reproduces_placement() {
+    let ring = Ring::from_members(&[(NodeId(5), 3), (NodeId(2), 1), (NodeId(9), 2)]);
+    let rebuilt = Ring::from_members(&ring.weights());
+    for _ in 0..100 {
+      let id = DatumId::new();
+      assert_eq!(ring.native(id), rebuilt.native(id));
+    }
   }
 }

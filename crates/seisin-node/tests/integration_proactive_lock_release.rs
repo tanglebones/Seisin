@@ -17,6 +17,7 @@ fn test_cluster(compute_ring: Arc<RwLock<Ring>>) -> Arc<ClusterState> {
     compute_ring,
     storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
     store_addresses: Arc::new(RwLock::new(std::collections::HashMap::new())),
+    identity_book: Arc::new(RwLock::new(std::collections::HashMap::new())),
     halt: Arc::new(seisin_node::halt::HaltState::new()),
   })
 }
@@ -78,6 +79,7 @@ fn start_node(
         role: MemberRole::Compute,
         capacity_weight: 0,
         store_address: String::new(),
+        log_id: [0u8; 16],
       });
     }
   }

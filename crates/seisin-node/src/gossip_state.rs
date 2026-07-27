@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
 use seisin_core::authority::NodeId;
+use seisin_core::datum::DatumId;
 use seisin_gossip::membership::{MemberRole, MemberTable, MemberUpdate};
 use std::collections::HashMap;
 
@@ -92,7 +93,25 @@ pub struct ClusterState {
   pub compute_ring: Arc<RwLock<Ring>>,
   pub storage_ring: Arc<RwLock<Ring>>,
   pub store_addresses: Arc<RwLock<HashMap<NodeId, String>>>,
+  /// Log id per storage member — the identity resume-after-halt
+  /// verifies against. Populated by `InstallStorageRing` (driver-
+  /// provided) and reconciled from gossiped `MemberUpdate.log_id`.
+  pub identity_book: Arc<RwLock<HashMap<NodeId, DatumId>>>,
   pub halt: Arc<HaltState>,
+}
+
+/// Copies every known storage member's non-zero log id from the member
+/// table into the identity book. Idempotent; called after each gossip
+/// apply so config-seeded storage members (which never emit a Join
+/// mutation) still land in the book once their self-update propagates.
+pub fn reconcile_identity_book(gossip: &GossipState, cluster: &ClusterState) {
+  let members = gossip.member_table.lock().unwrap().all();
+  let mut book = cluster.identity_book.write().unwrap();
+  for update in members {
+    if update.role == MemberRole::Storage && update.log_id != [0u8; 16] {
+      book.insert(update.node_id, DatumId::from_bytes(update.log_id));
+    }
+  }
 }
 
 /// Applies every ring mutation that's now ready (in epoch order),
@@ -201,6 +220,7 @@ mod tests {
       role: MemberRole::Compute,
       capacity_weight: 0,
       store_address: String::new(),
+      log_id: [0u8; 16],
     }
   }
 
@@ -310,8 +330,31 @@ mod tests {
       compute_ring,
       storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
       store_addresses: Arc::new(RwLock::new(HashMap::new())),
+      identity_book: Arc::new(RwLock::new(HashMap::new())),
       halt: Arc::new(HaltState::new()),
     }
+  }
+
+  #[test]
+  fn reconcile_identity_book_copies_storage_log_ids() {
+    let cluster = test_cluster(Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)]))));
+    let gossip = GossipState::new();
+    {
+      let mut table = gossip.member_table.lock().unwrap();
+      // A storage member with a real log id -> copied.
+      let mut with_id = storage_member(9, 4, "127.0.0.1:6999");
+      with_id.log_id = [3u8; 16];
+      table.merge_update(with_id);
+      // A storage member with a zero log id -> skipped.
+      table.merge_update(storage_member(8, 1, "127.0.0.1:6998"));
+      // A compute member -> skipped even if it somehow carried a log id.
+      table.merge_update(sample_update(1));
+    }
+    reconcile_identity_book(&gossip, &cluster);
+    let book = cluster.identity_book.read().unwrap();
+    assert_eq!(book.get(&NodeId(9)), Some(&DatumId::from_bytes([3u8; 16])));
+    assert!(!book.contains_key(&NodeId(8)));
+    assert!(!book.contains_key(&NodeId(1)));
   }
 
   fn test_pool(ring: &Arc<RwLock<Ring>>) -> WorkerPool {
@@ -342,6 +385,7 @@ mod tests {
       role: MemberRole::Storage,
       capacity_weight: weight,
       store_address: addr.to_string(),
+      log_id: [0u8; 16],
     }
   }
 

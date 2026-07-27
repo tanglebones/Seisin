@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     let log = std::sync::Arc::new(std::sync::Mutex::new(
       seisin_storage::datum_log::DatumLog::open(&log_path)?,
     ));
+    let self_log_id = log.lock().unwrap().log_id();
     let listener = TcpListener::bind(&store_address)
       .with_context(|| format!("failed to bind {store_address}"))?;
     println!("seisin-node {self_node_id:?} STORAGE role, store listener on {store_address}");
@@ -63,6 +64,11 @@ fn main() -> Result<()> {
           },
           capacity_weight: member.capacity_weight.unwrap_or(1),
           store_address: member.store_address.clone().unwrap_or_default(),
+          log_id: if member.node_id == config.self_node_id {
+            self_log_id
+          } else {
+            [0u8; 16]
+          },
         });
       }
     }
@@ -161,6 +167,9 @@ fn main() -> Result<()> {
         },
         capacity_weight: member.capacity_weight.unwrap_or(1),
         store_address: member.store_address.clone().unwrap_or_default(),
+        // Compute nodes learn a storage member's log id via gossip
+        // (its self-update), not from config — zero here.
+        log_id: [0u8; 16],
       });
     }
   }
@@ -186,10 +195,13 @@ fn main() -> Result<()> {
       .collect(),
   ));
   let halt = Arc::new(seisin_node::halt::HaltState::new());
+  let identity_book: Arc<RwLock<HashMap<NodeId, seisin_core::datum::DatumId>>> =
+    Arc::new(RwLock::new(HashMap::new()));
   let cluster = Arc::new(seisin_node::gossip_state::ClusterState {
     compute_ring: Arc::clone(&ring),
     storage_ring: Arc::clone(&storage_ring),
     store_addresses: Arc::clone(&store_addresses),
+    identity_book: Arc::clone(&identity_book),
     halt: Arc::clone(&halt),
   });
   let store: Arc<dyn seisin_core::store::Store> = if storage_members.is_empty() {

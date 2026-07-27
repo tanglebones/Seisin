@@ -19,7 +19,9 @@ use seisin_gossip::sequencer::{is_sequencer, RingMutation};
 use seisin_gossip::wire::{decode_gossip_message, encode_gossip_message, GossipMessage};
 use seisin_protocol::{read_frame, write_frame};
 
-use crate::gossip_state::{apply_ready_mutations, ClusterState, GossipState};
+use crate::gossip_state::{
+  apply_ready_mutations, reconcile_identity_book, ClusterState, GossipState,
+};
 use crate::pool::WorkerPool;
 
 /// Runs forever. Callers spawn this on a dedicated background thread.
@@ -90,6 +92,7 @@ pub fn run_gossip_loop(
     }
 
     apply_ready_mutations(&gossip, &cluster, self_node_id, &pool);
+    reconcile_identity_book(&gossip, &cluster);
   }
 }
 

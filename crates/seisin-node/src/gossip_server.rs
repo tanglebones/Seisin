@@ -7,7 +7,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use crate::gossip_state::{apply_ready_mutations, ClusterState, GossipState};
+use crate::gossip_state::{
+  apply_ready_mutations, reconcile_identity_book, ClusterState, GossipState,
+};
 use crate::heartbeat::Heartbeat;
 use crate::pool::WorkerPool;
 use seisin_core::authority::NodeId;
@@ -57,6 +59,7 @@ fn handle_gossip_connection(
   };
   gossip.merge_incoming(updates, mutations);
   apply_ready_mutations(&gossip, &cluster, self_node_id, &pool);
+  reconcile_identity_book(&gossip, &cluster);
 
   let (reply_updates, reply_mutations) = gossip.piggyback();
   let ack = GossipMessage::Ack {

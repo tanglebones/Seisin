@@ -55,6 +55,11 @@ pub struct MemberUpdate {
   pub role: MemberRole,
   pub capacity_weight: u32,
   pub store_address: String,
+  /// Storage members only: the log identity this node stamped at
+  /// creation (all-zeros for compute members and before a storage
+  /// node's self-update has propagated). Lets compute nodes build the
+  /// identity book that resume-after-halt verifies against.
+  pub log_id: [u8; 16],
 }
 
 struct MemberRecord {
@@ -66,6 +71,7 @@ struct MemberRecord {
   client_address: String,
   gossip_address: String,
   thread_count: u32,
+  log_id: [u8; 16],
 }
 
 impl MemberRecord {
@@ -80,6 +86,7 @@ impl MemberRecord {
       role: self.role,
       capacity_weight: self.capacity_weight,
       store_address: self.store_address.clone(),
+      log_id: self.log_id,
     }
   }
 }
@@ -112,6 +119,7 @@ impl MemberTable {
           client_address: update.client_address,
           gossip_address: update.gossip_address,
           thread_count: update.thread_count,
+          log_id: update.log_id,
         });
         true
       }
@@ -130,6 +138,7 @@ impl MemberTable {
             client_address: update.client_address,
             gossip_address: update.gossip_address,
             thread_count: update.thread_count,
+            log_id: update.log_id,
           });
         }
         accept
@@ -224,6 +233,7 @@ mod tests {
       role: MemberRole::Compute,
       capacity_weight: 0,
       store_address: String::new(),
+      log_id: [0u8; 16],
     }
   }
 
