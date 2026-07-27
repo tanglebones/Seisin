@@ -213,10 +213,9 @@ fn main() -> Result<()> {
   let store: Arc<dyn seisin_core::store::Store> = if storage_members.is_empty() {
     Arc::new(InMemoryStore::new())
   } else {
-    Arc::new(seisin_node::remote_store::RemoteStore::new(
-      storage_ring,
-      store_addresses,
-    ))
+    Arc::new(seisin_node::remote_store::RemoteStore::new(Arc::clone(
+      &cluster,
+    )))
   };
   // No solution has been wired up yet — empty op and index-kind
   // registries until a real solution built on this framework registers

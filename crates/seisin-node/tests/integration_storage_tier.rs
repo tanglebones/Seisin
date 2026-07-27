@@ -5,6 +5,7 @@ use std::thread;
 
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
+use seisin_node::gossip_state::ClusterState;
 use seisin_node::heartbeat::Heartbeat;
 use seisin_node::index_handler::IndexKindRegistry;
 use seisin_node::pool::WorkerPool;
@@ -35,13 +36,15 @@ fn start_storage(dir: &std::path::Path) -> String {
 }
 
 fn remote_store(storage_addr: &str) -> Arc<RemoteStore> {
-  let storage_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(100), 1)])));
   let mut addresses = HashMap::new();
   addresses.insert(NodeId(100), storage_addr.to_string());
-  Arc::new(RemoteStore::new(
-    storage_ring,
-    Arc::new(RwLock::new(addresses)),
-  ))
+  let cluster = Arc::new(ClusterState {
+    storage_ring: Arc::new(RwLock::new(Ring::from_members(&[(NodeId(100), 1)]))),
+    store_addresses: Arc::new(RwLock::new(addresses)),
+    storage_alive: Arc::new(RwLock::new(std::collections::HashSet::from([NodeId(100)]))),
+    ..ClusterState::compute_only(Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)]))))
+  });
+  Arc::new(RemoteStore::new(cluster))
 }
 
 /// A compute pool backed by the given store, with byte read/write ops.

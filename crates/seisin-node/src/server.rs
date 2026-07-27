@@ -75,10 +75,48 @@ fn handle_connection(
       Ok(r) => r,
       Err(_) => return, // malformed request: drop the connection
     };
-    // The serving gate: op traffic is rejected while halted (a storage
-    // member confirmed dead — fail-stop) or paused (a live migration),
-    // with a distinct message per flavor. Admin requests bypass it.
-    if !is_admin(&request) {
+    // Admin control plane bypasses the serving gate entirely (served
+    // while halted/paused). `Pause` additionally drains in-flight ops so
+    // it is a true barrier: after it acks, no client write can still be
+    // racing toward storage when the migration captures its dirty tail.
+    let response = if is_admin(&request) {
+      match request {
+        Request::GetClusterConfig => handle_get_cluster_config(&cluster),
+        Request::Pause { reason } => {
+          cluster.halt.pause(reason);
+          pool.drain_in_flight();
+          Response::Ack
+        }
+        Request::Resume => {
+          cluster.halt.resume();
+          Response::Ack
+        }
+        Request::ClearHalt => {
+          // The driver sends this only after verifying every storage ring
+          // member's identity, so full service resumes: clear the halt and
+          // re-admit all ring members (alive, non-stale) as current
+          // replicas.
+          cluster.halt.clear_halt();
+          let members: std::collections::HashSet<NodeId> = cluster
+            .storage_ring
+            .read()
+            .unwrap()
+            .node_ids()
+            .into_iter()
+            .collect();
+          *cluster.storage_alive.write().unwrap() = members;
+          cluster.storage_stale.write().unwrap().clear();
+          Response::Ack
+        }
+        Request::InstallStorageRing { members } => handle_install_storage_ring(&cluster, members),
+        _ => unreachable!("is_admin matches only admin requests"),
+      }
+    } else {
+      // Op traffic holds the pool's drain guard for its whole duration,
+      // then checks the serving gate: rejected while halted (a total
+      // shard loss — fail-stop) or paused (a live migration), with a
+      // distinct message per flavor.
+      let _op_guard = pool.op_guard();
       if let Some(message) = cluster.halt.gate() {
         if write_frame(
           &mut stream,
@@ -90,143 +128,128 @@ fn handle_connection(
         }
         continue;
       }
-    }
-    let response = match request {
-      Request::Op {
-        op_id,
-        op_name,
-        datum_ids,
-        payload,
-      } => handle_op_request(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        op_id,
-        op_name,
-        datum_ids,
-        payload,
-      ),
-      Request::RkQuery {
-        index_datum_id,
-        query,
-      } => handle_rk_query(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        index_datum_id,
-        query,
-      ),
-      Request::LbExecute {
-        board_id,
-        class,
-        op,
-      } => handle_lb_execute(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        board_id,
-        class,
-        op,
-      ),
-      Request::LbQuery {
-        board_id,
-        class,
-        query,
-      } => handle_lb_query(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        board_id,
-        class,
-        query,
-      ),
-      Request::TkExecute {
-        entity_datum_id,
-        class,
-        op,
-      } => handle_tk_execute(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        entity_datum_id,
-        class,
-        op,
-      ),
-      Request::TkQuery {
-        entity_datum_id,
-        class,
-        query,
-      } => handle_tk_query(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        entity_datum_id,
-        class,
-        query,
-      ),
-      Request::ExistsCheck { datum_id } => {
-        handle_exists_check(self_node_id, &ring, &address_book, &pool, datum_id)
+      match request {
+        Request::Op {
+          op_id,
+          op_name,
+          datum_ids,
+          payload,
+        } => handle_op_request(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          op_id,
+          op_name,
+          datum_ids,
+          payload,
+        ),
+        Request::RkQuery {
+          index_datum_id,
+          query,
+        } => handle_rk_query(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          index_datum_id,
+          query,
+        ),
+        Request::LbExecute {
+          board_id,
+          class,
+          op,
+        } => handle_lb_execute(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          board_id,
+          class,
+          op,
+        ),
+        Request::LbQuery {
+          board_id,
+          class,
+          query,
+        } => handle_lb_query(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          board_id,
+          class,
+          query,
+        ),
+        Request::TkExecute {
+          entity_datum_id,
+          class,
+          op,
+        } => handle_tk_execute(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          entity_datum_id,
+          class,
+          op,
+        ),
+        Request::TkQuery {
+          entity_datum_id,
+          class,
+          query,
+        } => handle_tk_query(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          entity_datum_id,
+          class,
+          query,
+        ),
+        Request::ExistsCheck { datum_id } => {
+          handle_exists_check(self_node_id, &ring, &address_book, &pool, datum_id)
+        }
+        Request::FkPending {
+          pending_datum_id,
+          op,
+        } => handle_fk_pending(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          pending_datum_id,
+          op,
+        ),
+        Request::ExtentQuery {
+          extent_datum_id,
+          offset,
+          limit,
+        } => handle_extent_query(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          extent_datum_id,
+          offset,
+          limit,
+        ),
+        Request::PartitionUpdate {
+          partition_datum_id,
+          op,
+        } => handle_partition_update(
+          self_node_id,
+          &ring,
+          &address_book,
+          &pool,
+          partition_datum_id,
+          op,
+        ),
+        // Acquire/Recall/Release/IndexUpdate are node-to-node only,
+        // carried over a peer-link connection (see peer_link.rs) — a
+        // client should never send one on this client-facing connection.
+        _ => return,
       }
-      Request::FkPending {
-        pending_datum_id,
-        op,
-      } => handle_fk_pending(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        pending_datum_id,
-        op,
-      ),
-      Request::ExtentQuery {
-        extent_datum_id,
-        offset,
-        limit,
-      } => handle_extent_query(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        extent_datum_id,
-        offset,
-        limit,
-      ),
-      Request::PartitionUpdate {
-        partition_datum_id,
-        op,
-      } => handle_partition_update(
-        self_node_id,
-        &ring,
-        &address_book,
-        &pool,
-        partition_datum_id,
-        op,
-      ),
-      // --- admin control plane (Storage Tier Part C-1) ---
-      Request::GetClusterConfig => handle_get_cluster_config(&cluster),
-      Request::Pause { reason } => {
-        cluster.halt.pause(reason);
-        Response::Ack
-      }
-      Request::Resume => {
-        cluster.halt.resume();
-        Response::Ack
-      }
-      Request::ClearHalt => {
-        cluster.halt.clear_halt();
-        Response::Ack
-      }
-      Request::InstallStorageRing { members } => handle_install_storage_ring(&cluster, members),
-      // Acquire/Recall/Release/IndexUpdate are node-to-node only,
-      // carried over a peer-link connection (see peer_link.rs) — a
-      // client should never send one on this client-facing connection.
-      _ => return,
     };
     if write_frame(&mut stream, &encode_response(&response)).is_err() {
       return;

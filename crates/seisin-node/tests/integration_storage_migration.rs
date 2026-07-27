@@ -155,10 +155,7 @@ fn build(storages: Vec<Storage>, initial_ring: &[NodeId]) -> Cluster {
     "get",
     Box::new(|ctx, ids, _payload| ctx.get(ids[0]).unwrap_or_default()),
   );
-  let store = Arc::new(RemoteStore::new(
-    Arc::clone(&storage_ring),
-    Arc::clone(&store_addresses),
-  ));
+  let store = Arc::new(RemoteStore::new(Arc::clone(&cluster)));
   let peer_link = TcpListener::bind("127.0.0.1:0").unwrap();
   let pool = Arc::new(WorkerPool::spawn(
     store,
@@ -242,12 +239,39 @@ impl Cluster {
 
   /// Injects a confirmed-dead Leave for `node_id` through the real
   /// mutation-apply path (what the gossip server would do on a detector
-  /// verdict).
+  /// verdict): the node drops from the alive serving set and is marked
+  /// stale. The coordinated halt is point-of-use, so this does not halt
+  /// on its own — a client op touching a now-lost shard does (see
+  /// `wait_until_halted`).
   fn inject_leave(&self, node_id: NodeId) {
     self
       .gossip
       .record_mutation(1, RingMutation::Leave { node_id });
     apply_ready_mutations(&self.gossip, &self.cluster, COMPUTE_ID, &self.pool);
+  }
+
+  /// Fires reads of `id` until the cluster is observed halted (the first
+  /// op touching a fully-lost shard trips the point-of-use halt and
+  /// fail-stops its worker; subsequent ops are cleanly gated). Panics if
+  /// no halt appears.
+  fn wait_until_halted(&self, id: DatumId) {
+    for _ in 0..50 {
+      if let Ok(Response::OpError { message }) = seisin_client::call(
+        &self.compute_addr,
+        Request::Op {
+          op_id: DatumId::new(),
+          op_name: "get".to_string(),
+          datum_ids: vec![id],
+          payload: vec![],
+        },
+      ) {
+        if message.contains("cluster halted") {
+          return;
+        }
+      }
+      thread::sleep(Duration::from_millis(20));
+    }
+    panic!("cluster did not halt after storage loss");
   }
 }
 
@@ -389,9 +413,13 @@ fn concurrent_writes_during_migration_are_all_present_after_the_flip() {
 }
 
 /// Writes `value` to `id`, retrying while the cluster is paused for a
-/// migration (a distinct retryable error).
+/// migration (a distinct retryable error). Deadline-based (not a fixed
+/// iteration count) so a pause window stretched by parallel-test load
+/// doesn't spuriously exhaust the budget — this drives real TCP, so wall
+/// time is the right bound here.
 fn put_with_retry(compute_addr: &str, id: DatumId, value: &[u8]) {
-  for _ in 0..2000 {
+  let deadline = std::time::Instant::now() + Duration::from_secs(60);
+  while std::time::Instant::now() < deadline {
     let resp = seisin_client::call(
       compute_addr,
       Request::Op {
@@ -405,12 +433,12 @@ fn put_with_retry(compute_addr: &str, id: DatumId, value: &[u8]) {
     match resp {
       Response::OpResult { .. } => return,
       Response::OpError { message } if message.contains("cluster paused") => {
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(Duration::from_millis(5));
       }
       other => panic!("unexpected write response: {other:?}"),
     }
   }
-  panic!("write never succeeded past the pause window");
+  panic!("write never succeeded within the deadline");
 }
 
 #[test]
@@ -421,27 +449,14 @@ fn halt_then_resume_verifies_identity_and_restores_service() {
   let id = DatumId::new();
   cluster.put(id, b"durable");
 
-  // The storage node is confirmed dead while still in the ring -> halt.
+  // The storage node is confirmed dead (dropped from serving); a client
+  // op touching its now-lost single-copy shard trips the point-of-use
+  // halt.
   cluster.inject_leave(NodeId(10));
-  assert!(cluster.cluster.halt.is_halted());
-  // Client ops are rejected while halted.
-  match seisin_client::call(
-    &cluster.compute_addr,
-    Request::Op {
-      op_id: DatumId::new(),
-      op_name: "get".to_string(),
-      datum_ids: vec![id],
-      payload: vec![],
-    },
-  )
-  .unwrap()
-  {
-    Response::OpError { message } => assert!(message.contains("cluster halted"), "{message}"),
-    other => panic!("expected halt error, got {other:?}"),
-  }
+  cluster.wait_until_halted(id);
 
   // The node is back (same log id — the identity book still matches).
-  // resume verifies identity and clears the halt.
+  // resume verifies identity, clears the halt, and re-admits the node.
   seisin_migrate::resume(std::slice::from_ref(&cluster.compute_addr)).unwrap();
   assert!(!cluster.cluster.halt.is_halted());
 
@@ -454,9 +469,10 @@ fn resume_refuses_an_impostor_and_the_halt_stands() {
   let a = start_storage(NodeId(10), 1);
   let cluster = build(vec![a], &[NodeId(10)]);
 
-  cluster.put(DatumId::new(), b"x");
+  let id = DatumId::new();
+  cluster.put(id, b"x");
   cluster.inject_leave(NodeId(10));
-  assert!(cluster.cluster.halt.is_halted());
+  cluster.wait_until_halted(id);
 
   // Simulate an impostor: the identity book expects a different log id
   // than the node now reports (a blank/wrong disk at the same address).

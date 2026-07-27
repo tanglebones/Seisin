@@ -20,6 +20,12 @@ use crate::worker::{AcquireReply, RecallReply, WorkerHandle, WorkerMessage};
 pub struct WorkerPool {
   handles: Vec<WorkerHandle>,
   ring: Arc<RwLock<Ring>>,
+  /// Drain barrier for the migration pause. Each op holds a read guard
+  /// for its whole duration (`op_guard`); `drain_in_flight` acquires the
+  /// write guard, which blocks until every in-flight op has released —
+  /// so once a paused node has drained, no client write can still be
+  /// racing toward storage when the migration captures its dirty tail.
+  op_gate: RwLock<()>,
 }
 
 impl WorkerPool {
@@ -141,7 +147,26 @@ impl WorkerPool {
         )
       })
       .collect();
-    Self { handles, ring }
+    Self {
+      handles,
+      ring,
+      op_gate: RwLock::new(()),
+    }
+  }
+
+  /// A read guard held for an op's whole duration; while any is
+  /// outstanding, `drain_in_flight` blocks. Cheap when nothing is
+  /// draining (reader locks are uncontended).
+  pub fn op_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+    self.op_gate.read().unwrap()
+  }
+
+  /// Blocks until every in-flight op has completed. Call after engaging
+  /// the pause (so no new ops start) to make the pause a true barrier.
+  pub fn drain_in_flight(&self) {
+    // Acquiring the write lock blocks until every in-flight op's read
+    // guard has released; drop it immediately (the wait is the point).
+    drop(self.op_gate.write().unwrap());
   }
 
   /// Picks the local thread that natively owns the most of

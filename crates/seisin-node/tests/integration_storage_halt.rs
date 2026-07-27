@@ -121,10 +121,7 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
       vec![]
     }),
   );
-  let remote = Arc::new(RemoteStore::new(
-    Arc::clone(&storage_ring),
-    Arc::clone(&store_addresses),
-  ));
+  let remote = Arc::new(RemoteStore::new(Arc::clone(&cluster)));
   let pool = Arc::new(WorkerPool::spawn(
     remote,
     2,
@@ -229,8 +226,13 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
       vec![]
     }),
   );
+  // compute2 writes through a RemoteStore over the (unreachable) storage
+  // node, so a client op tripping the point-of-use total-loss halt is
+  // what this half exercises.
   let pool2 = Arc::new(WorkerPool::spawn(
-    Arc::new(seisin_core::store::InMemoryStore::new()),
+    Arc::new(seisin_node::remote_store::RemoteStore::new(Arc::clone(
+      &cluster2,
+    ))),
     2,
     Arc::new(ops2),
     Arc::clone(&compute2_ring),
@@ -309,32 +311,37 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     });
   }
 
-  // Wait for the detector to converge the storage member to Dead.
+  // Wait for the detector to converge the storage member to Dead (it
+  // drops from the alive serving set). The coordinated halt is now
+  // point-of-use: it engages when a client op finds the dead node was
+  // the only replica of its datum (single-copy total loss).
   thread::sleep(Duration::from_millis(
     PROBE_INTERVAL_MILLIS + PROBE_TIMEOUT_MILLIS * 2 + SUSPICION_TIMEOUT_MILLIS + 500,
   ));
-  assert!(halt2.is_halted(), "storage death did not engage the halt");
-  let reason = halt2.reason().unwrap();
-  assert!(reason.contains("storage node"), "{reason}");
-  assert!(reason.contains("9"), "{reason}");
-
-  // Client traffic is rejected with the halt reason...
-  let response = seisin_client::call(
-    &compute2_addr,
-    Request::Op {
-      op_id: DatumId::new(),
-      op_name: "put".to_string(),
-      datum_ids: vec![DatumId::new()],
-      payload: b"x".to_vec(),
-    },
-  )
-  .unwrap();
-  match response {
-    Response::OpError { message } => {
-      assert!(message.contains("cluster halted"), "{message}")
+  // The first client op touching the lost shard trips the point-of-use
+  // halt. That fail-stops the op's worker (Part A's contract — a storage
+  // round-trip failure panics the worker), so this call may come back as
+  // an error or a dropped connection; the halt latches regardless. Once
+  // latched, the serve gate cleanly rejects every subsequent op with the
+  // halt reason. Poll until we observe that clean rejection.
+  let put_op = || Request::Op {
+    op_id: DatumId::new(),
+    op_name: "put".to_string(),
+    datum_ids: vec![DatumId::new()],
+    payload: b"x".to_vec(),
+  };
+  let mut saw_halt = false;
+  for _ in 0..50 {
+    if let Ok(Response::OpError { message }) = seisin_client::call(&compute2_addr, put_op()) {
+      if message.contains("cluster halted") {
+        saw_halt = true;
+        break;
+      }
     }
-    other => panic!("expected the halt error, got {other:?}"),
+    thread::sleep(Duration::from_millis(20));
   }
+  assert!(saw_halt, "storage loss did not engage the cluster halt");
+  assert!(halt2.is_halted());
   // ...and the compute ring itself was never touched by the storage
   // death (its own node still owns everything).
   assert_eq!(
