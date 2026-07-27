@@ -69,10 +69,9 @@ fn start_test_server() -> SocketAddr {
     serve(
       listener,
       node_id,
-      ring,
+      Arc::new(seisin_node::gossip_state::ClusterState::compute_only(ring)),
       address_book,
       pool,
-      Arc::new(seisin_node::halt::HaltState::new()),
     )
   });
   addr

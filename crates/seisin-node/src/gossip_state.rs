@@ -100,6 +100,21 @@ pub struct ClusterState {
   pub halt: Arc<HaltState>,
 }
 
+impl ClusterState {
+  /// A compute-only cluster state: the storage ring and its address /
+  /// identity books start empty, with a fresh halt. For single-tier
+  /// compute deployments and tests that exercise no storage tier.
+  pub fn compute_only(compute_ring: Arc<RwLock<Ring>>) -> Self {
+    Self {
+      compute_ring,
+      storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
+      store_addresses: Arc::new(RwLock::new(HashMap::new())),
+      identity_book: Arc::new(RwLock::new(HashMap::new())),
+      halt: Arc::new(HaltState::new()),
+    }
+  }
+}
+
 /// Copies every known storage member's non-zero log id from the member
 /// table into the identity book. Idempotent; called after each gossip
 /// apply so config-seeded storage members (which never emit a Join

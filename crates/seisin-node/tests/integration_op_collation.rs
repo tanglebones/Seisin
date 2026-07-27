@@ -64,10 +64,9 @@ fn start_single_node_server() -> String {
     serve(
       listener,
       node_id,
-      ring,
+      Arc::new(seisin_node::gossip_state::ClusterState::compute_only(ring)),
       address_book,
       pool,
-      Arc::new(seisin_node::halt::HaltState::new()),
     )
   });
   addr

@@ -137,18 +137,16 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
   let compute_gossip = Arc::new(GossipState::new());
   seed(&mut compute_gossip.member_table.lock().unwrap());
   {
-    let ring = Arc::clone(&compute_ring);
+    let cluster = Arc::clone(&cluster);
     let address_book = Arc::new(HashMap::from([(compute_id, compute_addr.clone())]));
     let pool = Arc::clone(&pool);
-    let halt = Arc::clone(&halt);
     thread::spawn(move || {
       serve(
         compute_client_listener,
         compute_id,
-        ring,
+        cluster,
         address_book,
         pool,
-        halt,
       )
     });
   }
@@ -269,18 +267,16 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     });
   }
   {
-    let ring = Arc::clone(&compute2_ring);
+    let cluster = Arc::clone(&cluster2);
     let address_book = Arc::new(HashMap::from([(compute2_id, compute2_addr.clone())]));
     let pool = Arc::clone(&pool2);
-    let halt = Arc::clone(&halt2);
     thread::spawn(move || {
       serve(
         compute2_client_listener,
         compute2_id,
-        ring,
+        cluster,
         address_book,
         pool,
-        halt,
       )
     });
   }

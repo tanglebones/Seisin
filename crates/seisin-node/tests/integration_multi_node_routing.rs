@@ -81,10 +81,9 @@ fn start_two_node_cluster() -> (String, String) {
       serve(
         listener_a,
         node_a,
-        ring,
+        Arc::new(seisin_node::gossip_state::ClusterState::compute_only(ring)),
         address_book,
         pool_a,
-        Arc::new(seisin_node::halt::HaltState::new()),
       )
     });
   }
@@ -95,10 +94,9 @@ fn start_two_node_cluster() -> (String, String) {
       serve(
         listener_b,
         node_b,
-        ring,
+        Arc::new(seisin_node::gossip_state::ClusterState::compute_only(ring)),
         address_book,
         pool_b,
-        Arc::new(seisin_node::halt::HaltState::new()),
       )
     });
   }

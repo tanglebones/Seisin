@@ -112,10 +112,9 @@ fn a_recall_against_a_peer_that_dies_mid_flight_still_releases_via_the_reactive_
     serve(
       listener_a,
       node_a,
-      ring,
+      Arc::new(seisin_node::gossip_state::ClusterState::compute_only(ring)),
       address_book,
       pool,
-      Arc::new(seisin_node::halt::HaltState::new()),
     )
   });
 
@@ -198,10 +197,11 @@ fn start_node_a_with_unreachable_peer(
     serve(
       listener_a,
       node_a,
-      serve_ring,
+      Arc::new(seisin_node::gossip_state::ClusterState::compute_only(
+        serve_ring,
+      )),
       address_book,
       pool,
-      Arc::new(seisin_node::halt::HaltState::new()),
     )
   });
   (addr_a, ring)

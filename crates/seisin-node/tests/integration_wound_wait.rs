@@ -45,10 +45,11 @@ fn start_single_node_server(thread_count: u32) -> (String, Arc<RwLock<Ring>>, No
     serve(
       listener,
       node_id,
-      serve_ring,
+      Arc::new(seisin_node::gossip_state::ClusterState::compute_only(
+        serve_ring,
+      )),
       address_book,
       pool,
-      Arc::new(seisin_node::halt::HaltState::new()),
     )
   });
   (addr, ring, node_id)

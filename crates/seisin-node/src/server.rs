@@ -15,11 +15,11 @@ use std::thread;
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
 use seisin_protocol::{
-  decode_request, encode_response, read_frame, write_frame, Request, Response,
+  decode_request, encode_response, read_frame, write_frame, Request, Response, StorageMember,
 };
 use seisin_ring::ring::Ring;
 
-use crate::halt::HaltState;
+use crate::gossip_state::ClusterState;
 use crate::pool::WorkerPool;
 
 /// Runs the accept loop on `listener`, spawning one handler thread per
@@ -27,32 +27,45 @@ use crate::pool::WorkerPool;
 pub fn serve(
   listener: TcpListener,
   self_node_id: NodeId,
-  ring: Arc<RwLock<Ring>>,
+  cluster: Arc<ClusterState>,
   address_book: Arc<HashMap<NodeId, String>>,
   pool: Arc<WorkerPool>,
-  halt: Arc<HaltState>,
 ) {
   for stream in listener.incoming() {
     let stream = match stream {
       Ok(s) => s,
       Err(_) => continue,
     };
-    let ring = Arc::clone(&ring);
+    let cluster = Arc::clone(&cluster);
     let address_book = Arc::clone(&address_book);
     let pool = Arc::clone(&pool);
-    let halt = Arc::clone(&halt);
-    thread::spawn(move || handle_connection(stream, self_node_id, ring, address_book, pool, halt));
+    thread::spawn(move || handle_connection(stream, self_node_id, cluster, address_book, pool));
   }
+}
+
+/// Admin control-plane requests are served regardless of halt/pause —
+/// `GetClusterConfig` is read-only control plane (readable while
+/// halted, which the resume flow needs), and the pause/halt mutators
+/// plus the ring flip must run precisely while the gate is engaged.
+fn is_admin(request: &Request) -> bool {
+  matches!(
+    request,
+    Request::GetClusterConfig
+      | Request::Pause { .. }
+      | Request::Resume
+      | Request::ClearHalt
+      | Request::InstallStorageRing { .. }
+  )
 }
 
 fn handle_connection(
   mut stream: TcpStream,
   self_node_id: NodeId,
-  ring: Arc<RwLock<Ring>>,
+  cluster: Arc<ClusterState>,
   address_book: Arc<HashMap<NodeId, String>>,
   pool: Arc<WorkerPool>,
-  halt: Arc<HaltState>,
 ) {
+  let ring = Arc::clone(&cluster.compute_ring);
   loop {
     let payload = match read_frame(&mut stream) {
       Ok(p) => p,
@@ -62,22 +75,21 @@ fn handle_connection(
       Ok(r) => r,
       Err(_) => return, // malformed request: drop the connection
     };
-    // The coordinated fail-stop gate: once any storage member is
-    // confirmed dead, every request answers with the halt reason
-    // rather than risking service from a partially-lost dataset.
-    if halt.is_halted() {
-      let message = halt
-        .reason()
-        .unwrap_or_else(|| "cluster halted".to_string());
-      if write_frame(
-        &mut stream,
-        &encode_response(&Response::OpError { message }),
-      )
-      .is_err()
-      {
-        return;
+    // The serving gate: op traffic is rejected while halted (a storage
+    // member confirmed dead — fail-stop) or paused (a live migration),
+    // with a distinct message per flavor. Admin requests bypass it.
+    if !is_admin(&request) {
+      if let Some(message) = cluster.halt.gate() {
+        if write_frame(
+          &mut stream,
+          &encode_response(&Response::OpError { message }),
+        )
+        .is_err()
+        {
+          return;
+        }
+        continue;
       }
-      continue;
     }
     let response = match request {
       Request::Op {
@@ -196,6 +208,21 @@ fn handle_connection(
         partition_datum_id,
         op,
       ),
+      // --- admin control plane (Storage Tier Part C-1) ---
+      Request::GetClusterConfig => handle_get_cluster_config(&cluster),
+      Request::Pause { reason } => {
+        cluster.halt.pause(reason);
+        Response::Ack
+      }
+      Request::Resume => {
+        cluster.halt.resume();
+        Response::Ack
+      }
+      Request::ClearHalt => {
+        cluster.halt.clear_halt();
+        Response::Ack
+      }
+      Request::InstallStorageRing { members } => handle_install_storage_ring(&cluster, members),
       // Acquire/Recall/Release/IndexUpdate are node-to-node only,
       // carried over a peer-link connection (see peer_link.rs) — a
       // client should never send one on this client-facing connection.
@@ -254,6 +281,51 @@ fn handle_op_request(
     Ok(payload) => Response::OpResult { payload },
     Err(message) => Response::OpError { message },
   }
+}
+
+/// Reports the storage ring's members with their store addresses and
+/// log ids — the migration driver's planning input and the resume
+/// flow's identity source. Served even while halted/paused (read-only).
+fn handle_get_cluster_config(cluster: &ClusterState) -> Response {
+  let weights = cluster.storage_ring.read().unwrap().weights();
+  let addresses = cluster.store_addresses.read().unwrap();
+  let identity = cluster.identity_book.read().unwrap();
+  let members = weights
+    .into_iter()
+    .map(|(node_id, weight)| StorageMember {
+      node_id,
+      weight,
+      store_address: addresses.get(&node_id).cloned().unwrap_or_default(),
+      log_id: identity
+        .get(&node_id)
+        .copied()
+        .unwrap_or_else(|| DatumId::from_bytes([0u8; 16])),
+    })
+    .collect();
+  Response::ClusterConfig { members }
+}
+
+/// The migration flip: swap the shared storage ring (and its address /
+/// identity books) to exactly `members`, in wire order — the same order
+/// the driver used to compute the moved set, so placement agrees. The
+/// shared `Arc<RwLock<Ring>>` is the one `RemoteStore` reads, so this is
+/// a live swap with no restart.
+fn handle_install_storage_ring(cluster: &ClusterState, members: Vec<StorageMember>) -> Response {
+  let ring_members: Vec<(NodeId, u32)> = members.iter().map(|m| (m.node_id, m.weight)).collect();
+  *cluster.storage_ring.write().unwrap() = Ring::from_members(&ring_members);
+  {
+    let mut addresses = cluster.store_addresses.write().unwrap();
+    let mut identity = cluster.identity_book.write().unwrap();
+    addresses.clear();
+    identity.clear();
+    for m in &members {
+      if !m.store_address.is_empty() {
+        addresses.insert(m.node_id, m.store_address.clone());
+      }
+      identity.insert(m.node_id, m.log_id);
+    }
+  }
+  Response::Ack
 }
 
 /// `Some(response)` if `datum_id` isn't native here (a redirect, or an
@@ -514,5 +586,76 @@ fn handle_partition_update(
       },
     },
     Err(message) => Response::OpError { message },
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::halt::HaltState;
+
+  fn cluster_with_storage(members: &[(NodeId, u32)]) -> ClusterState {
+    ClusterState {
+      compute_ring: Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)]))),
+      storage_ring: Arc::new(RwLock::new(Ring::from_members(members))),
+      store_addresses: Arc::new(RwLock::new(HashMap::new())),
+      identity_book: Arc::new(RwLock::new(HashMap::new())),
+      halt: Arc::new(HaltState::new()),
+    }
+  }
+
+  #[test]
+  fn is_admin_flags_only_admin_requests() {
+    assert!(is_admin(&Request::GetClusterConfig));
+    assert!(is_admin(&Request::Resume));
+    assert!(is_admin(&Request::InstallStorageRing { members: vec![] }));
+    assert!(!is_admin(&Request::Op {
+      op_id: DatumId::new(),
+      op_name: "x".to_string(),
+      datum_ids: vec![],
+      payload: vec![],
+    }));
+  }
+
+  #[test]
+  fn install_storage_ring_swaps_the_ring_and_books() {
+    let cluster = cluster_with_storage(&[(NodeId(7), 1)]);
+    let member = StorageMember {
+      node_id: NodeId(9),
+      weight: 1,
+      store_address: "127.0.0.1:6900".to_string(),
+      log_id: DatumId::from_bytes([4u8; 16]),
+    };
+    assert_eq!(
+      handle_install_storage_ring(&cluster, vec![member]),
+      Response::Ack
+    );
+    // The old member is gone, the new one is in.
+    assert!(cluster.storage_ring.read().unwrap().contains(NodeId(9)));
+    assert!(!cluster.storage_ring.read().unwrap().contains(NodeId(7)));
+    assert_eq!(
+      cluster.store_addresses.read().unwrap().get(&NodeId(9)),
+      Some(&"127.0.0.1:6900".to_string())
+    );
+    assert_eq!(
+      cluster.identity_book.read().unwrap().get(&NodeId(9)),
+      Some(&DatumId::from_bytes([4u8; 16]))
+    );
+  }
+
+  #[test]
+  fn get_cluster_config_reports_members_with_addresses_and_log_ids() {
+    let cluster = cluster_with_storage(&[]);
+    let member = StorageMember {
+      node_id: NodeId(9),
+      weight: 3,
+      store_address: "127.0.0.1:6900".to_string(),
+      log_id: DatumId::from_bytes([4u8; 16]),
+    };
+    handle_install_storage_ring(&cluster, vec![member.clone()]);
+    match handle_get_cluster_config(&cluster) {
+      Response::ClusterConfig { members } => assert_eq!(members, vec![member]),
+      other => panic!("expected ClusterConfig, got {other:?}"),
+    }
   }
 }

@@ -233,20 +233,10 @@ fn main() -> Result<()> {
     TcpListener::bind(&self_address).with_context(|| format!("failed to bind {self_address}"))?;
   println!("seisin-node {self_node_id:?} client listener on {self_address}");
   {
-    let ring = Arc::clone(&ring);
+    let cluster = Arc::clone(&cluster);
     let address_book = Arc::clone(&address_book);
     let pool = Arc::clone(&pool);
-    let halt = Arc::clone(&halt);
-    thread::spawn(move || {
-      serve(
-        client_listener,
-        self_node_id,
-        ring,
-        address_book,
-        pool,
-        halt,
-      )
-    });
+    thread::spawn(move || serve(client_listener, self_node_id, cluster, address_book, pool));
   }
 
   let gossip_listener = TcpListener::bind(&self_gossip_address)
