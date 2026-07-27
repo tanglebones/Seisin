@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 /// ports. This global lock serializes them — one live cluster at a time.
 static CLUSTER_LOCK: Mutex<()> = Mutex::new(());
 
+use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
-use seisin_protocol::{Request, Response};
+use seisin_protocol::{Request, Response, StorageMember};
+use seisin_ring::ring::Ring;
 
 const PROBE_INTERVAL_MS: u64 = 20;
 const PROBE_TIMEOUT_MS: u64 = 20;
@@ -397,4 +399,115 @@ fn a_killed_storage_node_halts_client_traffic() {
     thread::sleep(Duration::from_millis(20));
   }
   assert!(halted, "killing a storage node did not halt client traffic");
+}
+
+impl ClusterHarness {
+  /// The proposed storage ring as `StorageMember`s (log ids zero — the
+  /// driver resolves them via `Identify`), addresses from the harness.
+  fn proposed(&self, ids_weights: &[(u64, u32)]) -> Vec<StorageMember> {
+    ids_weights
+      .iter()
+      .map(|(id, weight)| StorageMember {
+        node_id: NodeId(*id),
+        weight: *weight,
+        store_address: self.store_addr(*id),
+        log_id: DatumId::from_bytes([0u8; 16]),
+      })
+      .collect()
+  }
+}
+
+#[test]
+fn a_live_reweight_moves_data_and_keeps_the_corpus_readable() {
+  // Three storage nodes; write a corpus, then run the real seisin_migrate
+  // driver (library) to reweight one node heavier — the copy -> pause ->
+  // flip -> resume path runs over real sockets, and every datum stays
+  // readable.
+  let h = ClusterHarness::start(&[
+    NodeSpec::compute(1, 2),
+    NodeSpec::storage(10, 1),
+    NodeSpec::storage(20, 1),
+    NodeSpec::storage(30, 1),
+  ]);
+  let ids: Vec<DatumId> = (0..40).map(|_| DatumId::new()).collect();
+  for (i, id) in ids.iter().enumerate() {
+    h.op(1, "put1", vec![*id], format!("v{i}").as_bytes());
+  }
+
+  let report = seisin_migrate::migrate(
+    &[h.compute_addr(1)],
+    &h.proposed(&[(10, 1), (20, 1), (30, 4)]),
+    true,
+  )
+  .unwrap();
+  assert!(
+    report.applied && report.total_moves > 0,
+    "reweight moved nothing"
+  );
+
+  // Every datum still reads back...
+  for (i, id) in ids.iter().enumerate() {
+    assert_eq!(
+      ok(h.op(1, "get1", vec![*id], &[])),
+      format!("v{i}").into_bytes()
+    );
+  }
+  // ...and placement followed the new ring (node 30 owns a share now).
+  let new_ring = Ring::from_members(&[(NodeId(10), 1), (NodeId(20), 1), (NodeId(30), 4)]);
+  assert!(ids.iter().any(|id| new_ring.native(*id).0 == NodeId(30)));
+}
+
+#[test]
+fn replication_survives_a_replica_kill_and_recover_restores_it() {
+  // Three storage nodes, a replication-factor-2 corpus; kill one storage
+  // node and reads still succeed (failover, no halt); recover drops the
+  // dead node and restores replication onto the survivors.
+  let mut h = ClusterHarness::start(&[
+    NodeSpec::compute(1, 2),
+    NodeSpec::storage(10, 1),
+    NodeSpec::storage(20, 1),
+    NodeSpec::storage(30, 1),
+  ]);
+  let ids: Vec<DatumId> = (0..30).map(|_| DatumId::new()).collect();
+  for (i, id) in ids.iter().enumerate() {
+    h.op(1, "put2", vec![*id], format!("v{i}").as_bytes());
+  }
+
+  h.kill(30);
+
+  // Reads still succeed by failing over to the surviving replica — poll
+  // through the detection window (a datum whose primary was node 30
+  // fails over once the compute marks it stale).
+  let read_all = |h: &ClusterHarness| -> bool {
+    ids.iter().enumerate().all(|(i, id)| {
+      matches!(
+        h.try_op(1, "get2", vec![*id], b""),
+        Ok(Response::OpResult { payload }) if payload == format!("v{i}").into_bytes()
+      )
+    })
+  };
+  let deadline = Instant::now() + Duration::from_secs(8);
+  while !read_all(&h) {
+    assert!(
+      Instant::now() < deadline,
+      "replicated reads did not fail over after the replica kill"
+    );
+    thread::sleep(Duration::from_millis(50));
+  }
+  assert!(!matches!(
+    h.try_op(1, "get2", vec![DatumId::new()], b""),
+    Ok(Response::OpError { message }) if message.contains("cluster halted")
+  ));
+
+  // Recover: drop the dead node and restore replication onto 10 & 20.
+  let report = seisin_migrate::recover(&[h.compute_addr(1)], true).unwrap();
+  assert!(report.applied);
+
+  // The corpus is fully readable after recovery.
+  for (i, id) in ids.iter().enumerate() {
+    assert_eq!(
+      ok(h.op(1, "get2", vec![*id], &[])),
+      format!("v{i}").into_bytes()
+    );
+  }
 }

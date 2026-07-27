@@ -23,20 +23,19 @@ anywhere — all datum types, indexes, and constraints are defined in Rust
    without a matching plan (or plan with unchecked boxes) is the work
    in flight.
 
-Snapshot as of 2026-07-26: sub-projects 1–3 (datum core, gossip/ring,
-collation & wound-wait) and the datum type system (pk/sk/rk/tk/lb, FK
-constraints, partition index) are done. Storage Tier Parts A (delta log,
-store wire, RemoteStore), B (role-tagged gossip membership, coordinated
-fail-stop halt), C-1 (live add/remove/reweight migration via the
-`seisin-migrate` driver, log identity, resumable pause, storage
-self-halt, resume-after-halt with impostor detection), and C-2
-(per-datum-type replication with write-to-all-alive, read failover,
-point-of-use total-loss halt, and driver `recover` re-replication) are
-done — 11 crates, 500 tests passing. Next up: Storage Tier Part C
-remainder (incremental replica catch-up, rack awareness, read
-load-balancing, log compaction, tk/lb datum-grade durability, group
-commit) and Sub-project 5 (containerized multi-node harness). No spec
-written for either yet. PROGRESS.md supersedes this snapshot if they
+Snapshot as of 2026-07-27: sub-projects 1–3 (datum core, gossip/ring,
+collation & wound-wait), the datum type system (pk/sk/rk/tk/lb, FK
+constraints, partition index), the full Storage Tier (Parts A/B, C-1
+migration + log identity + pause + self-halt, C-2 per-type replication
+with failover + driver `recover`), and Sub-project 5 (real-process
+cluster test harness + six real-socket scenarios; configurable
+failure-detection timeouts; `node::run` composition-root extraction +
+`cluster_test_node` binary) are done — 11 crates, 508 tests passing.
+Next up: Storage Tier Part C remainder (incremental replica catch-up,
+rack awareness, read load-balancing, log compaction, tk/lb datum-grade
+durability, group commit) and the deployment *management* system (n→n+1
+rollout orchestration) — the latter still undesigned. No spec written
+for either yet. PROGRESS.md supersedes this snapshot if they
 disagree.
 
 ## Architecture quick map (crate → responsibility)

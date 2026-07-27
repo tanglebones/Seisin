@@ -765,7 +765,42 @@ commit and push immediately, since work sessions may end abruptly.
   read load-balancing across replicas, changing a type's N on
   already-written data.
 
-As of this entry: 11 crates, 500 tests passing, `cargo fmt --check` and
+- **Sub-project 5 — Deployment & cluster tests.** Per
+  `specs/2026-07-27-deployment-cluster-tests-design.md` and
+  `plans/2026-07-27-deployment-cluster-tests.md`. A real-process,
+  real-socket cluster harness under `cargo test` (no Docker — spawned OS
+  processes cover the real-socket path). Pieces:
+  (1) **Configurable failure-detection timeouts** — `NodeConfig` gains
+  optional `probe_interval`/`probe_timeout`/`suspicion_timeout`/
+  `self_halt_threshold` millis, defaulting to the `failure_detector`
+  production constants; the harness turns them down so crash detection
+  converges in ~1s.
+  (2) `main.rs`'s composition root extracted to `seisin_node::node::run(
+  config, ops, index_kinds)`, shared by the bare (op-less) binary and a
+  new `cluster_test_node` binary that registers byte ops (put1/get1,
+  put2/get2, touch_both).
+  (3) A `ClusterHarness` (tests) that generates a RON config per node,
+  spawns real node processes over localhost (storage-first), polls a
+  startup barrier, drives them via `seisin-client` and the
+  `seisin_migrate` library, `kill`s them (SIGKILL) for crashes, and reaps
+  every child on drop; cluster tests are serialized by a global lock
+  (parallel process-clusters starved gossip convergence and collided
+  ports).
+  Six scenarios in `integration_cluster.rs`: cross-node routing/redirect,
+  cross-node multi-datum ops over the real peer link, compute-kill →
+  ring reclaim, storage-kill → point-of-use halt, live reweight
+  migration (real `seisin_migrate::migrate`), and replication failover +
+  `recover`. 10x stress clean. **Found & fixed a real bug**: `node::run`
+  built the compute ring from *all* config members, so a storage node
+  became a compute owner and its "owned" datums redirected to a
+  non-existent client port — the compute ring is now compute-members-
+  only. Deferred: the deployment *management* system (n→n+1 rollout
+  orchestration), Docker/container variant, graceful-leave signal
+  handling, and a static-config "available-but-not-in-ring" storage
+  member (so the migration scenario reweights rather than admits a brand
+  new node — the same driver path over real sockets).
+
+As of this entry: 11 crates, 508 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -803,9 +838,10 @@ resume once the type system is designed.
   load-balancing across replicas, changing a type's N on already-written
   data, log compaction, tk/lb B+Tree-file datum-grade durability, group
   commit, copy/insert deltas, chunk-aware wire, hot-value LRU.
-- **Sub-project 5 — Deployment & cluster tests.** Containerized
-  multi-node harness, plus remaining cross-node correctness tests from
-  the design doc's Testing Strategy.
+- **Sub-project 5 — Deployment & cluster tests.** Done — see "Done"
+  above (spawned-process cluster harness + six real-socket scenarios).
+  A Docker/container variant reusing the same scenarios remains a
+  possible later addition.
 
 ## Not started — from the 2026-07-20 design additions
 
