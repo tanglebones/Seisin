@@ -8,6 +8,7 @@ pub mod gossip_state;
 pub mod halt;
 pub mod heartbeat;
 pub mod index_handler;
+pub mod node;
 pub mod peer_link;
 pub mod pool;
 pub mod remote_store;
