@@ -1,0 +1,13 @@
+[package]
+name = "seisin-migrate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
+seisin-core = { path = "../seisin-core" }
+seisin-protocol = { path = "../seisin-protocol" }
+seisin-ring = { path = "../seisin-ring" }
+seisin-client = { path = "../seisin-client" }

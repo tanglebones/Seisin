@@ -124,7 +124,15 @@ pub fn reconcile_identity_book(gossip: &GossipState, cluster: &ClusterState) {
   let mut book = cluster.identity_book.write().unwrap();
   for update in members {
     if update.role == MemberRole::Storage && update.log_id != [0u8; 16] {
-      book.insert(update.node_id, DatumId::from_bytes(update.log_id));
+      // First-writer-wins: once a node's log identity is known, a later
+      // gossip must not overwrite it. Otherwise an impostor (same node
+      // id, fresh log id, blank disk) rejoining after a halt would
+      // replace the expected identity and defeat resume's impostor
+      // check. `InstallStorageRing` is the only path that re-sets an
+      // identity (it clears the book first).
+      book
+        .entry(update.node_id)
+        .or_insert_with(|| DatumId::from_bytes(update.log_id));
     }
   }
 }
