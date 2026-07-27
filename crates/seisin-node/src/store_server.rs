@@ -167,10 +167,14 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
   }
 }
 
-/// Reads the current value of `id` from the log (materializing any delta
-/// chain), releasing the lock before the caller does any network I/O.
-fn read_value(node: &StoreNode, id: DatumId) -> Option<Vec<u8>> {
-  node.log.lock().unwrap().get(id.as_bytes()).ok().flatten()
+/// Reads the current value of `id` and its stored replication factor
+/// from the log (materializing any delta chain), releasing the lock
+/// before the caller does any network I/O.
+fn read_value(node: &StoreNode, id: DatumId) -> Option<(Vec<u8>, u16)> {
+  let mut log = node.log.lock().unwrap();
+  let bytes = log.get(id.as_bytes()).ok().flatten()?;
+  let n = log.n_of(id.as_bytes()).unwrap_or(1);
+  Some((bytes, n))
 }
 
 /// The async bulk copy: snapshot-read each transfer id and `Put` it to
@@ -182,10 +186,8 @@ fn run_transfer_copy(node: Arc<StoreNode>, transfer_id: DatumId) {
     return;
   };
   for id in node.transfers.ids(transfer_id) {
-    if let Some(bytes) = read_value(&node, id) {
-      // Task 3 bridge: n=1 here; Task 4 preserves the source's stored
-      // replication factor (via the log's `n_of`).
-      let _ = store_call(&dest, &StoreRequest::Put { id, bytes, n: 1 });
+    if let Some((bytes, n)) = read_value(&node, id) {
+      let _ = store_call(&dest, &StoreRequest::Put { id, bytes, n });
     }
     node.transfers.bump_copied(transfer_id, 1);
   }
@@ -204,7 +206,7 @@ fn finish_transfer(node: &Arc<StoreNode>, transfer_id: DatumId) -> StoreResponse
   };
   for id in node.transfers.take_dirty(transfer_id) {
     let request = match read_value(node, id) {
-      Some(bytes) => StoreRequest::Put { id, bytes, n: 1 }, // Task 3 bridge (see run_transfer_copy)
+      Some((bytes, n)) => StoreRequest::Put { id, bytes, n },
       None => StoreRequest::Delete { id },
     };
     let _ = store_call(&dest, &request);
@@ -299,16 +301,18 @@ mod tests {
     let (src_addr, _src, _src_dir) = store_node(NodeId(1));
     let (dst_addr, _dst, _dst_dir) = store_node(NodeId(2));
 
-    // Seed the source with three datums.
+    // Seed the source with three datums; ids[2] opts into replication
+    // factor 5 so we can prove the transfer preserves it.
     let ids: Vec<DatumId> = (0..3).map(|_| DatumId::new()).collect();
-    for id in &ids {
+    for (i, id) in ids.iter().enumerate() {
+      let n = if i == 2 { 5 } else { 1 };
       assert_eq!(
         store_call(
           &src_addr,
           &StoreRequest::Put {
             id: *id,
             bytes: b"v0".to_vec(),
-            n: 1,
+            n,
           }
         )
         .unwrap(),
@@ -359,6 +363,26 @@ mod tests {
     assert_eq!(get(&dst_addr, ids[0]), Some(b"v1".to_vec()));
     assert_eq!(get(&dst_addr, ids[1]), Some(b"v0".to_vec()));
     assert_eq!(get(&dst_addr, ids[2]), Some(b"v0".to_vec()));
+    // ...and the copy preserved ids[2]'s replication factor.
+    let dst_factors = match store_call(
+      &dst_addr,
+      &StoreRequest::ListIds {
+        after: None,
+        limit: 100,
+      },
+    )
+    .unwrap()
+    {
+      StoreResponse::IdList { ids, .. } => ids,
+      other => panic!("expected IdList, got {other:?}"),
+    };
+    assert_eq!(
+      dst_factors
+        .iter()
+        .find(|(id, _)| *id == ids[2])
+        .map(|(_, n)| *n),
+      Some(5)
+    );
 
     // Retire tombstones the moved ids on the source.
     assert_eq!(

@@ -454,7 +454,7 @@ mod tests {
         )
         .unwrap(),
       );
-      for (id, content) in ctx.take_staged_writes() {
+      for (id, content, _n) in ctx.take_staged_writes() {
         if let Some(bytes) = content {
           cache.put(id, bytes);
         }
@@ -501,7 +501,7 @@ mod tests {
     {
       let mut ctx = OpContext::new(&mut cache);
       ctx.put(pk_id, crate::encode_datum(&def, &values).unwrap());
-      for (id, content) in ctx.take_staged_writes() {
+      for (id, content, _n) in ctx.take_staged_writes() {
         if let Some(bytes) = content {
           cache.put(id, bytes);
         }
@@ -539,7 +539,7 @@ mod tests {
     {
       let mut ctx = OpContext::new(&mut cache);
       ctx.put(pk_id, crate::encode_datum(&def, &values).unwrap());
-      for (id, content) in ctx.take_staged_writes() {
+      for (id, content, _n) in ctx.take_staged_writes() {
         if let Some(bytes) = content {
           cache.put(id, bytes);
         }
@@ -604,7 +604,7 @@ mod tests {
     let mut ctx = OpContext::new(cache);
     ctx.put(pk_id, crate::encode_datum(def, values).unwrap());
     let staged = ctx.take_staged_writes();
-    for (id, content) in staged {
+    for (id, content, _n) in staged {
       if let Some(bytes) = content {
         cache.put(id, bytes);
       }

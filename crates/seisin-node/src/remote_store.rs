@@ -109,7 +109,11 @@ impl RemoteStore {
 }
 
 impl Store for RemoteStore {
-  fn get(&self, id: DatumId) -> Option<Vec<u8>> {
+  // Task 4: still single-copy placement (writes/reads the native node
+  // only), but the datum's replication factor `n` now rides on the wire
+  // so storage persists it. Task 6 replaces this with true multi-replica
+  // writes and read failover.
+  fn get_replicated(&self, id: DatumId, _n: u16) -> Option<Vec<u8>> {
     let node = self.storage_node_for(id);
     match self.call(node, id, &StoreRequest::Get { id }) {
       StoreResponse::Value { bytes } => bytes,
@@ -119,7 +123,7 @@ impl Store for RemoteStore {
     }
   }
 
-  fn put(&self, id: DatumId, content: Vec<u8>) {
+  fn put_replicated(&self, id: DatumId, content: Vec<u8>, n: u16) {
     let node = self.storage_node_for(id);
     match self.call(
       node,
@@ -127,7 +131,7 @@ impl Store for RemoteStore {
       &StoreRequest::Put {
         id,
         bytes: content,
-        n: 1,
+        n,
       },
     ) {
       StoreResponse::Ack => {}
@@ -137,7 +141,7 @@ impl Store for RemoteStore {
     }
   }
 
-  fn delete(&self, id: DatumId) {
+  fn delete_replicated(&self, id: DatumId, _n: u16) {
     let node = self.storage_node_for(id);
     match self.call(node, id, &StoreRequest::Delete { id }) {
       StoreResponse::Ack => {}
@@ -151,18 +155,24 @@ impl Store for RemoteStore {
   /// trim, ship a Patch; on `NeedFull` (the log has no base — e.g. the
   /// cache believed in a value the log never saw) fall back to a full
   /// Put. Cold caches, new datums, and poor deltas go straight to Put.
-  fn put_with_previous(&self, id: DatumId, content: Vec<u8>, previous: Option<&[u8]>) {
+  fn put_with_previous_replicated(
+    &self,
+    id: DatumId,
+    content: Vec<u8>,
+    previous: Option<&[u8]>,
+    n: u16,
+  ) {
     let Some(previous) = previous else {
-      return self.put(id, content);
+      return self.put_replicated(id, content, n);
     };
     let delta = diff(previous, &content);
     if delta.encoded_len() >= content.len() / 2 {
-      return self.put(id, content);
+      return self.put_replicated(id, content, n);
     }
     let node = self.storage_node_for(id);
-    match self.call(node, id, &StoreRequest::Patch { id, delta, n: 1 }) {
+    match self.call(node, id, &StoreRequest::Patch { id, delta, n }) {
       StoreResponse::Ack => {}
-      StoreResponse::NeedFull => self.put(id, content),
+      StoreResponse::NeedFull => self.put_replicated(id, content, n),
       other => panic!(
         "storage node {node:?} answered a Patch for {id:?} with {other:?} — halting (fail-stop)"
       ),

@@ -63,7 +63,9 @@ pub struct PendingExistsCheck {
 
 pub struct OpContext<'a> {
   cache: &'a mut Cache,
-  staged: HashMap<DatumId, Option<Vec<u8>>>,
+  /// Each staged write carries its datum's replication factor so the
+  /// commit path (worker.rs) writes it through at the right factor.
+  staged: HashMap<DatumId, (Option<Vec<u8>>, u16)>,
   pending_index_updates: Vec<PendingIndexUpdate>,
   pending_exists_checks: Vec<PendingExistsCheck>,
 }
@@ -83,18 +85,34 @@ impl<'a> OpContext<'a> {
   /// writes), even though nothing is actually committed to the
   /// underlying cache/storage until the framework says so.
   pub fn get(&mut self, id: DatumId) -> Option<Vec<u8>> {
-    if let Some(staged) = self.staged.get(&id) {
+    self.get_replicated(id, 1)
+  }
+
+  /// Reads `id`, telling the store its replication factor `n` (so a
+  /// networked store can fail a read over across the datum's replicas).
+  pub fn get_replicated(&mut self, id: DatumId, n: u16) -> Option<Vec<u8>> {
+    if let Some((staged, _)) = self.staged.get(&id) {
       return staged.clone();
     }
-    self.cache.get(id)
+    self.cache.get_replicated(id, n)
   }
 
   pub fn put(&mut self, id: DatumId, content: Vec<u8>) {
-    self.staged.insert(id, Some(content));
+    self.staged.insert(id, (Some(content), 1));
+  }
+
+  /// Stages a write of `id` at replication factor `n` — the typed layer
+  /// uses this for a datum type that opted into replication.
+  pub fn put_replicated(&mut self, id: DatumId, content: Vec<u8>, n: u16) {
+    self.staged.insert(id, (Some(content), n));
   }
 
   pub fn delete(&mut self, id: DatumId) {
-    self.staged.insert(id, None);
+    self.staged.insert(id, (None, 1));
+  }
+
+  pub fn delete_replicated(&mut self, id: DatumId, n: u16) {
+    self.staged.insert(id, (None, n));
   }
 
   /// Schedules an index update to be dispatched, once this op's
@@ -113,11 +131,15 @@ impl<'a> OpContext<'a> {
     });
   }
 
-  /// Drains every staged write from this op. Framework-internal — the
-  /// caller (`worker.rs`) is responsible for actually committing these
-  /// to the underlying cache once it's known safe to do so.
-  pub fn take_staged_writes(&mut self) -> Vec<(DatumId, Option<Vec<u8>>)> {
-    std::mem::take(&mut self.staged).into_iter().collect()
+  /// Drains every staged write from this op as `(id, value, n)`.
+  /// Framework-internal — the caller (`worker.rs`) is responsible for
+  /// actually committing these to the underlying cache once it's known
+  /// safe to do so, at each datum's replication factor.
+  pub fn take_staged_writes(&mut self) -> Vec<(DatumId, Option<Vec<u8>>, u16)> {
+    std::mem::take(&mut self.staged)
+      .into_iter()
+      .map(|(id, (value, n))| (id, value, n))
+      .collect()
   }
 
   /// Drains every index update this op scheduled. Framework-internal.
@@ -195,10 +217,24 @@ mod tests {
     ctx.put(put_id, b"hello".to_vec());
     ctx.delete(delete_id);
     let mut writes = ctx.take_staged_writes();
-    writes.sort_by_key(|(id, _)| *id);
-    let mut expected = vec![(put_id, Some(b"hello".to_vec())), (delete_id, None)];
-    expected.sort_by_key(|(id, _)| *id);
+    writes.sort_by_key(|(id, _, _)| *id);
+    let mut expected = vec![
+      (put_id, Some(b"hello".to_vec()), 1u16),
+      (delete_id, None, 1u16),
+    ];
+    expected.sort_by_key(|(id, _, _)| *id);
     assert_eq!(writes, expected);
+  }
+
+  #[test]
+  fn staged_writes_carry_the_replication_factor() {
+    let mut cache = Cache::new(Arc::new(InMemoryStore::new()));
+    let mut ctx = OpContext::new(&mut cache);
+    let id = DatumId::new();
+    ctx.put_replicated(id, b"hi".to_vec(), 3);
+    assert_eq!(ctx.get_replicated(id, 3), Some(b"hi".to_vec())); // read-your-own-write
+    let writes = ctx.take_staged_writes();
+    assert_eq!(writes, vec![(id, Some(b"hi".to_vec()), 3u16)]);
   }
 
   #[test]

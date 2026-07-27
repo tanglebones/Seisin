@@ -24,32 +24,45 @@ impl Cache {
   }
 
   /// Returns the datum's content, serving from the local cache on a hit
-  /// and loading through to the store on a miss.
-  pub fn get(&mut self, id: DatumId) -> Option<Vec<u8>> {
+  /// and loading through to the store on a miss. `n` is the datum's
+  /// replication factor (passed to the store on a miss).
+  pub fn get_replicated(&mut self, id: DatumId, n: u16) -> Option<Vec<u8>> {
     if let Some(content) = self.entries.get(&id) {
       return Some(content.clone());
     }
-    let loaded = self.store.get(id)?;
+    let loaded = self.store.get_replicated(id, n)?;
     self.entries.insert(id, loaded.clone());
     Some(loaded)
   }
 
-  /// Writes through to the store, then updates the local cache. Returns
-  /// only after the store write completes. The value being overwritten
-  /// (if cached) rides along so a networked store can send a byte
-  /// delta rather than the full content.
-  pub fn put(&mut self, id: DatumId, content: Vec<u8>) {
+  /// Writes through to the store at replication factor `n`, then updates
+  /// the local cache. Returns only after the store write completes. The
+  /// value being overwritten (if cached) rides along so a networked
+  /// store can send a byte delta rather than the full content.
+  pub fn put_replicated(&mut self, id: DatumId, content: Vec<u8>, n: u16) {
     let previous = self.entries.get(&id).cloned();
     self
       .store
-      .put_with_previous(id, content.clone(), previous.as_deref());
+      .put_with_previous_replicated(id, content.clone(), previous.as_deref(), n);
     self.entries.insert(id, content);
   }
 
-  /// Deletes from the store, then evicts the local cache entry.
-  pub fn delete(&mut self, id: DatumId) {
-    self.store.delete(id);
+  /// Deletes from the store (all `n` replicas), then evicts the local
+  /// cache entry.
+  pub fn delete_replicated(&mut self, id: DatumId, n: u16) {
+    self.store.delete_replicated(id, n);
     self.entries.remove(&id);
+  }
+
+  // --- N=1 back-compat wrappers (existing callers/tests unchanged) ---
+  pub fn get(&mut self, id: DatumId) -> Option<Vec<u8>> {
+    self.get_replicated(id, 1)
+  }
+  pub fn put(&mut self, id: DatumId, content: Vec<u8>) {
+    self.put_replicated(id, content, 1);
+  }
+  pub fn delete(&mut self, id: DatumId) {
+    self.delete_replicated(id, 1);
   }
 
   /// Evicts a cache entry without touching the store — used when a

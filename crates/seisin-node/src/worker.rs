@@ -260,7 +260,7 @@ struct OpRecord {
 }
 
 struct IndexUpdateState {
-  staged_writes: Vec<(DatumId, Option<Vec<u8>>)>,
+  staged_writes: Vec<(DatumId, Option<Vec<u8>>, u16)>,
   op_result: Vec<u8>,
   pending: usize,
   /// The first violation seen, if any — an op can have scheduled
@@ -913,10 +913,10 @@ fn try_run_if_ready(
   };
 
   if pending_index_updates.is_empty() && pending_exists_checks.is_empty() {
-    for (id, content) in staged_writes {
+    for (id, content, n) in staged_writes {
       match content {
-        Some(bytes) => cache.put(id, bytes),
-        None => cache.delete(id),
+        Some(bytes) => cache.put_replicated(id, bytes, n),
+        None => cache.delete_replicated(id, n),
       }
     }
     let record = op_records.remove(&op_id).unwrap();
@@ -1001,10 +1001,10 @@ fn finish_op_if_settled(
   if let Some(message) = state.violation {
     let _ = record.reply.send(Err(message));
   } else {
-    for (id, content) in state.staged_writes {
+    for (id, content, n) in state.staged_writes {
       match content {
-        Some(bytes) => cache.put(id, bytes),
-        None => cache.delete(id),
+        Some(bytes) => cache.put_replicated(id, bytes, n),
+        None => cache.delete_replicated(id, n),
       }
     }
     let _ = record.reply.send(Ok(state.op_result));
