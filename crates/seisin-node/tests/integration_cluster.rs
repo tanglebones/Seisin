@@ -11,7 +11,14 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command};
+use std::sync::{Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
+
+/// Cluster scenarios each spawn several node processes; running them in
+/// parallel (cargo's default) starves gossip convergence and collides
+/// ports. This global lock serializes them — one live cluster at a time.
+static CLUSTER_LOCK: Mutex<()> = Mutex::new(());
 
 use seisin_core::datum::DatumId;
 use seisin_protocol::{Request, Response};
@@ -70,6 +77,7 @@ struct ClusterHarness {
   _dir: tempfile::TempDir,
   nodes: Vec<NodeAddrs>,
   children: Vec<(u64, Child)>,
+  _guard: MutexGuard<'static, ()>,
 }
 
 /// Binds an ephemeral localhost port, records it, and drops the listener
@@ -88,6 +96,10 @@ fn addr() -> String {
 
 impl ClusterHarness {
   fn start(specs: &[NodeSpec]) -> Self {
+    // Held for the cluster's lifetime — only one cluster runs at a time
+    // (recover from a poisoned lock so one panicking scenario doesn't
+    // wedge the rest).
+    let guard = CLUSTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let nodes: Vec<NodeAddrs> = specs
       .iter()
@@ -148,6 +160,7 @@ impl ClusterHarness {
       _dir: dir,
       nodes,
       children,
+      _guard: guard,
     };
     harness.await_ready();
     harness
@@ -200,6 +213,19 @@ impl ClusterHarness {
 
   /// A client op against compute node `id`, returning its `Response`.
   fn op(&self, id: u64, name: &str, datum_ids: Vec<DatumId>, payload: &[u8]) -> Response {
+    self.try_op(id, name, datum_ids, payload).unwrap()
+  }
+
+  /// Like `op`, but surfaces the transport error (a redirect to a
+  /// just-killed node refuses the connection) instead of panicking — so
+  /// crash scenarios can poll through the convergence window.
+  fn try_op(
+    &self,
+    id: u64,
+    name: &str,
+    datum_ids: Vec<DatumId>,
+    payload: &[u8],
+  ) -> anyhow::Result<Response> {
     seisin_client::call(
       &self.compute_addr(id),
       Request::Op {
@@ -209,7 +235,6 @@ impl ClusterHarness {
         payload: payload.to_vec(),
       },
     )
-    .unwrap()
   }
 
   #[allow(dead_code)] // used by the crash scenarios (Task 3)
@@ -262,4 +287,114 @@ fn a_client_op_is_served_across_two_compute_nodes() {
     );
   }
   assert_eq!(h.compute_ids().len(), 2);
+}
+
+#[test]
+fn a_killed_compute_node_is_reclaimed_and_ops_keep_succeeding() {
+  // Two compute nodes over one storage node; kill a compute node and the
+  // ring converges so the survivor owns every key and serves it (reload
+  // from storage), no longer redirecting to the dead node.
+  let mut h = ClusterHarness::start(&[
+    NodeSpec::compute(1, 2),
+    NodeSpec::compute(2, 2),
+    NodeSpec::storage(10, 1),
+  ]);
+  // Some keys written while both nodes are up.
+  for i in 0..10u32 {
+    h.op(1, "put1", vec![DatumId::new()], format!("v{i}").as_bytes());
+  }
+
+  h.kill(2);
+
+  // A round-trip that succeeds without a redirect to the dead node.
+  let round_trips = |id: DatumId| -> bool {
+    matches!(
+      h.try_op(1, "put1", vec![id], b"v"),
+      Ok(Response::OpResult { .. })
+    ) && matches!(
+      h.try_op(1, "get1", vec![id], b""),
+      Ok(Response::OpResult { payload }) if payload == b"v".to_vec()
+    )
+  };
+
+  // Poll until the survivor's detector has fully converged node 2 dead
+  // (ring shrunk to just node 1): a *fixed batch* of ids must all
+  // round-trip — a single fresh id could merely happen to be node-1-
+  // native while node-2-native ids still redirect to the dead node.
+  let batch: Vec<DatumId> = (0..15).map(|_| DatumId::new()).collect();
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    if batch.iter().all(|id| round_trips(*id)) {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "cluster never reclaimed after the compute-node kill"
+    );
+    thread::sleep(Duration::from_millis(50));
+  }
+
+  // Reclaimed: every op now serves on the survivor.
+  for i in 0..20u32 {
+    let id = DatumId::new();
+    assert!(ok(h.op(1, "put1", vec![id], format!("k{i}").as_bytes())).is_empty());
+    assert_eq!(
+      ok(h.op(1, "get1", vec![id], &[])),
+      format!("k{i}").into_bytes()
+    );
+  }
+}
+
+#[test]
+fn cross_node_ops_complete_under_contention() {
+  // A two-datum op whose ids may be native to different compute nodes
+  // completes over the real peer link (foreign pull + release). Random
+  // pairs cover both the same-node and cross-node dispatch paths.
+  let h = ClusterHarness::start(&[
+    NodeSpec::compute(1, 2),
+    NodeSpec::compute(2, 2),
+    NodeSpec::storage(10, 1),
+  ]);
+  for _ in 0..30 {
+    let a = DatumId::new();
+    let b = DatumId::new();
+    // Route via either node; the op touches both ids and must complete.
+    assert_eq!(
+      h.op(1, "touch_both", vec![a, b], b"x"),
+      Response::OpResult { payload: vec![] }
+    );
+    assert_eq!(ok(h.op(2, "get1", vec![a], &[])), b"x".to_vec());
+    assert_eq!(ok(h.op(2, "get1", vec![b], &[])), b"x".to_vec());
+  }
+}
+
+#[test]
+fn a_killed_storage_node_halts_client_traffic() {
+  // N=1 corpus across two storage nodes; kill one, and an op touching a
+  // now-lost shard trips the point-of-use cluster halt over real sockets.
+  let mut h = ClusterHarness::start(&[
+    NodeSpec::compute(1, 2),
+    NodeSpec::storage(10, 1),
+    NodeSpec::storage(20, 1),
+  ]);
+  for i in 0..20u32 {
+    h.op(1, "put1", vec![DatumId::new()], format!("v{i}").as_bytes());
+  }
+
+  h.kill(20);
+
+  // Some op touching a datum on the killed node halts the whole cluster;
+  // poll fresh reads until the halt reason appears.
+  let deadline = Instant::now() + Duration::from_secs(8);
+  let mut halted = false;
+  while Instant::now() < deadline {
+    if let Ok(Response::OpError { message }) = h.try_op(1, "get1", vec![DatumId::new()], b"") {
+      if message.contains("cluster halted") {
+        halted = true;
+        break;
+      }
+    }
+    thread::sleep(Duration::from_millis(20));
+  }
+  assert!(halted, "killing a storage node did not halt client traffic");
 }
