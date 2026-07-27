@@ -18,8 +18,13 @@ use crate::crc::crc32;
 use crate::delta::{apply, decode_delta, encode_delta, Delta};
 
 const MAGIC: &[u8; 4] = b"SDLG";
-const FORMAT_VERSION: u16 = 1;
-const HEADER_LEN: u64 = 6;
+// Bumped to 2 when the header gained a 16-byte log id (Storage Tier
+// Part C-1). The keep-the-old-decoder n±1 policy binds from the first
+// deployed release; there have been none, so a v1 log is simply
+// rejected on open rather than migrated.
+const FORMAT_VERSION: u16 = 2;
+/// MAGIC(4) ++ FORMAT_VERSION:u16 ++ log_id:[u8;16].
+const HEADER_LEN: u64 = 22;
 
 const KIND_FULL: u8 = 1;
 const KIND_DELTA: u8 = 2;
@@ -52,6 +57,11 @@ pub struct DatumLog {
   file: File,
   index: HashMap<[u8; 16], LogRef>,
   end_offset: u64,
+  /// Stamped once at creation, read back on every reopen; never changes
+  /// for the life of the log directory. Proves a restarted/moved storage
+  /// node holds the same data (see the migration design's log-identity
+  /// section).
+  log_id: [u8; 16],
 }
 
 impl DatumLog {
@@ -67,10 +77,13 @@ impl DatumLog {
       .open(path)
       .with_context(|| format!("failed to open datum log {path:?}"))?;
     let file_len = file.metadata()?.len();
-    if file_len == 0 {
+    let log_id: [u8; 16] = if file_len == 0 {
+      let fresh = *uuid::Uuid::now_v7().as_bytes();
       file.write_all(MAGIC)?;
       file.write_all(&FORMAT_VERSION.to_le_bytes())?;
+      file.write_all(&fresh)?;
       file.sync_data()?;
+      fresh
     } else {
       let mut header = [0u8; HEADER_LEN as usize];
       file.seek(SeekFrom::Start(0))?;
@@ -82,12 +95,14 @@ impl DatumLog {
       if version != FORMAT_VERSION {
         bail!("datum log {path:?} is format version {version}; this build reads {FORMAT_VERSION}");
       }
-    }
+      header[6..22].try_into().unwrap()
+    };
 
     let mut log = Self {
       file,
       index: HashMap::new(),
       end_offset: HEADER_LEN,
+      log_id,
     };
     log.recover(file_len.max(HEADER_LEN))?;
     Ok(log)
@@ -263,6 +278,28 @@ impl DatumLog {
   pub fn is_empty(&self) -> bool {
     self.index.is_empty()
   }
+
+  /// The immutable 16-byte identity stamped into this log at creation.
+  pub fn log_id(&self) -> [u8; 16] {
+    self.log_id
+  }
+
+  /// The ids currently present (index keys), sorted ascending by raw
+  /// bytes, strictly greater than `after`, capped at `limit`. The caller
+  /// pages by passing the last returned id back as the next `after`, and
+  /// knows it is done when a page comes back shorter than `limit`. Used
+  /// by the migration driver's per-source id enumeration.
+  pub fn list_ids(&self, after: Option<[u8; 16]>, limit: usize) -> Vec<[u8; 16]> {
+    let mut ids: Vec<[u8; 16]> = self
+      .index
+      .keys()
+      .copied()
+      .filter(|id| after.map(|a| *id > a).unwrap_or(true))
+      .collect();
+    ids.sort_unstable();
+    ids.truncate(limit);
+    ids
+  }
 }
 
 #[cfg(test)]
@@ -422,6 +459,50 @@ mod tests {
     let mut log = DatumLog::open(&path).unwrap();
     assert_eq!(log.get(id(1)).unwrap(), Some(b"first".to_vec()));
     assert_eq!(log.get(id(2)).unwrap(), None); // truncated away
+  }
+
+  #[test]
+  fn log_id_is_stamped_at_creation_and_stable_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = log_path(&dir);
+    let first_id = {
+      let log = DatumLog::open(&path).unwrap();
+      log.log_id()
+    };
+    // A freshly-created log has a non-zero id...
+    assert_ne!(first_id, [0u8; 16]);
+    // ...that survives a reopen unchanged (it lives in the header).
+    let reopened = DatumLog::open(&path).unwrap();
+    assert_eq!(reopened.log_id(), first_id);
+    // ...and a different log directory gets a distinct id.
+    let other_dir = TempDir::new().unwrap();
+    let other = DatumLog::open(&log_path(&other_dir)).unwrap();
+    assert_ne!(other.log_id(), first_id);
+  }
+
+  #[test]
+  fn list_ids_pages_in_ascending_order() {
+    let dir = TempDir::new().unwrap();
+    let mut log = DatumLog::open(&log_path(&dir)).unwrap();
+    for n in [3u8, 1, 4, 2] {
+      log.put_full(id(n), b"v").unwrap();
+    }
+    // Page with limit 2, walking `after`, gathering the full set.
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+      let page = log.list_ids(after, 2);
+      if page.is_empty() {
+        break;
+      }
+      assert!(page.len() <= 2);
+      after = Some(*page.last().unwrap());
+      seen.extend(page);
+    }
+    assert_eq!(seen, vec![id(1), id(2), id(3), id(4)]); // ascending, no dupes/gaps
+                                                        // A tombstoned id drops out of enumeration.
+    log.delete(id(2)).unwrap();
+    assert_eq!(log.list_ids(None, 10), vec![id(1), id(3), id(4)]);
   }
 
   #[test]
