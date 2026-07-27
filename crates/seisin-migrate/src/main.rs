@@ -48,6 +48,15 @@ fn main() -> Result<()> {
       let config = load(path)?;
       seisin_migrate::resume(&config.compute_addresses)
     }
+    Some("recover") => {
+      let path = args
+        .get(2)
+        .context("usage: seisin-migrate recover <config.ron> [--apply]")?;
+      let apply = args.iter().any(|a| a == "--apply");
+      let config = load(path)?;
+      seisin_migrate::recover(&config.compute_addresses, apply)?;
+      Ok(())
+    }
     Some(path) => {
       let apply = args.iter().any(|a| a == "--apply");
       let config = load(path)?;
@@ -66,7 +75,11 @@ fn main() -> Result<()> {
       Ok(())
     }
     None => {
-      bail!("usage:\n  seisin-migrate <config.ron> [--apply]\n  seisin-migrate resume <config.ron>")
+      bail!(
+        "usage:\n  seisin-migrate <config.ron> [--apply]\n  \
+         seisin-migrate recover <config.ron> [--apply]\n  \
+         seisin-migrate resume <config.ron>"
+      )
     }
   }
 }

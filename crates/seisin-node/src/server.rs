@@ -348,6 +348,14 @@ fn handle_install_storage_ring(cluster: &ClusterState, members: Vec<StorageMembe
       identity.insert(m.node_id, m.log_id);
     }
   }
+  // Installed members are current replicas — re-admit any that were
+  // marked stale (e.g. a node re-replicated into the new ring).
+  {
+    let mut stale = cluster.storage_stale.write().unwrap();
+    for m in &members {
+      stale.remove(&m.node_id);
+    }
+  }
   Response::Ack
 }
 

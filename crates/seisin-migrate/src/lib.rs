@@ -33,17 +33,44 @@ pub struct Move {
   pub dest: NodeId,
 }
 
-/// The moved set: every id whose owning node differs between `old` and
-/// `new`. Pure ring math — add, remove, and reweight all reduce to this.
-pub fn plan_moves(old: &Ring, new: &Ring, ids: &[DatumId]) -> Vec<Move> {
-  ids
-    .iter()
-    .filter_map(|&id| {
-      let source = old.native(id).0;
-      let dest = new.native(id).0;
-      (source != dest).then_some(Move { id, source, dest })
-    })
-    .collect()
+/// The moved set over replica sets: for each `(id, n)`, one copy per
+/// node that is a replica of `id` under `new` but not under `old`,
+/// sourced from `id`'s current primary (rank-0 old replica, which holds
+/// it and receives every write during the copy so the dirty tail is
+/// complete). Pure ring math — add, remove, reweight, and re-replication
+/// all reduce to this. At n=1 it is exactly the old single-owner move.
+pub fn plan_moves(old: &Ring, new: &Ring, ids: &[(DatumId, u16)]) -> Vec<Move> {
+  let mut moves = Vec::new();
+  for &(id, n) in ids {
+    let old_set = old.replicas(id, n as usize);
+    // Provisional source: the current primary (rank 0), which holds the
+    // datum. `migrate` reroutes this to a reachable old replica when the
+    // primary is itself the node being recovered-from (a crashed node).
+    let Some(&source) = old_set.first() else {
+      continue; // no current replica — nothing to copy
+    };
+    for dest in new.replicas(id, n as usize) {
+      if !old_set.contains(&dest) {
+        moves.push(Move { id, source, dest });
+      }
+    }
+  }
+  moves
+}
+
+/// The superseded copies to reclaim after the flip: for each `(id, n)`,
+/// the nodes that were a replica under `old` but are not under `new`.
+fn plan_drops(old: &Ring, new: &Ring, ids: &[(DatumId, u16)]) -> Vec<(NodeId, DatumId)> {
+  let mut drops = Vec::new();
+  for &(id, n) in ids {
+    let new_set = new.replicas(id, n as usize);
+    for node in old.replicas(id, n as usize) {
+      if !new_set.contains(&node) {
+        drops.push((node, id));
+      }
+    }
+  }
+  drops
 }
 
 /// The outcome of a `migrate` run.
@@ -99,13 +126,42 @@ pub fn migrate(
   let old = ring_of(&current);
   let new = ring_of(&resolved);
 
-  let mut all_ids = Vec::new();
+  // Enumerate every (id, n) across current sources, deduped — a
+  // replicated datum is listed by each of its replicas. An unreachable
+  // source is skipped (a `recover` run has dead nodes in the ring; every
+  // recoverable datum is still listed by a surviving replica).
+  let mut id_factors: HashMap<DatumId, u16> = HashMap::new();
+  let mut reachable: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
   for m in &current {
-    all_ids.extend(
-      list_all_ids(&m.store_address).with_context(|| format!("listing ids on {:?}", m.node_id))?,
-    );
+    match list_all_ids(&m.store_address) {
+      Ok(page) => {
+        reachable.insert(m.node_id);
+        for (id, n) in page {
+          id_factors.insert(id, n);
+        }
+      }
+      Err(e) => println!("  (skipping unreachable source {:?}: {e})", m.node_id),
+    }
   }
-  let moves = plan_moves(&old, &new, &all_ids);
+  let all_ids: Vec<(DatumId, u16)> = id_factors.iter().map(|(id, n)| (*id, *n)).collect();
+  let drops = plan_drops(&old, &new, &all_ids);
+  // Reroute each copy's source off any unreachable node (a `recover`
+  // run's crashed replica) onto a reachable old replica of the same
+  // datum; a datum with no reachable old replica is unrecoverable and
+  // dropped from the plan.
+  let moves: Vec<Move> = plan_moves(&old, &new, &all_ids)
+    .into_iter()
+    .filter_map(|mut mv| {
+      if !reachable.contains(&mv.source) {
+        let n = *id_factors.get(&mv.id).unwrap_or(&1);
+        mv.source = old
+          .replicas(mv.id, n as usize)
+          .into_iter()
+          .find(|node| reachable.contains(node))?;
+      }
+      Some(mv)
+    })
+    .collect();
 
   let mut by_pair: HashMap<(NodeId, NodeId), Vec<DatumId>> = HashMap::new();
   for mv in &moves {
@@ -117,9 +173,10 @@ pub fn migrate(
     .collect();
 
   println!(
-    "migration plan: {} datum(s) move across {} (source -> dest) pair(s)",
+    "migration plan: {} replica copy(ies) across {} (source -> dest) pair(s); {} superseded copy(ies) to reclaim",
     moves.len(),
-    per_pair.len()
+    per_pair.len(),
+    drops.len()
   );
   for (s, d, n) in &per_pair {
     println!("  {s:?} -> {d:?}: {n}");
@@ -193,17 +250,21 @@ pub fn migrate(
     )?;
   }
 
-  // --- Resume, then retire (the only destructive step) ---
+  // --- Resume, then reclaim superseded copies (the only destructive
+  // step): delete each dropped replica's now-inert copy. This is the
+  // only place data is removed, and it runs after the flip named the new
+  // replica set, so a datum always has a live replica throughout. ---
   for addr in compute_addrs {
     expect_ack(addr, Request::Resume)?;
   }
-  for (addr, transfer_id) in &transfers {
-    expect_store_ack(
-      addr,
-      &StoreRequest::Retire {
-        transfer_id: *transfer_id,
-      },
-    )?;
+  for (node, id) in &drops {
+    let Some(addr) = current_addr.get(node) else {
+      continue;
+    };
+    // Best-effort: a dropped node may itself be the dead one (a recover
+    // run). Its copy is already inert (the ring no longer names it), so a
+    // failed delete only leaks space until compaction reclaims it.
+    let _ = store_call(addr, &StoreRequest::Delete { id: *id });
   }
 
   println!("migration applied");
@@ -248,6 +309,36 @@ pub fn resume(compute_addrs: &[String]) -> Result<()> {
   Ok(())
 }
 
+/// Recover-after-loss: drop every unreachable storage node from the ring
+/// and restore the replication factor of its shards onto the survivors.
+/// Reads the current ring, `Identify`s each member to find the dead
+/// ones, and runs a migration to the surviving ring (same weights). A
+/// datum with no surviving replica (an N=1 total loss) cannot be
+/// recovered this way — restart that node on its log directory and
+/// `resume` instead.
+pub fn recover(compute_addrs: &[String], apply: bool) -> Result<Report> {
+  if compute_addrs.is_empty() {
+    bail!("need at least one compute node address");
+  }
+  let current = get_cluster_config(&compute_addrs[0])?;
+  let survivors: Vec<StorageMember> = current
+    .iter()
+    .filter(|m| identify(&m.store_address).is_ok())
+    .cloned()
+    .collect();
+  let dropped = current.len() - survivors.len();
+  if dropped == 0 {
+    println!("recover: every storage node is reachable; nothing to do");
+    return Ok(Report {
+      applied: false,
+      total_moves: 0,
+      per_pair: Vec::new(),
+    });
+  }
+  println!("recover: {dropped} unreachable node(s) dropped; restoring replication onto survivors");
+  migrate(compute_addrs, &survivors, apply)
+}
+
 // --- helpers ---
 
 fn addr_map(members: &[StorageMember]) -> HashMap<NodeId, String> {
@@ -280,7 +371,7 @@ fn identify(store_addr: &str) -> Result<(NodeId, DatumId)> {
   }
 }
 
-fn list_all_ids(store_addr: &str) -> Result<Vec<DatumId>> {
+fn list_all_ids(store_addr: &str) -> Result<Vec<(DatumId, u16)>> {
   const PAGE: u32 = 1024;
   let mut ids = Vec::new();
   let mut after = None;
@@ -289,9 +380,7 @@ fn list_all_ids(store_addr: &str) -> Result<Vec<DatumId>> {
       StoreResponse::IdList { ids: page, done } => {
         after = page.last().map(|(id, _n)| *id);
         let stop = done || page.is_empty();
-        // Task 3 bridge: drop the replication factor; the driver starts
-        // using it (per-id N) in Task 7.
-        ids.extend(page.into_iter().map(|(id, _n)| id));
+        ids.extend(page);
         if stop {
           break;
         }
@@ -320,19 +409,18 @@ fn expect_store_ack(store_addr: &str, request: &StoreRequest) -> Result<()> {
 mod tests {
   use super::*;
 
-  fn ids(n: usize) -> Vec<DatumId> {
-    (0..n).map(|_| DatumId::new()).collect()
+  /// A corpus of `count` ids, each at replication factor `n`.
+  fn corpus(count: usize, n: u16) -> Vec<(DatumId, u16)> {
+    (0..count).map(|_| (DatumId::new(), n)).collect()
   }
 
   #[test]
   fn add_moves_a_subset_to_the_new_node_and_leaves_the_rest() {
     let old = Ring::from_members(&[(NodeId(1), 1)]);
     let new = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
-    let corpus = ids(200);
-    let moves = plan_moves(&old, &new, &corpus);
-    // Some ids move; every move goes from node 1 to node 2 (nothing was
-    // anywhere else), and no id both stays and moves.
-    assert!(!moves.is_empty() && moves.len() < corpus.len());
+    let ids = corpus(200, 1);
+    let moves = plan_moves(&old, &new, &ids);
+    assert!(!moves.is_empty() && moves.len() < ids.len());
     for mv in &moves {
       assert_eq!(mv.source, NodeId(1));
       assert_eq!(mv.dest, NodeId(2));
@@ -343,18 +431,18 @@ mod tests {
   fn remove_moves_every_id_off_the_departing_node_to_the_survivor() {
     let old = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
     let new = Ring::from_members(&[(NodeId(1), 1)]);
-    let corpus = ids(200);
-    let moves = plan_moves(&old, &new, &corpus);
+    let ids = corpus(200, 1);
+    let moves = plan_moves(&old, &new, &ids);
     for mv in &moves {
-      // Only ids that were on the removed node move, and they all land
-      // on the survivor.
       assert_eq!(old.native(mv.id).0, NodeId(2));
       assert_eq!(mv.dest, NodeId(1));
+      // Source is the drained node itself — alive during a planned
+      // remove, and the only holder of its single copy.
+      assert_eq!(mv.source, NodeId(2));
     }
-    // Every id that was on node 2 is accounted for as a move.
-    let on_two = corpus
+    let on_two = ids
       .iter()
-      .filter(|id| old.native(**id).0 == NodeId(2))
+      .filter(|(id, _)| old.native(*id).0 == NodeId(2))
       .count();
     assert_eq!(moves.len(), on_two);
   }
@@ -363,10 +451,8 @@ mod tests {
   fn reweight_moves_a_nonempty_subset_toward_the_heavier_node() {
     let old = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
     let new = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 3)]);
-    let corpus = ids(300);
-    let moves = plan_moves(&old, &new, &corpus);
+    let moves = plan_moves(&old, &new, &corpus(300, 1));
     assert!(!moves.is_empty());
-    // Net flow is toward node 2 (the heavier one gains placements).
     let to_two = moves.iter().filter(|m| m.dest == NodeId(2)).count();
     let to_one = moves.iter().filter(|m| m.dest == NodeId(1)).count();
     assert!(
@@ -379,6 +465,59 @@ mod tests {
   fn an_identical_ring_moves_nothing() {
     let ring_a = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 1)]);
     let ring_b = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 1)]);
-    assert!(plan_moves(&ring_a, &ring_b, &ids(200)).is_empty());
+    assert!(plan_moves(&ring_a, &ring_b, &corpus(200, 1)).is_empty());
+  }
+
+  #[test]
+  fn adding_a_node_replicates_each_datum_to_a_new_replica() {
+    // With N=2 and a 3rd node added, some datums gain node 3 as a replica.
+    let old = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
+    let new = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1), (NodeId(3), 1)]);
+    let ids = corpus(200, 2);
+    let moves = plan_moves(&old, &new, &ids);
+    assert!(moves.iter().any(|m| m.dest == NodeId(3)));
+    // Every move's source is an old replica of that id, and its dest is a
+    // new replica that was not already an old replica.
+    for mv in &moves {
+      let old_set = old.replicas(mv.id, 2);
+      let new_set = new.replicas(mv.id, 2);
+      assert!(old_set.contains(&mv.source));
+      assert!(new_set.contains(&mv.dest) && !old_set.contains(&mv.dest));
+    }
+  }
+
+  #[test]
+  fn recover_re_replication_restores_two_replicas_among_survivors() {
+    // A 3-node, N=2 cluster loses node 3: re-replication restores N onto
+    // the survivors. (Sourcing off the dead node is `migrate`'s reroute
+    // job, exercised end-to-end in the integration suite.)
+    let old = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1), (NodeId(3), 1)]);
+    let new = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
+    let ids = corpus(300, 2);
+    let moves = plan_moves(&old, &new, &ids);
+    assert!(
+      !moves.is_empty(),
+      "losing a replica should trigger re-replication"
+    );
+    // Every datum ends with 2 replicas among the two survivors.
+    for (id, _) in &ids {
+      let new_set = new.replicas(*id, 2);
+      assert_eq!(new_set.len(), 2);
+      for node in &new_set {
+        assert!(*node == NodeId(1) || *node == NodeId(2));
+      }
+    }
+  }
+
+  #[test]
+  fn drops_reclaim_only_nodes_that_left_the_replica_set() {
+    let old = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 1)]);
+    let new = Ring::from_members(&[(NodeId(1), 1)]);
+    let ids = corpus(200, 1);
+    let drops = plan_drops(&old, &new, &ids);
+    for (node, id) in &drops {
+      assert_eq!(*node, NodeId(2)); // only the removed node's copies are reclaimed
+      assert!(!new.replicas(*id, 1).contains(node));
+    }
   }
 }
