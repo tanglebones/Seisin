@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
 use seisin_gossip::membership::{MemberRole, MemberTable, MemberUpdate};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::halt::HaltState;
 use seisin_gossip::sequencer::{MutationLog, RingMutation};
@@ -97,6 +97,14 @@ pub struct ClusterState {
   /// verifies against. Populated by `InstallStorageRing` (driver-
   /// provided) and reconciled from gossiped `MemberUpdate.log_id`.
   pub identity_book: Arc<RwLock<HashMap<NodeId, DatumId>>>,
+  /// Storage nodes currently believed up. A replica is served only if it
+  /// is in the ring, alive, and not stale (replication, Part C-2).
+  pub storage_alive: Arc<RwLock<HashSet<NodeId>>>,
+  /// Storage nodes that were confirmed dead and have not yet been
+  /// re-replicated. A returned node stays here (never auto-cleared by
+  /// gossip) until a driver re-replication re-admits it, so it can never
+  /// serve stale data.
+  pub storage_stale: Arc<RwLock<HashSet<NodeId>>>,
   pub halt: Arc<HaltState>,
 }
 
@@ -110,6 +118,8 @@ impl ClusterState {
       storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
       store_addresses: Arc::new(RwLock::new(HashMap::new())),
       identity_book: Arc::new(RwLock::new(HashMap::new())),
+      storage_alive: Arc::new(RwLock::new(HashSet::new())),
+      storage_stale: Arc::new(RwLock::new(HashSet::new())),
       halt: Arc::new(HaltState::new()),
     }
   }
@@ -189,6 +199,7 @@ pub fn apply_ready_mutations(
         // auto-extending a jump-hash ring re-homes existing keys whose
         // bytes never moved, a read-miss once real data exists. The ring
         // changes exclusively via a driver `InstallStorageRing`.
+        cluster.storage_alive.write().unwrap().insert(node_id);
         if let Some(update) = &member {
           if !update.store_address.is_empty() {
             cluster
@@ -207,10 +218,13 @@ pub fn apply_ready_mutations(
         }
       }
       (MemberRole::Storage, RingMutation::Leave { node_id }) => {
-        // No replication in v1: a lost storage member that is still
-        // serving the ring is fail-stop for the cluster. A drained node
-        // left the ring at flip time, so its later Leave finds it absent
-        // and is ignored — planned removal avoids the halt for free.
+        // A confirmed-dead storage node drops from the alive serving set
+        // and is marked stale (excluded until a driver re-replication
+        // re-admits it). Task 6 moves the coordinated halt out of this
+        // path and into `RemoteStore` (point-of-use, on total loss); for
+        // now the membership halt still fires so behavior is unchanged.
+        cluster.storage_alive.write().unwrap().remove(&node_id);
+        cluster.storage_stale.write().unwrap().insert(node_id);
         if cluster.storage_ring.read().unwrap().contains(node_id) {
           cluster.halt.halt(format!(
             "cluster halted: storage node {node_id:?} confirmed dead — fail-stop (no replication in v1)"
@@ -355,13 +369,7 @@ mod tests {
   }
 
   fn test_cluster(compute_ring: Arc<RwLock<Ring>>) -> ClusterState {
-    ClusterState {
-      compute_ring,
-      storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
-      store_addresses: Arc::new(RwLock::new(HashMap::new())),
-      identity_book: Arc::new(RwLock::new(HashMap::new())),
-      halt: Arc::new(HaltState::new()),
-    }
+    ClusterState::compute_only(compute_ring)
   }
 
   #[test]
@@ -447,6 +455,8 @@ mod tests {
       cluster.identity_book.read().unwrap().get(&NodeId(9)),
       Some(&DatumId::from_bytes([5u8; 16]))
     );
+    // ...and it joined the alive serving set...
+    assert!(cluster.storage_alive.read().unwrap().contains(&NodeId(9)));
     // ...and neither the compute ring nor the halt were touched.
     assert_eq!(
       compute_ring.read().unwrap().native(DatumId::new()).0,
@@ -456,16 +466,58 @@ mod tests {
   }
 
   #[test]
+  fn a_storage_leave_removes_from_alive_marks_stale_and_stays_stale() {
+    let compute_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let pool = test_pool(&compute_ring);
+    let cluster = test_cluster(Arc::clone(&compute_ring));
+    let gossip = GossipState::new();
+    gossip
+      .member_table
+      .lock()
+      .unwrap()
+      .merge_update(storage_member(9, 4, "127.0.0.1:6999"));
+
+    // Join -> alive; Leave -> dropped from alive, marked stale.
+    gossip.record_mutation(
+      1,
+      RingMutation::Join {
+        node_id: NodeId(9),
+        thread_count: 1,
+      },
+    );
+    apply_ready_mutations(&gossip, &cluster, NodeId(1), &pool);
+    assert!(cluster.storage_alive.read().unwrap().contains(&NodeId(9)));
+
+    gossip.record_mutation(2, RingMutation::Leave { node_id: NodeId(9) });
+    apply_ready_mutations(&gossip, &cluster, NodeId(1), &pool);
+    assert!(!cluster.storage_alive.read().unwrap().contains(&NodeId(9)));
+    assert!(cluster.storage_stale.read().unwrap().contains(&NodeId(9)));
+
+    // A returned node (a fresh Join) rejoins alive but STAYS stale —
+    // only a driver re-replication clears it.
+    gossip.record_mutation(
+      3,
+      RingMutation::Join {
+        node_id: NodeId(9),
+        thread_count: 1,
+      },
+    );
+    apply_ready_mutations(&gossip, &cluster, NodeId(1), &pool);
+    assert!(cluster.storage_alive.read().unwrap().contains(&NodeId(9)));
+    assert!(
+      cluster.storage_stale.read().unwrap().contains(&NodeId(9)),
+      "a returned node must stay stale until re-replicated"
+    );
+  }
+
+  #[test]
   fn a_storage_leave_engages_the_halt_when_the_node_is_in_the_ring() {
     let compute_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
     let pool = test_pool(&compute_ring);
     // The departing node is actually serving the storage ring.
     let cluster = ClusterState {
-      compute_ring: Arc::clone(&compute_ring),
       storage_ring: Arc::new(RwLock::new(Ring::from_members(&[(NodeId(9), 1)]))),
-      store_addresses: Arc::new(RwLock::new(HashMap::new())),
-      identity_book: Arc::new(RwLock::new(HashMap::new())),
-      halt: Arc::new(HaltState::new()),
+      ..ClusterState::compute_only(Arc::clone(&compute_ring))
     };
     let gossip = GossipState::new();
     gossip

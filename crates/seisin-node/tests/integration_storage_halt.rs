@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -108,6 +108,8 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     storage_ring: Arc::clone(&storage_ring),
     store_addresses: Arc::clone(&store_addresses),
     identity_book: Arc::new(RwLock::new(HashMap::new())),
+    storage_alive: Arc::new(RwLock::new(HashSet::from([storage_id]))),
+    storage_stale: Arc::new(RwLock::new(HashSet::new())),
     halt: Arc::clone(&halt),
   });
 
@@ -215,6 +217,8 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
     storage_ring: Arc::new(RwLock::new(Ring::from_members(&[(storage_id, 1)]))),
     store_addresses: Arc::new(RwLock::new(HashMap::new())),
     identity_book: Arc::new(RwLock::new(HashMap::new())),
+    storage_alive: Arc::new(RwLock::new(HashSet::from([storage_id]))),
+    storage_stale: Arc::new(RwLock::new(HashSet::new())),
     halt: Arc::clone(&halt2),
   });
   let mut ops2 = OpRegistry::new();

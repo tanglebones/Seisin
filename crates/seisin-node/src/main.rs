@@ -197,11 +197,17 @@ fn main() -> Result<()> {
   let halt = Arc::new(seisin_node::halt::HaltState::new());
   let identity_book: Arc<RwLock<HashMap<NodeId, seisin_core::datum::DatumId>>> =
     Arc::new(RwLock::new(HashMap::new()));
+  // Initial ring members start alive; gossip maintains the set thereafter.
+  let storage_alive: Arc<RwLock<std::collections::HashSet<NodeId>>> = Arc::new(RwLock::new(
+    storage_members.iter().map(|(id, _)| *id).collect(),
+  ));
   let cluster = Arc::new(seisin_node::gossip_state::ClusterState {
     compute_ring: Arc::clone(&ring),
     storage_ring: Arc::clone(&storage_ring),
     store_addresses: Arc::clone(&store_addresses),
     identity_book: Arc::clone(&identity_book),
+    storage_alive,
+    storage_stale: Arc::new(RwLock::new(std::collections::HashSet::new())),
     halt: Arc::clone(&halt),
   });
   let store: Arc<dyn seisin_core::store::Store> = if storage_members.is_empty() {

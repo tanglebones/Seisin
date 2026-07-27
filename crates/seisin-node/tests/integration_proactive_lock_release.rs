@@ -13,13 +13,7 @@ use seisin_node::gossip_server::serve_gossip;
 use seisin_node::gossip_state::ClusterState;
 
 fn test_cluster(compute_ring: Arc<RwLock<Ring>>) -> Arc<ClusterState> {
-  Arc::new(ClusterState {
-    compute_ring,
-    storage_ring: Arc::new(RwLock::new(Ring::from_members(&[]))),
-    store_addresses: Arc::new(RwLock::new(std::collections::HashMap::new())),
-    identity_book: Arc::new(RwLock::new(std::collections::HashMap::new())),
-    halt: Arc::new(seisin_node::halt::HaltState::new()),
-  })
+  Arc::new(ClusterState::compute_only(compute_ring))
 }
 use seisin_node::gossip_state::GossipState;
 use seisin_node::pool::WorkerPool;

@@ -592,15 +592,11 @@ fn handle_partition_update(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::halt::HaltState;
 
   fn cluster_with_storage(members: &[(NodeId, u32)]) -> ClusterState {
     ClusterState {
-      compute_ring: Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)]))),
       storage_ring: Arc::new(RwLock::new(Ring::from_members(members))),
-      store_addresses: Arc::new(RwLock::new(HashMap::new())),
-      identity_book: Arc::new(RwLock::new(HashMap::new())),
-      halt: Arc::new(HaltState::new()),
+      ..ClusterState::compute_only(Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)]))))
     }
   }
 

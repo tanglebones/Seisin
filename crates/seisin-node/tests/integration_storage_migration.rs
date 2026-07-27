@@ -111,11 +111,15 @@ fn build(storages: Vec<Storage>, initial_ring: &[NodeId]) -> Cluster {
       .collect::<HashMap<_, _>>(),
   ));
   let halt = Arc::new(HaltState::new());
+  let storage_alive: std::collections::HashSet<NodeId> =
+    storages.iter().map(|s| s.node_id).collect();
   let cluster = Arc::new(ClusterState {
     compute_ring: Arc::clone(&compute_ring),
     storage_ring: Arc::clone(&storage_ring),
     store_addresses: Arc::clone(&store_addresses),
     identity_book,
+    storage_alive: Arc::new(RwLock::new(storage_alive)),
+    storage_stale: Arc::new(RwLock::new(std::collections::HashSet::new())),
     halt: Arc::clone(&halt),
   });
 
