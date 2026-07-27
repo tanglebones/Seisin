@@ -26,12 +26,14 @@ anywhere — all datum types, indexes, and constraints are defined in Rust
 Snapshot as of 2026-07-26: sub-projects 1–3 (datum core, gossip/ring,
 collation & wound-wait) and the datum type system (pk/sk/rk/tk/lb, FK
 constraints, partition index) are done. Storage Tier Parts A (delta log,
-store wire, RemoteStore) and B (role-tagged gossip membership,
-coordinated fail-stop halt) are done — 440 tests passing. Next up:
-Storage Tier Part C-1 per
-`specs/2026-07-26-storage-migration-design.md` (migration +
-reweighting + log identity + self-halt); spec written, implementation
-plan not yet written. PROGRESS.md supersedes this snapshot if they
+store wire, RemoteStore), B (role-tagged gossip membership, coordinated
+fail-stop halt), and C-1 (live add/remove/reweight migration via the
+`seisin-migrate` driver, log identity, resumable pause, storage
+self-halt, resume-after-halt with impostor detection) are done — 11
+crates, 479 tests passing. Next up: Storage Tier Part C remainder
+(replication, log compaction, tk/lb datum-grade durability, group
+commit) and Sub-project 5 (containerized multi-node harness). No spec
+written for either yet. PROGRESS.md supersedes this snapshot if they
 disagree.
 
 ## Architecture quick map (crate → responsibility)

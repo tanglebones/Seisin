@@ -223,6 +223,7 @@ dependencies = [
  "seisin-client",
  "seisin-core",
  "seisin-gossip",
+ "seisin-migrate",
  "seisin-ops",
  "seisin-protocol",
  "seisin-ring",

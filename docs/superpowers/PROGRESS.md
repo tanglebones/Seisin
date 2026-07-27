@@ -668,7 +668,59 @@ commit and push immediately, since work sessions may end abruptly.
   weight only affects new placement), storage-side self-halt,
   auto-resume with log identity.
 
-As of this entry: 10 crates, 440 tests passing, `cargo fmt --check` and
+- **Sub-project 4, Part C-1 — Storage migration, reweighting, log
+  identity, pause & self-halt.** Per
+  `specs/2026-07-26-storage-migration-design.md` and
+  `plans/2026-07-26-storage-migration.md`. One unified mechanism for
+  storage node add / planned remove / capacity reweight: a client-side
+  **migration driver** (`seisin-migrate`) that drains shards live,
+  briefly pauses the cluster to catch the write tail, flips the storage
+  ring on every compute node, and resumes. Add/remove/reweight all
+  reduce to "the storage ring's member/weight set changes" → the
+  **moved set** (`plan_moves`: every id whose owner differs between the
+  old and proposed rings). Pieces:
+  (1) **Log identity** — `DatumLog` stamps a UUIDv7 log id in its header
+  at creation (`FORMAT_VERSION 2`), read back on every reopen; `Identify`
+  (store wire) returns `(node_id, log_id)`; compute nodes keep an
+  identity book (log id per storage member) reconciled from gossiped
+  `MemberUpdate.log_id` (first-writer-wins, so an impostor's gossip can't
+  overwrite a known id) and re-set wholesale by `InstallStorageRing`.
+  (2) **Transfer engine** (store wire v2: `ListIds`/`Transfer`/
+  `TransferStatus`/`FinishTransfer`/`Retire`) — a source snapshot-copies
+  ids to a destination over the store wire while tracking a dirty set
+  (any id written during the copy), re-sends the dirty tail on finish,
+  and tombstones on retire. (3) **Pause** — `HaltState` grows a
+  resumable, driver-owned pause alongside the permanent halt; `gate()`
+  gives one answer (halt beats pause; distinct "cluster halted" vs
+  "cluster paused" prefixes). (4) **Admin control plane** (client wire
+  v2: `GetClusterConfig`/`Pause`/`Resume`/`ClearHalt`/
+  `InstallStorageRing`) on the compute `serve` path, bypassing the op
+  gate so config is readable while halted and the flip runs under the
+  pause; the flip is a live swap of the shared `Arc<RwLock<Ring>>`.
+  (5) **Membership behavior change** — a storage Join no longer
+  auto-extends the ring (that re-homed live keys); it only records
+  availability (address + log id), and the ring changes exclusively via
+  a driver flip. A storage Leave halts **only if the node is still in
+  the ring**, so a drained node's later Leave is ignored (planned
+  removal avoids the halt for free). (6) **Storage self-halt** — the
+  store server answers `Error` instead of serving if it has heard no
+  gossip within the suspicion window (fresh boot counts as "just
+  heard"). (7) **Driver `resume`** — verifies each ring member's
+  identity via `Identify` against the identity book (`GetClusterConfig`
+  readable while halted), then `ClearHalt`s every compute node; refuses
+  on any node-id/log-id mismatch (impostor), leaving the halt standing.
+  All six scenarios proven in `integration_storage_migration.rs` (live
+  add, planned remove + no-halt-after-drain, reweight, concurrent writes
+  through the dirty tail, halt+resume, impostor refusal), 10x stress, no
+  flakiness. Wire bumps (all pre-first-release, old decoders dropped):
+  `STORE_PROTOCOL_VERSION 2`, `PROTOCOL_VERSION 2`,
+  `GOSSIP_PROTOCOL_VERSION 3`, `DatumLog FORMAT_VERSION 2`. Deferred to
+  later Part C: replication (crashes still halt; recovery is log-dir
+  restore + resume), log compaction, tk/lb B+Tree datum-grade
+  durability, group commit, copy/insert deltas, chunk-aware wire,
+  hot-value LRU.
+
+As of this entry: 11 crates, 479 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -696,12 +748,14 @@ persist rather than needing a later rework. Storage Tier Part A/B/C
 resume once the type system is designed.
 
 ## Not started — from the original sub-project sequence
-- **Sub-project 4 — Storage tier, Part C.** Parts A (delta log,
-  store wire, RemoteStore) and B (role-tagged gossip membership,
-  coordinated fail-stop halt) are done — see "Done" above. Remaining:
-  Part C (node add/remove migration + capacity reweighting as one
-  unified mechanism, log compaction, tk/lb B+Tree-file durability,
-  group commit).
+- **Sub-project 4 — Storage tier, Part C (remainder).** Parts A (delta
+  log, store wire, RemoteStore), B (role-tagged gossip membership,
+  coordinated fail-stop halt), and C-1 (add/remove/reweight migration,
+  log identity, pause, storage self-halt, resume) are done — see "Done"
+  above. Remaining Part C: replication (until then crashes still halt;
+  recovery is log-dir restore + `seisin-migrate resume`), log
+  compaction, tk/lb B+Tree-file datum-grade durability, group commit,
+  copy/insert deltas, chunk-aware wire, hot-value LRU.
 - **Sub-project 5 — Deployment & cluster tests.** Containerized
   multi-node harness, plus remaining cross-node correctness tests from
   the design doc's Testing Strategy.

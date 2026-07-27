@@ -16,4 +16,5 @@ seisin-storage = { path = "../seisin-storage" }
 
 [dev-dependencies]
 seisin-client = { path = "../seisin-client" }
+seisin-migrate = { path = "../seisin-migrate" }
 tempfile = "3"
