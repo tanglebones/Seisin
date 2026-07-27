@@ -16,26 +16,28 @@ use seisin_storage::delta::{decode_delta, encode_delta, Delta};
 
 use crate::{read_frame, write_frame};
 
-// Bumped to 2 for the migration surface — ListIds/Transfer/
-// TransferStatus/FinishTransfer/Retire/Identify requests and the
-// IdList/TransferProgress/Identity/Error responses (Storage Tier
-// Part C-1). The keep-the-old-decoder n±1 policy binds from the first
-// deployed release; there have been none, so the v1 decoder is dropped
-// rather than preserved.
-pub const STORE_PROTOCOL_VERSION: u8 = 2;
+// Bumped to 2 for the migration surface (Storage Tier Part C-1), then to
+// 3 when writes gained a replication factor and `IdList` became `(id, n)`
+// pairs (Storage Tier Part C-2). The keep-the-old-decoder n±1 policy
+// binds from the first deployed release; there have been none, so older
+// decoders are dropped rather than preserved.
+pub const STORE_PROTOCOL_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreRequest {
-  /// Full content write — fsynced before the ack.
+  /// Full content write — fsynced before the ack. `n` is the datum's
+  /// replication factor, persisted per record.
   Put {
     id: DatumId,
     bytes: Vec<u8>,
+    n: u16,
   },
   /// Byte-delta write against the current value — fsynced before the
   /// ack. `NeedFull` answers a patch for an id the log doesn't know.
   Patch {
     id: DatumId,
     delta: Delta,
+    n: u16,
   },
   Get {
     id: DatumId,
@@ -79,9 +81,10 @@ pub enum StoreResponse {
   Value {
     bytes: Option<Vec<u8>>,
   },
-  /// Reply to `ListIds`; `done` is true when this page exhausted the ids.
+  /// Reply to `ListIds`; each entry is `(id, replication_factor)`, and
+  /// `done` is true when this page exhausted the ids.
   IdList {
-    ids: Vec<DatumId>,
+    ids: Vec<(DatumId, u16)>,
     done: bool,
   },
   /// Reply to `TransferStatus`.
@@ -153,6 +156,15 @@ fn take_bytes(buf: &[u8], offset: &mut usize) -> Result<Vec<u8>> {
   Ok(bytes)
 }
 
+fn take_u16(buf: &[u8], offset: &mut usize) -> Result<u16> {
+  if buf.len() < *offset + 2 {
+    bail!("truncated u16 at offset {offset}");
+  }
+  let v = u16::from_le_bytes(buf[*offset..*offset + 2].try_into().unwrap());
+  *offset += 2;
+  Ok(v)
+}
+
 fn take_u32(buf: &[u8], offset: &mut usize) -> Result<u32> {
   if buf.len() < *offset + 4 {
     bail!("truncated u32 at offset {offset}");
@@ -200,14 +212,16 @@ fn check_version<'a>(buf: &'a [u8], what: &str) -> Result<&'a [u8]> {
 pub fn encode_store_request(req: &StoreRequest) -> Vec<u8> {
   let mut buf = vec![STORE_PROTOCOL_VERSION];
   match req {
-    StoreRequest::Put { id, bytes } => {
+    StoreRequest::Put { id, bytes, n } => {
       buf.push(REQ_PUT);
       put_id(&mut buf, *id);
+      buf.extend_from_slice(&n.to_le_bytes());
       buf.extend_from_slice(bytes);
     }
-    StoreRequest::Patch { id, delta } => {
+    StoreRequest::Patch { id, delta, n } => {
       buf.push(REQ_PATCH);
       put_id(&mut buf, *id);
+      buf.extend_from_slice(&n.to_le_bytes());
       buf.extend_from_slice(&encode_delta(delta));
     }
     StoreRequest::Get { id } => {
@@ -268,16 +282,20 @@ pub fn decode_store_request(buf: &[u8]) -> Result<StoreRequest> {
   match tag {
     REQ_PUT => {
       let id = take_id(buf, &mut offset)?;
+      let n = take_u16(buf, &mut offset)?;
       Ok(StoreRequest::Put {
         id,
         bytes: buf[offset..].to_vec(),
+        n,
       })
     }
     REQ_PATCH => {
       let id = take_id(buf, &mut offset)?;
+      let n = take_u16(buf, &mut offset)?;
       Ok(StoreRequest::Patch {
         id,
         delta: decode_delta(&buf[offset..]).context("store patch carried a malformed delta")?,
+        n,
       })
     }
     REQ_GET => {
@@ -368,7 +386,11 @@ pub fn encode_store_response(resp: &StoreResponse) -> Vec<u8> {
     StoreResponse::IdList { ids, done } => {
       buf.push(RESP_ID_LIST);
       buf.push(u8::from(*done));
-      put_id_list(&mut buf, ids);
+      buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+      for (id, n) in ids {
+        put_id(&mut buf, *id);
+        buf.extend_from_slice(&n.to_le_bytes());
+      }
     }
     StoreResponse::TransferProgress {
       copied,
@@ -421,7 +443,13 @@ pub fn decode_store_response(buf: &[u8]) -> Result<StoreResponse> {
       }
       let done = buf[offset] != 0;
       offset += 1;
-      let ids = take_id_list(buf, &mut offset)?;
+      let count = take_u32(buf, &mut offset)? as usize;
+      let mut ids = Vec::with_capacity(count);
+      for _ in 0..count {
+        let id = take_id(buf, &mut offset)?;
+        let n = take_u16(buf, &mut offset)?;
+        ids.push((id, n));
+      }
       Ok(StoreResponse::IdList { ids, done })
     }
     RESP_TRANSFER_PROGRESS => {
@@ -476,10 +504,17 @@ mod tests {
       StoreRequest::Put {
         id: DatumId::new(),
         bytes: b"content".to_vec(),
+        n: 1,
+      },
+      StoreRequest::Put {
+        id: DatumId::new(),
+        bytes: b"replicated".to_vec(),
+        n: 3,
       },
       StoreRequest::Patch {
         id: DatumId::new(),
         delta: diff(b"hello world", b"hello brave world"),
+        n: 2,
       },
       StoreRequest::Get { id: DatumId::new() },
       StoreRequest::Delete { id: DatumId::new() },
@@ -529,7 +564,7 @@ mod tests {
         bytes: Some(b"content".to_vec()),
       },
       StoreResponse::IdList {
-        ids: vec![DatumId::new(), DatumId::new()],
+        ids: vec![(DatumId::new(), 1), (DatumId::new(), 3)],
         done: true,
       },
       StoreResponse::IdList {

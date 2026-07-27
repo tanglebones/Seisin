@@ -121,7 +121,15 @@ impl Store for RemoteStore {
 
   fn put(&self, id: DatumId, content: Vec<u8>) {
     let node = self.storage_node_for(id);
-    match self.call(node, id, &StoreRequest::Put { id, bytes: content }) {
+    match self.call(
+      node,
+      id,
+      &StoreRequest::Put {
+        id,
+        bytes: content,
+        n: 1,
+      },
+    ) {
       StoreResponse::Ack => {}
       other => panic!(
         "storage node {node:?} answered a Put for {id:?} with {other:?} — halting (fail-stop)"
@@ -152,7 +160,7 @@ impl Store for RemoteStore {
       return self.put(id, content);
     }
     let node = self.storage_node_for(id);
-    match self.call(node, id, &StoreRequest::Patch { id, delta }) {
+    match self.call(node, id, &StoreRequest::Patch { id, delta, n: 1 }) {
       StoreResponse::Ack => {}
       StoreResponse::NeedFull => self.put(id, content),
       other => panic!(

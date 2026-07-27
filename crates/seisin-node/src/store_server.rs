@@ -81,8 +81,8 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
     // transfer arms — which lock the log themselves via helpers — never
     // deadlock against an outer guard.
     let response = match request {
-      StoreRequest::Put { id, bytes } => {
-        match node.log.lock().unwrap().put_full(id.as_bytes(), &bytes, 1) {
+      StoreRequest::Put { id, bytes, n } => {
+        match node.log.lock().unwrap().put_full(id.as_bytes(), &bytes, n) {
           Ok(()) => {
             node.transfers.note_write(id);
             StoreResponse::Ack
@@ -90,8 +90,8 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
           Err(_) => return, // disk failure: fail-stop, drop the conn
         }
       }
-      StoreRequest::Patch { id, delta } => {
-        match node.log.lock().unwrap().put_delta(id.as_bytes(), &delta, 1) {
+      StoreRequest::Patch { id, delta, n } => {
+        match node.log.lock().unwrap().put_delta(id.as_bytes(), &delta, n) {
           Ok(PatchOutcome::Applied) => {
             node.transfers.note_write(id);
             StoreResponse::Ack
@@ -123,12 +123,10 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
           .unwrap()
           .list_ids(after_bytes, limit as usize);
         let done = ids.len() < limit as usize;
-        // Task 2 bridge: the store wire's IdList still carries bare ids;
-        // the replication factor is threaded onto the wire in Task 3.
         StoreResponse::IdList {
           ids: ids
             .into_iter()
-            .map(|(id, _n)| DatumId::from_bytes(id))
+            .map(|(id, n)| (DatumId::from_bytes(id), n))
             .collect(),
           done,
         }
@@ -185,7 +183,9 @@ fn run_transfer_copy(node: Arc<StoreNode>, transfer_id: DatumId) {
   };
   for id in node.transfers.ids(transfer_id) {
     if let Some(bytes) = read_value(&node, id) {
-      let _ = store_call(&dest, &StoreRequest::Put { id, bytes });
+      // Task 3 bridge: n=1 here; Task 4 preserves the source's stored
+      // replication factor (via the log's `n_of`).
+      let _ = store_call(&dest, &StoreRequest::Put { id, bytes, n: 1 });
     }
     node.transfers.bump_copied(transfer_id, 1);
   }
@@ -204,7 +204,7 @@ fn finish_transfer(node: &Arc<StoreNode>, transfer_id: DatumId) -> StoreResponse
   };
   for id in node.transfers.take_dirty(transfer_id) {
     let request = match read_value(node, id) {
-      Some(bytes) => StoreRequest::Put { id, bytes },
+      Some(bytes) => StoreRequest::Put { id, bytes, n: 1 }, // Task 3 bridge (see run_transfer_copy)
       None => StoreRequest::Delete { id },
     };
     let _ = store_call(&dest, &request);
@@ -262,7 +262,8 @@ mod tests {
         &addr,
         &StoreRequest::Put {
           id,
-          bytes: b"v".to_vec()
+          bytes: b"v".to_vec(),
+          n: 1,
         }
       )
       .unwrap(),
@@ -306,7 +307,8 @@ mod tests {
           &src_addr,
           &StoreRequest::Put {
             id: *id,
-            bytes: b"v0".to_vec()
+            bytes: b"v0".to_vec(),
+            n: 1,
           }
         )
         .unwrap(),
@@ -341,7 +343,8 @@ mod tests {
         &src_addr,
         &StoreRequest::Put {
           id: ids[0],
-          bytes: b"v1".to_vec()
+          bytes: b"v1".to_vec(),
+          n: 1,
         }
       )
       .unwrap(),

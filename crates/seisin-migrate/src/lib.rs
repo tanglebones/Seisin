@@ -287,9 +287,11 @@ fn list_all_ids(store_addr: &str) -> Result<Vec<DatumId>> {
   loop {
     match store_call(store_addr, &StoreRequest::ListIds { after, limit: PAGE })? {
       StoreResponse::IdList { ids: page, done } => {
-        after = page.last().copied();
+        after = page.last().map(|(id, _n)| *id);
         let stop = done || page.is_empty();
-        ids.extend(page);
+        // Task 3 bridge: drop the replication factor; the driver starts
+        // using it (per-id N) in Task 7.
+        ids.extend(page.into_iter().map(|(id, _n)| id));
         if stop {
           break;
         }
