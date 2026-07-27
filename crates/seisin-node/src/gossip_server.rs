@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::gossip_state::{apply_ready_mutations, ClusterState, GossipState};
+use crate::heartbeat::Heartbeat;
 use crate::pool::WorkerPool;
 use seisin_core::authority::NodeId;
 use seisin_gossip::wire::{decode_gossip_message, encode_gossip_message, GossipMessage};
@@ -68,14 +69,21 @@ fn handle_gossip_connection(
 /// The storage-role node's gossip participation: merge incoming
 /// piggybacks and ack with our own — no rings, no pool, no probing
 /// loop (being probed and acking is sufficient for SWIM liveness;
-/// compute nodes do the probing).
-pub fn serve_gossip_storage(listener: TcpListener, gossip: Arc<GossipState>) {
+/// compute nodes do the probing). Every accepted message also refreshes
+/// the self-halt heartbeat: hearing gossip is exactly the signal that
+/// this node is still in contact with the cluster.
+pub fn serve_gossip_storage(
+  listener: TcpListener,
+  gossip: Arc<GossipState>,
+  heartbeat: Arc<Heartbeat>,
+) {
   for stream in listener.incoming() {
     let stream = match stream {
       Ok(s) => s,
       Err(_) => continue,
     };
     let gossip = Arc::clone(&gossip);
+    let heartbeat = Arc::clone(&heartbeat);
     thread::spawn(move || {
       let mut stream = stream;
       let payload = match read_frame(&mut stream) {
@@ -86,6 +94,7 @@ pub fn serve_gossip_storage(listener: TcpListener, gossip: Arc<GossipState>) {
         Ok(m) => m,
         Err(_) => return,
       };
+      heartbeat.record();
       let (updates, mutations) = match message {
         GossipMessage::Ping { updates, mutations } => (updates, mutations),
         GossipMessage::PingReq {

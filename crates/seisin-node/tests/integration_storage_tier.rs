@@ -5,13 +5,15 @@ use std::thread;
 
 use seisin_core::authority::NodeId;
 use seisin_core::datum::DatumId;
+use seisin_node::heartbeat::Heartbeat;
 use seisin_node::index_handler::IndexKindRegistry;
 use seisin_node::pool::WorkerPool;
 use seisin_node::remote_store::RemoteStore;
-use seisin_node::store_server::serve_store;
+use seisin_node::store_server::{serve_store, StoreNode};
 use seisin_ops::registry::OpRegistry;
 use seisin_ring::ring::Ring;
 use seisin_storage::datum_log::DatumLog;
+use std::time::Duration;
 
 /// Boots a storage "node" (store listener over a delta log in `dir`)
 /// and returns its address.
@@ -19,9 +21,15 @@ fn start_storage(dir: &std::path::Path) -> String {
   let log = Arc::new(Mutex::new(
     DatumLog::open(&dir.join("datum_log.dlog")).unwrap(),
   ));
+  let node = Arc::new(StoreNode {
+    log,
+    node_id: NodeId(100),
+    heartbeat: Arc::new(Heartbeat::new()),
+    self_halt_threshold: Duration::from_secs(3600),
+  });
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let addr = listener.local_addr().unwrap().to_string();
-  thread::spawn(move || serve_store(listener, log));
+  thread::spawn(move || serve_store(listener, node));
   addr
 }
 

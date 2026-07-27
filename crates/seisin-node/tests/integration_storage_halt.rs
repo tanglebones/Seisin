@@ -11,10 +11,11 @@ use seisin_node::gossip_client::run_gossip_loop;
 use seisin_node::gossip_server::{serve_gossip, serve_gossip_storage};
 use seisin_node::gossip_state::{ClusterState, GossipState};
 use seisin_node::halt::HaltState;
+use seisin_node::heartbeat::Heartbeat;
 use seisin_node::pool::WorkerPool;
 use seisin_node::remote_store::RemoteStore;
 use seisin_node::server::serve;
-use seisin_node::store_server::serve_store;
+use seisin_node::store_server::{serve_store, StoreNode};
 use seisin_ops::registry::OpRegistry;
 use seisin_protocol::{Request, Response};
 use seisin_ring::ring::Ring;
@@ -37,7 +38,17 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
   ));
   let store_listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let store_addr = store_listener.local_addr().unwrap().to_string();
-  thread::spawn(move || serve_store(store_listener, log));
+  // A shared heartbeat between the store server and the gossip responder:
+  // being probed keeps the store server serving. A large threshold — this
+  // test exercises the compute-side halt, not storage self-halt.
+  let storage_heartbeat = Arc::new(Heartbeat::new());
+  let store_node = Arc::new(StoreNode {
+    log,
+    node_id: storage_id,
+    heartbeat: Arc::clone(&storage_heartbeat),
+    self_halt_threshold: Duration::from_secs(3600),
+  });
+  thread::spawn(move || serve_store(store_listener, store_node));
 
   let storage_gossip_listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let storage_gossip_addr = storage_gossip_listener.local_addr().unwrap().to_string();
@@ -76,7 +87,9 @@ fn a_dead_storage_node_halts_client_traffic_with_the_reason() {
 
   let storage_gossip = Arc::new(GossipState::new());
   seed(&mut storage_gossip.member_table.lock().unwrap());
-  thread::spawn(move || serve_gossip_storage(storage_gossip_listener, storage_gossip));
+  thread::spawn(move || {
+    serve_gossip_storage(storage_gossip_listener, storage_gossip, storage_heartbeat)
+  });
 
   // Compute node: pool over RemoteStore; gossip loop probing everyone
   // (including the storage member).

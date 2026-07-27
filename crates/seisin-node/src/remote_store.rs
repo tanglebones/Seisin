@@ -178,9 +178,15 @@ mod tests {
     let log = Arc::new(Mutex::new(
       DatumLog::open(&dir.path().join("datum_log.dlog")).unwrap(),
     ));
+    let node = Arc::new(crate::store_server::StoreNode {
+      log,
+      node_id: NodeId(1),
+      heartbeat: Arc::new(crate::heartbeat::Heartbeat::new()),
+      self_halt_threshold: std::time::Duration::from_secs(3600),
+    });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || crate::store_server::serve_store(listener, log));
+    std::thread::spawn(move || crate::store_server::serve_store(listener, node));
     let ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
     let mut addresses = HashMap::new();
     addresses.insert(NodeId(1), addr);

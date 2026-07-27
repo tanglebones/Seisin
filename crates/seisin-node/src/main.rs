@@ -68,10 +68,23 @@ fn main() -> Result<()> {
     }
     let gossip_listener = TcpListener::bind(&self_member.gossip_address)
       .with_context(|| format!("failed to bind {}", self_member.gossip_address))?;
-    thread::spawn(move || {
-      seisin_node::gossip_server::serve_gossip_storage(gossip_listener, gossip)
+    let heartbeat = Arc::new(seisin_node::heartbeat::Heartbeat::new());
+    {
+      let gossip = Arc::clone(&gossip);
+      let heartbeat = Arc::clone(&heartbeat);
+      thread::spawn(move || {
+        seisin_node::gossip_server::serve_gossip_storage(gossip_listener, gossip, heartbeat)
+      });
+    }
+    let store_node = Arc::new(seisin_node::store_server::StoreNode {
+      log,
+      node_id: self_node_id,
+      heartbeat,
+      self_halt_threshold: std::time::Duration::from_millis(
+        seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS,
+      ),
     });
-    seisin_node::store_server::serve_store(listener, log);
+    seisin_node::store_server::serve_store(listener, store_node);
     return Ok(());
   }
   let self_address = config.self_address().to_string();
