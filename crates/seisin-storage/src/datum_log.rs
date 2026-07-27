@@ -19,10 +19,11 @@ use crate::delta::{apply, decode_delta, encode_delta, Delta};
 
 const MAGIC: &[u8; 4] = b"SDLG";
 // Bumped to 2 when the header gained a 16-byte log id (Storage Tier
-// Part C-1). The keep-the-old-decoder n±1 policy binds from the first
-// deployed release; there have been none, so a v1 log is simply
-// rejected on open rather than migrated.
-const FORMAT_VERSION: u16 = 2;
+// Part C-1), then to 3 when each record gained a u16 replication factor
+// (Storage Tier Part C-2). The keep-the-old-decoder n±1 policy binds
+// from the first deployed release; there have been none, so an older
+// log is simply rejected on open rather than migrated.
+const FORMAT_VERSION: u16 = 3;
 /// MAGIC(4) ++ FORMAT_VERSION:u16 ++ log_id:[u8;16].
 const HEADER_LEN: u64 = 22;
 
@@ -36,8 +37,8 @@ const KIND_TOMBSTONE: u8 = 3;
 /// read-time replay and pre-shrinking compaction (Part C).
 const MAX_DELTA_CHAIN: usize = 8;
 
-/// A decoded record: (kind, id, body, next_offset).
-type RawRecord = (u8, [u8; 16], Vec<u8>, u64);
+/// A decoded record: (kind, id, replication_factor, body, next_offset).
+type RawRecord = (u8, [u8; 16], u16, Vec<u8>, u64);
 
 pub enum PatchOutcome {
   Applied,
@@ -51,6 +52,10 @@ struct LogRef {
   deltas: Vec<u64>,
   materialized_len: u32,
   delta_bytes: u32,
+  /// The datum's replication factor — placement metadata compute set on
+  /// write, reported back via `list_ids`/`n_of` so the type-blind
+  /// migration driver can restore the right number of replicas.
+  n: u16,
 }
 
 pub struct DatumLog {
@@ -112,7 +117,7 @@ impl DatumLog {
     let mut offset = HEADER_LEN;
     while offset < file_len {
       match self.read_record_at(offset, file_len) {
-        Ok(Some((kind, id, body, next_offset))) => {
+        Ok(Some((kind, id, n, body, next_offset))) => {
           match kind {
             KIND_FULL => {
               self.index.insert(
@@ -122,6 +127,7 @@ impl DatumLog {
                   deltas: Vec::new(),
                   materialized_len: body.len() as u32,
                   delta_bytes: 0,
+                  n,
                 },
               );
             }
@@ -138,6 +144,7 @@ impl DatumLog {
               entry.deltas.push(offset);
               entry.delta_bytes += body.len() as u32;
               entry.materialized_len = delta.new_total_len;
+              entry.n = n;
             }
             KIND_TOMBSTONE => {
               self.index.remove(&id);
@@ -155,8 +162,9 @@ impl DatumLog {
     Ok(())
   }
 
-  /// Reads the record at `offset`, returning `(kind, id, body,
-  /// next_offset)` — `None`/`Err` for anything torn or corrupt.
+  /// Reads the record at `offset`, returning `(kind, id, n, body,
+  /// next_offset)` — `None`/`Err` for anything torn or corrupt. The
+  /// record layout is `[kind:u8][id:16][n:u16 LE][body]`.
   fn read_record_at(&mut self, offset: u64, file_len: u64) -> Result<Option<RawRecord>> {
     if offset + 4 > file_len {
       return Ok(None);
@@ -164,8 +172,8 @@ impl DatumLog {
     self.file.seek(SeekFrom::Start(offset))?;
     let mut len_buf = [0u8; 4];
     self.file.read_exact(&mut len_buf)?;
-    let payload_len = u32::from_le_bytes(len_buf) as u64; // kind + id + body
-    if payload_len < 17 || offset + 4 + payload_len + 4 > file_len {
+    let payload_len = u32::from_le_bytes(len_buf) as u64; // kind + id + n + body
+    if payload_len < 19 || offset + 4 + payload_len + 4 > file_len {
       return Ok(None);
     }
     let mut payload = vec![0u8; payload_len as usize];
@@ -177,17 +185,19 @@ impl DatumLog {
     }
     let kind = payload[0];
     let id: [u8; 16] = payload[1..17].try_into().unwrap();
-    let body = payload[17..].to_vec();
-    Ok(Some((kind, id, body, offset + 4 + payload_len + 4)))
+    let n = u16::from_le_bytes(payload[17..19].try_into().unwrap());
+    let body = payload[19..].to_vec();
+    Ok(Some((kind, id, n, body, offset + 4 + payload_len + 4)))
   }
 
   /// Appends one record and fsyncs — the caller may ack after this
   /// returns. Returns the record's offset.
-  fn append(&mut self, kind: u8, id: [u8; 16], body: &[u8]) -> Result<u64> {
+  fn append(&mut self, kind: u8, id: [u8; 16], n: u16, body: &[u8]) -> Result<u64> {
     let offset = self.end_offset;
-    let mut payload = Vec::with_capacity(17 + body.len());
+    let mut payload = Vec::with_capacity(19 + body.len());
     payload.push(kind);
     payload.extend_from_slice(&id);
+    payload.extend_from_slice(&n.to_le_bytes());
     payload.extend_from_slice(body);
     self.file.seek(SeekFrom::Start(offset))?;
     self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -198,8 +208,8 @@ impl DatumLog {
     Ok(offset)
   }
 
-  pub fn put_full(&mut self, id: [u8; 16], bytes: &[u8]) -> Result<()> {
-    let offset = self.append(KIND_FULL, id, bytes)?;
+  pub fn put_full(&mut self, id: [u8; 16], bytes: &[u8], n: u16) -> Result<()> {
+    let offset = self.append(KIND_FULL, id, n, bytes)?;
     self.index.insert(
       id,
       LogRef {
@@ -207,12 +217,13 @@ impl DatumLog {
         deltas: Vec::new(),
         materialized_len: bytes.len() as u32,
         delta_bytes: 0,
+        n,
       },
     );
     Ok(())
   }
 
-  pub fn put_delta(&mut self, id: [u8; 16], delta: &Delta) -> Result<PatchOutcome> {
+  pub fn put_delta(&mut self, id: [u8; 16], delta: &Delta, n: u16) -> Result<PatchOutcome> {
     if !self.index.contains_key(&id) {
       return Ok(PatchOutcome::NeedFull);
     }
@@ -232,14 +243,15 @@ impl DatumLog {
         .get(id)?
         .expect("index entry implies a materializable value");
       let new_value = apply(&current, delta)?;
-      self.put_full(id, &new_value)?;
+      self.put_full(id, &new_value, n)?;
       return Ok(PatchOutcome::Applied);
     }
-    let offset = self.append(KIND_DELTA, id, &body)?;
+    let offset = self.append(KIND_DELTA, id, n, &body)?;
     let entry = self.index.get_mut(&id).unwrap();
     entry.deltas.push(offset);
     entry.delta_bytes += body.len() as u32;
     entry.materialized_len = delta.new_total_len;
+    entry.n = n;
     Ok(PatchOutcome::Applied)
   }
 
@@ -252,11 +264,11 @@ impl DatumLog {
       return Ok(None);
     };
     let end = self.end_offset;
-    let (_, _, mut value, _) = self
+    let (_, _, _, mut value, _) = self
       .read_record_at(base_offset, end)?
       .context("indexed base record unreadable")?;
     for delta_offset in delta_offsets {
-      let (_, _, body, _) = self
+      let (_, _, _, body, _) = self
         .read_record_at(delta_offset, end)?
         .context("indexed delta record unreadable")?;
       let delta = decode_delta(&body)?;
@@ -266,9 +278,14 @@ impl DatumLog {
   }
 
   pub fn delete(&mut self, id: [u8; 16]) -> Result<()> {
-    self.append(KIND_TOMBSTONE, id, &[])?;
+    self.append(KIND_TOMBSTONE, id, 0, &[])?;
     self.index.remove(&id);
     Ok(())
+  }
+
+  /// The stored replication factor for `id`, or `None` if absent.
+  pub fn n_of(&self, id: [u8; 16]) -> Option<u16> {
+    self.index.get(&id).map(|r| r.n)
   }
 
   pub fn len(&self) -> usize {
@@ -284,12 +301,13 @@ impl DatumLog {
     self.log_id
   }
 
-  /// The ids currently present (index keys), sorted ascending by raw
-  /// bytes, strictly greater than `after`, capped at `limit`. The caller
-  /// pages by passing the last returned id back as the next `after`, and
-  /// knows it is done when a page comes back shorter than `limit`. Used
-  /// by the migration driver's per-source id enumeration.
-  pub fn list_ids(&self, after: Option<[u8; 16]>, limit: usize) -> Vec<[u8; 16]> {
+  /// The `(id, replication_factor)` pairs currently present, sorted
+  /// ascending by id, strictly greater than `after`, capped at `limit`.
+  /// The caller pages by passing the last returned id back as the next
+  /// `after`, and knows it is done when a page comes back shorter than
+  /// `limit`. The replication factor lets the type-blind migration
+  /// driver restore the right number of replicas per datum.
+  pub fn list_ids(&self, after: Option<[u8; 16]>, limit: usize) -> Vec<([u8; 16], u16)> {
     let mut ids: Vec<[u8; 16]> = self
       .index
       .keys()
@@ -298,7 +316,7 @@ impl DatumLog {
       .collect();
     ids.sort_unstable();
     ids.truncate(limit);
-    ids
+    ids.into_iter().map(|id| (id, self.index[&id].n)).collect()
   }
 }
 
@@ -320,7 +338,7 @@ mod tests {
   fn put_get_delete_round_trip() {
     let dir = TempDir::new().unwrap();
     let mut log = DatumLog::open(&log_path(&dir)).unwrap();
-    log.put_full(id(1), b"hello").unwrap();
+    log.put_full(id(1), b"hello", 1).unwrap();
     assert_eq!(log.get(id(1)).unwrap(), Some(b"hello".to_vec()));
     assert_eq!(log.len(), 1);
     log.delete(id(1)).unwrap();
@@ -333,14 +351,14 @@ mod tests {
     let dir = TempDir::new().unwrap();
     let mut log = DatumLog::open(&log_path(&dir)).unwrap();
     let v1 = b"aaaaBBBBcccc".to_vec();
-    log.put_full(id(1), &v1).unwrap();
+    log.put_full(id(1), &v1, 1).unwrap();
     let v2 = b"aaaaXXXXcccc".to_vec();
     assert!(matches!(
-      log.put_delta(id(1), &diff(&v1, &v2)).unwrap(),
+      log.put_delta(id(1), &diff(&v1, &v2), 1).unwrap(),
       PatchOutcome::Applied
     ));
     let v3 = b"aaaaXXXXccccdd".to_vec();
-    log.put_delta(id(1), &diff(&v2, &v3)).unwrap();
+    log.put_delta(id(1), &diff(&v2, &v3), 1).unwrap();
     assert_eq!(log.get(id(1)).unwrap(), Some(v3));
   }
 
@@ -351,7 +369,7 @@ mod tests {
     let mut log = DatumLog::open(&path).unwrap();
     let before = std::fs::metadata(&path).unwrap().len();
     assert!(matches!(
-      log.put_delta(id(9), &diff(b"a", b"b")).unwrap(),
+      log.put_delta(id(9), &diff(b"a", b"b"), 1).unwrap(),
       PatchOutcome::NeedFull
     ));
     assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
@@ -364,11 +382,11 @@ mod tests {
     let mut log = DatumLog::open(&path).unwrap();
     // A large base so the size threshold never fires first.
     let mut value = vec![7u8; 4096];
-    log.put_full(id(1), &value).unwrap();
+    log.put_full(id(1), &value, 1).unwrap();
     for i in 0..12u8 {
       let mut next = value.clone();
       next[100] = i;
-      log.put_delta(id(1), &diff(&value, &next)).unwrap();
+      log.put_delta(id(1), &diff(&value, &next), 1).unwrap();
       value = next;
     }
     assert_eq!(log.get(id(1)).unwrap(), Some(value.clone()));
@@ -386,13 +404,13 @@ mod tests {
     let dir = TempDir::new().unwrap();
     let mut log = DatumLog::open(&log_path(&dir)).unwrap();
     let value = vec![1u8; 100];
-    log.put_full(id(1), &value).unwrap();
+    log.put_full(id(1), &value, 1).unwrap();
     // One delta bigger than half the value: must consolidate, not chain.
     let mut new = value.clone();
     for byte in new.iter_mut().take(80) {
       *byte = 2;
     }
-    log.put_delta(id(1), &diff(&value, &new)).unwrap();
+    log.put_delta(id(1), &diff(&value, &new), 1).unwrap();
     assert_eq!(log.index.get(&id(1)).unwrap().deltas.len(), 0);
     assert_eq!(log.get(id(1)).unwrap(), Some(new));
   }
@@ -403,8 +421,8 @@ mod tests {
     let path = log_path(&dir);
     {
       let mut log = DatumLog::open(&path).unwrap();
-      log.put_full(id(1), b"one").unwrap();
-      log.put_full(id(2), b"two").unwrap();
+      log.put_full(id(1), b"one", 1).unwrap();
+      log.put_full(id(2), b"two", 1).unwrap();
       log.delete(id(1)).unwrap();
     }
     let mut log = DatumLog::open(&path).unwrap();
@@ -418,7 +436,7 @@ mod tests {
     let path = log_path(&dir);
     {
       let mut log = DatumLog::open(&path).unwrap();
-      log.put_full(id(1), b"acked").unwrap();
+      log.put_full(id(1), b"acked", 1).unwrap();
     }
     // Simulate a crash mid-append: garbage after the acked record.
     {
@@ -429,7 +447,7 @@ mod tests {
     assert_eq!(log.get(id(1)).unwrap(), Some(b"acked".to_vec()));
     // The tail was truncated: a fresh append lands cleanly and survives
     // another reopen.
-    log.put_full(id(2), b"after").unwrap();
+    log.put_full(id(2), b"after", 1).unwrap();
     drop(log);
     let mut log = DatumLog::open(&path).unwrap();
     assert_eq!(log.get(id(2)).unwrap(), Some(b"after".to_vec()));
@@ -442,9 +460,9 @@ mod tests {
     let second_offset;
     {
       let mut log = DatumLog::open(&path).unwrap();
-      log.put_full(id(1), b"first").unwrap();
+      log.put_full(id(1), b"first", 1).unwrap();
       second_offset = log.end_offset;
-      log.put_full(id(2), b"second").unwrap();
+      log.put_full(id(2), b"second", 1).unwrap();
     }
     // Flip a byte inside the second record's body.
     {
@@ -453,7 +471,8 @@ mod tests {
         .write(true)
         .open(&path)
         .unwrap();
-      file.seek(SeekFrom::Start(second_offset + 4 + 17)).unwrap();
+      // record = [len:4][kind:1][id:16][n:2][body] — body starts at +4+19.
+      file.seek(SeekFrom::Start(second_offset + 4 + 19)).unwrap();
       file.write_all(&[0xFF]).unwrap();
     }
     let mut log = DatumLog::open(&path).unwrap();
@@ -485,10 +504,10 @@ mod tests {
     let dir = TempDir::new().unwrap();
     let mut log = DatumLog::open(&log_path(&dir)).unwrap();
     for n in [3u8, 1, 4, 2] {
-      log.put_full(id(n), b"v").unwrap();
+      log.put_full(id(n), b"v", 1).unwrap();
     }
     // Page with limit 2, walking `after`, gathering the full set.
-    let mut seen = Vec::new();
+    let mut seen: Vec<[u8; 16]> = Vec::new();
     let mut after = None;
     loop {
       let page = log.list_ids(after, 2);
@@ -496,13 +515,38 @@ mod tests {
         break;
       }
       assert!(page.len() <= 2);
-      after = Some(*page.last().unwrap());
-      seen.extend(page);
+      after = Some(page.last().unwrap().0);
+      seen.extend(page.into_iter().map(|(id, _)| id));
     }
     assert_eq!(seen, vec![id(1), id(2), id(3), id(4)]); // ascending, no dupes/gaps
                                                         // A tombstoned id drops out of enumeration.
     log.delete(id(2)).unwrap();
-    assert_eq!(log.list_ids(None, 10), vec![id(1), id(3), id(4)]);
+    let ids: Vec<[u8; 16]> = log
+      .list_ids(None, 10)
+      .into_iter()
+      .map(|(id, _)| id)
+      .collect();
+    assert_eq!(ids, vec![id(1), id(3), id(4)]);
+  }
+
+  #[test]
+  fn n_round_trips_through_a_reopen_and_list_ids() {
+    let dir = TempDir::new().unwrap();
+    let path = log_path(&dir);
+    {
+      let mut log = DatumLog::open(&path).unwrap();
+      log.put_full(id(1), b"v", 3).unwrap();
+      log.put_full(id(2), b"w", 1).unwrap();
+      // A delta write keeps the id's replication factor.
+      log.put_delta(id(1), &diff(b"v", b"z"), 3).unwrap();
+      assert_eq!(log.n_of(id(1)), Some(3));
+      assert_eq!(log.list_ids(None, 10), vec![(id(1), 3), (id(2), 1)]);
+    }
+    // The stored factor survives a recovery scan.
+    let log = DatumLog::open(&path).unwrap();
+    assert_eq!(log.n_of(id(1)), Some(3));
+    assert_eq!(log.n_of(id(2)), Some(1));
+    assert_eq!(log.n_of(id(9)), None);
   }
 
   #[test]

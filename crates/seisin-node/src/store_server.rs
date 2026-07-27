@@ -82,7 +82,7 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
     // deadlock against an outer guard.
     let response = match request {
       StoreRequest::Put { id, bytes } => {
-        match node.log.lock().unwrap().put_full(id.as_bytes(), &bytes) {
+        match node.log.lock().unwrap().put_full(id.as_bytes(), &bytes, 1) {
           Ok(()) => {
             node.transfers.note_write(id);
             StoreResponse::Ack
@@ -91,7 +91,7 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
         }
       }
       StoreRequest::Patch { id, delta } => {
-        match node.log.lock().unwrap().put_delta(id.as_bytes(), &delta) {
+        match node.log.lock().unwrap().put_delta(id.as_bytes(), &delta, 1) {
           Ok(PatchOutcome::Applied) => {
             node.transfers.note_write(id);
             StoreResponse::Ack
@@ -123,8 +123,13 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
           .unwrap()
           .list_ids(after_bytes, limit as usize);
         let done = ids.len() < limit as usize;
+        // Task 2 bridge: the store wire's IdList still carries bare ids;
+        // the replication factor is threaded onto the wire in Task 3.
         StoreResponse::IdList {
-          ids: ids.into_iter().map(DatumId::from_bytes).collect(),
+          ids: ids
+            .into_iter()
+            .map(|(id, _n)| DatumId::from_bytes(id))
+            .collect(),
           done,
         }
       }
