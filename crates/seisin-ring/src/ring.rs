@@ -95,6 +95,56 @@ impl Ring {
     self.weights().into_iter().map(|(n, _)| n).collect()
   }
 
+  /// The ordered replica set for `datum_id`: up to `n` distinct nodes.
+  /// Rank 0 is `native(datum_id).0` (unchanged), so `replicas(id, 1) ==
+  /// [native(id).0]`. Ranks 1.. hash a salted key into the ring, skipping
+  /// already-chosen nodes, until `n` distinct nodes are collected or the
+  /// ring's distinct nodes are exhausted (a datum can have no more
+  /// replicas than there are nodes). Capacity-weighted like `native` —
+  /// heavier nodes are likelier at each rank — and deterministic.
+  ///
+  /// The salted phase gives good spread; a final sweep over `node_ids()`
+  /// guarantees completeness (every distinct node is reachable) and
+  /// bounded termination even in the pathological case where salted
+  /// hashing didn't surface a rare node.
+  pub fn replicas(&self, datum_id: DatumId, n: usize) -> Vec<NodeId> {
+    if self.slots.is_empty() || n == 0 {
+      return Vec::new();
+    }
+    let distinct = self.node_ids();
+    let target = n.min(distinct.len());
+    let base = hash_key(datum_id);
+    let slot_count = self.slots.len() as u32;
+
+    let mut chosen: Vec<NodeId> = Vec::with_capacity(target);
+    let mut hasher = JumpBackHasher::new();
+    chosen.push(self.slots[hasher.hash(base, slot_count) as usize].0);
+
+    let mut salt: u64 = 1;
+    let cap = self.slots.len() * 3 + 32;
+    let mut attempts = 0;
+    while chosen.len() < target && attempts < cap {
+      let key = base.wrapping_add(salt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+      let node = self.slots[hasher.hash(key, slot_count) as usize].0;
+      if !chosen.contains(&node) {
+        chosen.push(node);
+      }
+      salt += 1;
+      attempts += 1;
+    }
+    if chosen.len() < target {
+      for node in distinct {
+        if chosen.len() == target {
+          break;
+        }
+        if !chosen.contains(&node) {
+          chosen.push(node);
+        }
+      }
+    }
+    chosen
+  }
+
   /// Returns the datum's current native (node, thread).
   ///
   /// # Panics
@@ -230,6 +280,72 @@ mod tests {
     let ring = Ring::from_members(&[(NodeId(5), 3), (NodeId(2), 1)]);
     assert_eq!(ring.weights(), vec![(NodeId(5), 3), (NodeId(2), 1)]);
     assert_eq!(ring.node_ids(), vec![NodeId(5), NodeId(2)]);
+  }
+
+  #[test]
+  fn replicas_rank0_is_native() {
+    let ring = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 3), (NodeId(3), 1)]);
+    for _ in 0..200 {
+      let id = DatumId::new();
+      assert_eq!(ring.replicas(id, 1), vec![ring.native(id).0]);
+      assert_eq!(ring.replicas(id, 3)[0], ring.native(id).0);
+    }
+  }
+
+  #[test]
+  fn replicas_returns_n_distinct_nodes() {
+    let ring = Ring::from_members(&[
+      (NodeId(1), 1),
+      (NodeId(2), 1),
+      (NodeId(3), 1),
+      (NodeId(4), 1),
+    ]);
+    for _ in 0..200 {
+      let r = ring.replicas(DatumId::new(), 3);
+      assert_eq!(r.len(), 3);
+      let mut sorted = r.clone();
+      sorted.sort_by_key(|n| n.0);
+      sorted.dedup();
+      assert_eq!(sorted.len(), 3, "replicas not distinct: {r:?}");
+    }
+  }
+
+  #[test]
+  fn replicas_caps_at_node_count() {
+    let ring = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 2)]);
+    for _ in 0..200 {
+      let r = ring.replicas(DatumId::new(), 5); // asked for more than 2 nodes
+      assert_eq!(r.len(), 2);
+      assert_ne!(r[0], r[1]);
+    }
+    // Empty ring / n=0 degrade gracefully.
+    assert!(Ring::from_members(&[])
+      .replicas(DatumId::new(), 3)
+      .is_empty());
+    assert!(ring.replicas(DatumId::new(), 0).is_empty());
+  }
+
+  #[test]
+  fn replicas_is_deterministic() {
+    let ring = Ring::from_members(&[(NodeId(1), 2), (NodeId(2), 3), (NodeId(3), 2)]);
+    let id = DatumId::new();
+    assert_eq!(ring.replicas(id, 3), ring.replicas(id, 3));
+  }
+
+  #[test]
+  fn replicas_rank0_is_weight_biased() {
+    // Node 2 is much heavier -> it is rank-0 (primary) for more ids.
+    let ring = Ring::from_members(&[(NodeId(1), 1), (NodeId(2), 5)]);
+    let mut heavy_primary = 0;
+    for _ in 0..400 {
+      if ring.replicas(DatumId::new(), 2)[0] == NodeId(2) {
+        heavy_primary += 1;
+      }
+    }
+    assert!(
+      heavy_primary > 200,
+      "weight ignored at rank 0: {heavy_primary}/400"
+    );
   }
 
   #[test]
