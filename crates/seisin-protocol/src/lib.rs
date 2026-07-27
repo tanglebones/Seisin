@@ -125,6 +125,33 @@ pub enum Request {
     partition_datum_id: DatumId,
     op: ExtentOp,
   },
+  // --- admin control plane (Storage Tier Part C-1) — trusted-network
+  // commands, served by any compute node. `GetClusterConfig` is served
+  // even while halted/paused (read-only control plane); the migration
+  // driver drives the rest.
+  /// Return the storage ring members + their store addresses + log ids.
+  GetClusterConfig,
+  /// Engage the resumable pause (op traffic rejected until `Resume`).
+  Pause { reason: String },
+  /// Clear the pause.
+  Resume,
+  /// Clear the permanent halt — driver-only, post identity verification.
+  ClearHalt,
+  /// Swap the storage ring (and its address/identity books) to exactly
+  /// `members`, in this order — the migration flip.
+  InstallStorageRing { members: Vec<StorageMember> },
+}
+
+/// One storage ring member as seen on the admin wire: its id, its ring
+/// weight (virtual-bucket count), its store-protocol address, and its
+/// log identity. The `GetClusterConfig`/`InstallStorageRing` payload is
+/// a list of these — the ring, address book, and identity book in one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMember {
+  pub node_id: NodeId,
+  pub weight: u32,
+  pub store_address: String,
+  pub log_id: DatumId,
 }
 
 /// An extent maintenance op — the apply payload the write path
@@ -314,6 +341,12 @@ pub enum Response {
     total: u64,
     pks: Vec<DatumId>,
   },
+  /// Reply to `GetClusterConfig`.
+  ClusterConfig {
+    members: Vec<StorageMember>,
+  },
+  /// Reply to `Pause`/`Resume`/`ClearHalt`/`InstallStorageRing`.
+  Ack,
 }
 
 /// The wire protocol version, carried as the first byte of every
@@ -322,9 +355,13 @@ pub enum Response {
 /// updates with no version skipping, so when this is bumped to n+1 the
 /// decoder for version n must be kept alive for one release — during a
 /// rollout, version-n and version-n+1 nodes and clients coexist and
-/// must decode each other's frames. Only one version exists so far, so
-/// today's decoders accept exactly `PROTOCOL_VERSION`.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// must decode each other's frames.
+// Bumped to 2 for the admin control plane — GetClusterConfig/Pause/
+// Resume/ClearHalt/InstallStorageRing and the ClusterConfig/Ack
+// responses (Storage Tier Part C-1). The keep-the-old-decoder n±1
+// policy binds from the first deployed release; there have been none,
+// so the v1 decoder is dropped rather than preserved.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Checks and strips the leading version byte. Kept as the single
 /// place a future n/n-1 dual-decode dispatch would live.
@@ -367,6 +404,11 @@ const OP_FK_PENDING: u8 = 12;
 
 const OP_EXTENT_QUERY: u8 = 13;
 const OP_PARTITION_UPDATE: u8 = 14;
+const OP_GET_CLUSTER_CONFIG: u8 = 15;
+const OP_PAUSE: u8 = 16;
+const OP_RESUME: u8 = 17;
+const OP_CLEAR_HALT: u8 = 18;
+const OP_INSTALL_STORAGE_RING: u8 = 19;
 
 const EXTENT_OP_INSERT: u8 = 0;
 const EXTENT_OP_REMOVE: u8 = 1;
@@ -392,6 +434,8 @@ const RESP_TK_RESULT: u8 = 9;
 const RESP_EXISTS: u8 = 10;
 const RESP_FK_PENDING_RESULT: u8 = 11;
 const RESP_EXTENT_RESULT: u8 = 12;
+const RESP_CLUSTER_CONFIG: u8 = 13;
+const RESP_ACK: u8 = 14;
 
 const ID_LEN: usize = 16;
 
@@ -526,6 +570,17 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
       buf.extend_from_slice(&partition_datum_id.as_bytes());
       buf.extend_from_slice(&encode_extent_op(op));
     }
+    Request::GetClusterConfig => buf.push(OP_GET_CLUSTER_CONFIG),
+    Request::Pause { reason } => {
+      buf.push(OP_PAUSE);
+      buf.extend_from_slice(reason.as_bytes());
+    }
+    Request::Resume => buf.push(OP_RESUME),
+    Request::ClearHalt => buf.push(OP_CLEAR_HALT),
+    Request::InstallStorageRing { members } => {
+      buf.push(OP_INSTALL_STORAGE_RING);
+      put_storage_members(&mut buf, members);
+    }
   }
   buf
 }
@@ -585,6 +640,34 @@ pub fn decode_request(buf: &[u8]) -> Result<Request> {
         partition_datum_id,
         op,
       })
+    }
+    OP_GET_CLUSTER_CONFIG => {
+      if buf.len() != 1 {
+        bail!("get cluster config has {} trailing bytes", buf.len() - 1);
+      }
+      Ok(Request::GetClusterConfig)
+    }
+    OP_PAUSE => {
+      let reason =
+        String::from_utf8(buf[1..].to_vec()).context("pause reason was not valid utf8")?;
+      Ok(Request::Pause { reason })
+    }
+    OP_RESUME => {
+      if buf.len() != 1 {
+        bail!("resume has {} trailing bytes", buf.len() - 1);
+      }
+      Ok(Request::Resume)
+    }
+    OP_CLEAR_HALT => {
+      if buf.len() != 1 {
+        bail!("clear halt has {} trailing bytes", buf.len() - 1);
+      }
+      Ok(Request::ClearHalt)
+    }
+    OP_INSTALL_STORAGE_RING => {
+      let mut cursor = 1;
+      let members = take_storage_members(buf, &mut cursor)?;
+      Ok(Request::InstallStorageRing { members })
     }
     op => bail!("unknown request opcode: {op}"),
   }
@@ -923,6 +1006,43 @@ fn take_id_list(buf: &[u8], offset: &mut usize) -> Result<Vec<DatumId>> {
     ids.push(take_id(buf, offset)?);
   }
   Ok(ids)
+}
+
+fn put_storage_member(buf: &mut Vec<u8>, m: &StorageMember) {
+  buf.extend_from_slice(&m.node_id.0.to_le_bytes());
+  buf.extend_from_slice(&m.weight.to_le_bytes());
+  put_bytes(buf, m.store_address.as_bytes());
+  put_id(buf, m.log_id);
+}
+
+fn take_storage_member(buf: &[u8], offset: &mut usize) -> Result<StorageMember> {
+  let node_id = NodeId(take_u64(buf, offset)?);
+  let weight = take_u32(buf, offset)?;
+  let store_address =
+    String::from_utf8(take_bytes(buf, offset)?).context("store_address was not valid utf8")?;
+  let log_id = take_id(buf, offset)?;
+  Ok(StorageMember {
+    node_id,
+    weight,
+    store_address,
+    log_id,
+  })
+}
+
+fn put_storage_members(buf: &mut Vec<u8>, members: &[StorageMember]) {
+  buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
+  for m in members {
+    put_storage_member(buf, m);
+  }
+}
+
+fn take_storage_members(buf: &[u8], offset: &mut usize) -> Result<Vec<StorageMember>> {
+  let count = take_u32(buf, offset)? as usize;
+  let mut members = Vec::with_capacity(count);
+  for _ in 0..count {
+    members.push(take_storage_member(buf, offset)?);
+  }
+  Ok(members)
 }
 
 /// The lb codecs are public standalone functions (the rk precedent):
@@ -1484,6 +1604,11 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
       buf.push(RESP_EXTENT_RESULT);
       buf.extend_from_slice(&encode_extent_result(*total, pks));
     }
+    Response::ClusterConfig { members } => {
+      buf.push(RESP_CLUSTER_CONFIG);
+      put_storage_members(&mut buf, members);
+    }
+    Response::Ack => buf.push(RESP_ACK),
   }
   buf
 }
@@ -1559,6 +1684,12 @@ pub fn decode_response(buf: &[u8]) -> Result<Response> {
       let (total, pks) = decode_extent_result(&buf[1..])?;
       Ok(Response::ExtentResult { total, pks })
     }
+    RESP_CLUSTER_CONFIG => {
+      let mut cursor = 1;
+      let members = take_storage_members(buf, &mut cursor)?;
+      Ok(Response::ClusterConfig { members })
+    }
+    RESP_ACK => Ok(Response::Ack),
     op => bail!("unknown response opcode: {op}"),
   }
 }
@@ -1661,6 +1792,56 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
 mod tests {
   use super::*;
   use std::io::Cursor;
+
+  fn sample_member(node: u64) -> StorageMember {
+    StorageMember {
+      node_id: NodeId(node),
+      weight: 4,
+      store_address: format!("127.0.0.1:69{node:02}"),
+      log_id: DatumId::new(),
+    }
+  }
+
+  #[test]
+  fn round_trips_the_admin_requests() {
+    for req in [
+      Request::GetClusterConfig,
+      Request::Pause {
+        reason: "migrating".to_string(),
+      },
+      Request::Resume,
+      Request::ClearHalt,
+      Request::InstallStorageRing { members: vec![] },
+      Request::InstallStorageRing {
+        members: vec![sample_member(1), sample_member(2)],
+      },
+    ] {
+      assert_eq!(decode_request(&encode_request(&req)).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn round_trips_the_admin_responses() {
+    for resp in [
+      Response::Ack,
+      Response::ClusterConfig { members: vec![] },
+      Response::ClusterConfig {
+        members: vec![sample_member(1), sample_member(7)],
+      },
+    ] {
+      assert_eq!(decode_response(&encode_response(&resp)).unwrap(), resp);
+    }
+  }
+
+  #[test]
+  fn storage_member_round_trips_through_its_helper() {
+    let m = sample_member(3);
+    let mut buf = Vec::new();
+    put_storage_member(&mut buf, &m);
+    let mut offset = 0;
+    assert_eq!(take_storage_member(&buf, &mut offset).unwrap(), m);
+    assert_eq!(offset, buf.len());
+  }
 
   #[test]
   fn round_trips_an_rk_query_request() {

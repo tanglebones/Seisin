@@ -95,6 +95,12 @@ impl WorkerPool {
         seisin_protocol::Request::FkPending { .. } => return,
         seisin_protocol::Request::ExtentQuery { .. } => return,
         seisin_protocol::Request::PartitionUpdate { .. } => return,
+        // Admin control plane — client-facing only, handled in server.rs.
+        seisin_protocol::Request::GetClusterConfig
+        | seisin_protocol::Request::Pause { .. }
+        | seisin_protocol::Request::Resume
+        | seisin_protocol::Request::ClearHalt
+        | seisin_protocol::Request::InstallStorageRing { .. } => return,
         seisin_protocol::Request::IndexUpdate {
           target,
           op_id,
