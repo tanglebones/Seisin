@@ -160,17 +160,12 @@ pub fn apply_ready_mutations(
         compute_changed = true;
       }
       (MemberRole::Storage, RingMutation::Join { node_id, .. }) => {
-        // Interim (until Part C's migration): a joined storage node
-        // serves only new placements. thread_count carries the weight.
-        let weight = member
-          .as_ref()
-          .map(|m| m.capacity_weight.max(1))
-          .unwrap_or(1);
-        cluster
-          .storage_ring
-          .write()
-          .unwrap()
-          .apply_join(node_id, weight);
+        // Availability only — a joined storage node records its store
+        // address (and log id, if gossiped) so a driver can migrate it
+        // into the ring later. It does NOT enter the storage ring here:
+        // auto-extending a jump-hash ring re-homes existing keys whose
+        // bytes never moved, a read-miss once real data exists. The ring
+        // changes exclusively via a driver `InstallStorageRing`.
         if let Some(update) = &member {
           if !update.store_address.is_empty() {
             cluster
@@ -179,14 +174,25 @@ pub fn apply_ready_mutations(
               .unwrap()
               .insert(node_id, update.store_address.clone());
           }
+          if update.log_id != [0u8; 16] {
+            cluster
+              .identity_book
+              .write()
+              .unwrap()
+              .insert(node_id, DatumId::from_bytes(update.log_id));
+          }
         }
       }
       (MemberRole::Storage, RingMutation::Leave { node_id }) => {
-        // No replication in v1: a lost storage member is fail-stop for
-        // the cluster. Rings untouched — nothing serves after this.
-        cluster.halt.halt(format!(
-          "cluster halted: storage node {node_id:?} confirmed dead — fail-stop (no replication in v1)"
-        ));
+        // No replication in v1: a lost storage member that is still
+        // serving the ring is fail-stop for the cluster. A drained node
+        // left the ring at flip time, so its later Leave finds it absent
+        // and is ignored — planned removal avoids the halt for free.
+        if cluster.storage_ring.read().unwrap().contains(node_id) {
+          cluster.halt.halt(format!(
+            "cluster halted: storage node {node_id:?} confirmed dead — fail-stop (no replication in v1)"
+          ));
+        }
       }
     }
   }
@@ -390,16 +396,14 @@ mod tests {
   }
 
   #[test]
-  fn a_storage_join_extends_the_storage_ring_and_address_book() {
+  fn a_storage_join_records_availability_without_touching_the_ring() {
     let compute_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
     let pool = test_pool(&compute_ring);
-    let cluster = test_cluster(Arc::clone(&compute_ring));
+    let cluster = test_cluster(Arc::clone(&compute_ring)); // empty storage ring
     let gossip = GossipState::new();
-    gossip
-      .member_table
-      .lock()
-      .unwrap()
-      .merge_update(storage_member(9, 4, "127.0.0.1:6999"));
+    let mut member = storage_member(9, 4, "127.0.0.1:6999");
+    member.log_id = [5u8; 16];
+    gossip.member_table.lock().unwrap().merge_update(member);
     gossip.record_mutation(
       1,
       RingMutation::Join {
@@ -408,20 +412,17 @@ mod tests {
       },
     );
     apply_ready_mutations(&gossip, &cluster, NodeId(1), &pool);
-    // Storage ring now routes somewhere (it was empty before)...
-    assert_eq!(
-      cluster
-        .storage_ring
-        .read()
-        .unwrap()
-        .native(DatumId::new())
-        .0,
-      NodeId(9)
-    );
-    // ...the address book learned the store address...
+    // The node did NOT enter the storage ring — availability only.
+    assert!(!cluster.storage_ring.read().unwrap().contains(NodeId(9)));
+    assert!(cluster.storage_ring.read().unwrap().node_ids().is_empty());
+    // ...but the address and log identity books learned it.
     assert_eq!(
       cluster.store_addresses.read().unwrap().get(&NodeId(9)),
       Some(&"127.0.0.1:6999".to_string())
+    );
+    assert_eq!(
+      cluster.identity_book.read().unwrap().get(&NodeId(9)),
+      Some(&DatumId::from_bytes([5u8; 16]))
     );
     // ...and neither the compute ring nor the halt were touched.
     assert_eq!(
@@ -432,10 +433,17 @@ mod tests {
   }
 
   #[test]
-  fn a_storage_leave_engages_the_halt_and_touches_no_ring() {
+  fn a_storage_leave_engages_the_halt_when_the_node_is_in_the_ring() {
     let compute_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
     let pool = test_pool(&compute_ring);
-    let cluster = test_cluster(Arc::clone(&compute_ring));
+    // The departing node is actually serving the storage ring.
+    let cluster = ClusterState {
+      compute_ring: Arc::clone(&compute_ring),
+      storage_ring: Arc::new(RwLock::new(Ring::from_members(&[(NodeId(9), 1)]))),
+      store_addresses: Arc::new(RwLock::new(HashMap::new())),
+      identity_book: Arc::new(RwLock::new(HashMap::new())),
+      halt: Arc::new(HaltState::new()),
+    };
     let gossip = GossipState::new();
     gossip
       .member_table
@@ -452,5 +460,22 @@ mod tests {
       compute_ring.read().unwrap().native(DatumId::new()).0,
       NodeId(1) // compute ring untouched
     );
+  }
+
+  #[test]
+  fn a_storage_leave_is_ignored_when_the_node_is_not_in_the_ring() {
+    let compute_ring = Arc::new(RwLock::new(Ring::from_members(&[(NodeId(1), 1)])));
+    let pool = test_pool(&compute_ring);
+    let cluster = test_cluster(Arc::clone(&compute_ring)); // empty storage ring
+    let gossip = GossipState::new();
+    gossip
+      .member_table
+      .lock()
+      .unwrap()
+      .merge_update(storage_member(9, 4, "127.0.0.1:6999"));
+    gossip.record_mutation(1, RingMutation::Leave { node_id: NodeId(9) });
+    apply_ready_mutations(&gossip, &cluster, NodeId(1), &pool);
+    // A drained node (no longer in the ring) leaving does NOT halt.
+    assert!(!cluster.halt.is_halted());
   }
 }
