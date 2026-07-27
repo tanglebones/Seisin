@@ -86,9 +86,7 @@ fn main() -> Result<()> {
       log,
       node_id: self_node_id,
       heartbeat,
-      self_halt_threshold: std::time::Duration::from_millis(
-        seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS,
-      ),
+      self_halt_threshold: std::time::Duration::from_millis(config.self_halt_threshold_millis()),
       transfers: Arc::new(seisin_node::transfer::TransferManager::default()),
     });
     seisin_node::store_server::serve_store(listener, store_node);
@@ -259,9 +257,9 @@ fn main() -> Result<()> {
     gossip,
     cluster,
     pool,
-    seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS,
-    seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS,
-    seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS,
+    config.probe_interval_millis(),
+    config.probe_timeout_millis(),
+    config.suspicion_timeout_millis(),
   );
   Ok(())
 }

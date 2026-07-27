@@ -43,9 +43,45 @@ pub struct NodeConfig {
   /// Where this node's own index/data files live (rk B+Tree files
   /// today). Node-local only — not Storage Tier placement.
   pub data_dir: String,
+  /// Failure-detection timeouts (milliseconds). All optional — an
+  /// omitted field falls back to the `failure_detector` production
+  /// constant via the accessors below. Operational knobs (and what the
+  /// cluster test harness turns down to run crash tests fast), tunable
+  /// per deployment without a recompile.
+  #[serde(default)]
+  pub probe_interval_millis: Option<u64>,
+  #[serde(default)]
+  pub probe_timeout_millis: Option<u64>,
+  #[serde(default)]
+  pub suspicion_timeout_millis: Option<u64>,
+  #[serde(default)]
+  pub self_halt_threshold_millis: Option<u64>,
 }
 
 impl NodeConfig {
+  pub fn probe_interval_millis(&self) -> u64 {
+    self
+      .probe_interval_millis
+      .unwrap_or(seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS)
+  }
+
+  pub fn probe_timeout_millis(&self) -> u64 {
+    self
+      .probe_timeout_millis
+      .unwrap_or(seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS)
+  }
+
+  pub fn suspicion_timeout_millis(&self) -> u64 {
+    self
+      .suspicion_timeout_millis
+      .unwrap_or(seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS)
+  }
+
+  pub fn self_halt_threshold_millis(&self) -> u64 {
+    self
+      .self_halt_threshold_millis
+      .unwrap_or(seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS)
+  }
   pub fn parse(source: &str) -> Result<Self> {
     ron::from_str(source).context("failed to parse node config RON")
   }
@@ -145,5 +181,48 @@ mod tests {
   #[test]
   fn rejects_malformed_ron() {
     assert!(NodeConfig::parse("not valid ron {{{").is_err());
+  }
+
+  #[test]
+  fn timeouts_default_to_the_production_constants_when_omitted() {
+    let config = NodeConfig::parse(SAMPLE).unwrap(); // SAMPLE sets no timeout fields
+    assert_eq!(
+      config.probe_interval_millis(),
+      seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS
+    );
+    assert_eq!(
+      config.probe_timeout_millis(),
+      seisin_gossip::failure_detector::PROBE_TIMEOUT_MILLIS
+    );
+    assert_eq!(
+      config.suspicion_timeout_millis(),
+      seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS
+    );
+    assert_eq!(
+      config.self_halt_threshold_millis(),
+      seisin_gossip::failure_detector::SUSPICION_TIMEOUT_MILLIS
+    );
+  }
+
+  #[test]
+  fn timeouts_are_read_when_present() {
+    let ron = r#"
+(
+    self_node_id: 1,
+    members: [
+        (node_id: 1, address: "127.0.0.1:7878", gossip_address: "127.0.0.1:8878", peer_link_address: "127.0.0.1:9878", thread_count: 2),
+    ],
+    data_dir: "/tmp/seisin-data",
+    probe_interval_millis: Some(20),
+    probe_timeout_millis: Some(21),
+    suspicion_timeout_millis: Some(40),
+    self_halt_threshold_millis: Some(41),
+)
+"#;
+    let config = NodeConfig::parse(ron).unwrap();
+    assert_eq!(config.probe_interval_millis(), 20);
+    assert_eq!(config.probe_timeout_millis(), 21);
+    assert_eq!(config.suspicion_timeout_millis(), 40);
+    assert_eq!(config.self_halt_threshold_millis(), 41);
   }
 }
