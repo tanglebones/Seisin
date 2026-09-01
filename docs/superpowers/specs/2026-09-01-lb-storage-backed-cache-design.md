@@ -158,9 +158,50 @@ on first write) since a board never has one without the other.
 
 ## Compute-side cache (`LbResidentBoard` → `LbCache`)
 
+### Per-board cache configuration, resolved on first access
+
+Cache sizing (pinned top-K, pinned bottom-M, LRU cap) is **per specific
+board**, not per class — a "global season" leaderboard and a "friends
+this week" leaderboard under the same class may warrant very different
+sizes. Since the set of actual boards isn't fixed or enumerable up
+front (leaderboards get created dynamically, e.g. per event), this
+can't be a static table supplied at registration time. Instead,
+`register_lb_class` takes a resolver callback, invoked once per board
+the first time this compute node opens it (naturally already the
+"first access" point — `resident_indexes.entry(target)`'s `Vacant`
+branch in `worker.rs`, which only calls `IndexKind::open` the first
+time a given board id is touched on that thread):
+
+```rust
+pub struct LbCacheConfig {
+  pub pinned_top: usize,
+  pub pinned_bottom: usize,
+  pub max_cached_entries: usize, // includes the pinned windows
+}
+
+pub fn register_lb_class(
+  registry: &mut IndexKindRegistry,
+  def: LbClassDef,
+  data_dir: PathBuf,
+  cache_config: impl Fn(DatumId) -> LbCacheConfig + Send + Sync + 'static,
+);
+```
+
+The callback receives only the board's opaque `DatumId` — the wire
+protocol deliberately never carries a board's `leaderboard_id`/
+`area_config_id` past initial `DatumId` derivation (`lb_board_key`'s
+doc comment: "never repeated per entry"), and this design doesn't
+change that. A solution that needs the callback to make a genuinely
+per-leaderboard decision is expected to maintain its own mapping from
+`DatumId` to that leaderboard's settings (it already computed the id
+itself via `lb_board_key` when the leaderboard was created, so it can
+key its own config store the same way) — the callback is where that
+lookup runs. A solution with no such per-board tuning need can just
+return a constant.
+
 Replaces the fully-resident `BPlusTree` with:
-- **Pinned windows**: the current top-K and bottom-M entries (K/M are
-  the class's configured cache-pin sizes), kept live — every write that
+- **Pinned windows**: the current top-K and bottom-M entries (K/M come
+  from this board's resolved `LbCacheConfig`), kept live — every write that
   touches the pinned range patches the cache in place instead of
   invalidating it, since these are read far more than anything else.
 - **An LRU for everything else** — entries pulled in by a point/around-
@@ -211,12 +252,6 @@ takeover, and a genuine improvement, not just a side effect.
 
 ## Open questions
 
-- Cache-pin sizes (K/M) and the LRU's total size cap: fixed constants
-  for v1 (mirroring `cluster_test_node`'s hardcoded `REPL`), or a new
-  field on `LbClassDef`? Leaning toward a field on `LbClassDef` — it's
-  the natural per-class tuning knob and costs nothing to add now — but
-  flagging since it's the one piece not already pinned down by existing
-  precedent elsewhere in the codebase.
 - `sample_by_rank`'s existing resident-side semantics (uniform-at-random
   by rank position) carry over unchanged; not re-litigated here.
 
