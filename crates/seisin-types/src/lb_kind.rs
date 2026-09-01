@@ -117,9 +117,11 @@ mod tests {
   /// collection, linear scans throughout. Only for LbCache's own unit
   /// tests — the real storage-side path is exercised for real in
   /// `store_server.rs`'s collection test and the lb integration test.
+  type FakeCollection = Vec<(Vec<u8>, Vec<u8>)>;
+
   #[derive(Default)]
   struct FakeCollectionStore {
-    collections: Mutex<HashMap<DatumId, Vec<(Vec<u8>, Vec<u8>)>>>,
+    collections: Mutex<HashMap<DatumId, FakeCollection>>,
   }
 
   impl seisin_node::collection_store::CollectionStore for FakeCollectionStore {
