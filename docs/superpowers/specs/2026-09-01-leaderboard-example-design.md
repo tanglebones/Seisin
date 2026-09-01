@@ -45,12 +45,12 @@ plays. Nothing about HTTP, axum, or this example's routes belongs in any
 - No incremental-catch-up / rack-awareness / etc. — those are the
   already-tracked Storage Tier Part C remainder items in PROGRESS.md,
   unrelated to this work.
-- lb boards are node-resident indexes, not yet routed through the
-  storage tier (see `CLAUDE.md`'s "Load-bearing design decisions"). The
-  `storage1` node in the test topology is therefore not actually
-  exercised by leaderboard traffic — it's included for topology realism
-  (showing a real deployment's compute/storage split), not because lb
-  needs it.
+- lb boards are now storage-backed (see
+  `2026-09-01-lb-storage-backed-cache-design.md`) — the leaderboard-http
+  crate's HTTP contract is unaffected by that change; the `storage1`
+  node in the test topology is genuinely exercised by leaderboard
+  traffic now, not just included for topology realism as originally
+  written here.
 
 ## Crate layout: `crates/leaderboard-http`
 

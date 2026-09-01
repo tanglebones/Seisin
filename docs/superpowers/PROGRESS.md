@@ -800,7 +800,37 @@ commit and push immediately, since work sessions may end abruptly.
   member (so the migration scenario reweights rather than admits a brand
   new node — the same driver path over real sockets).
 
-As of this entry: 11 crates, 508 tests passing, `cargo fmt --check` and
+- **lb storage-backed cache.** Per
+  `specs/2026-09-01-lb-storage-backed-cache-design.md` and
+  `plans/2026-09-01-lb-storage-backed-cache.md`. `lb` boards moved from
+  a fully-resident `BPlusTree` file on the owning compute node's local
+  disk into the storage tier, behind a new content-agnostic ordered-
+  collection store-wire primitive (`CollectionCreate`/`Insert`/`Remove`/
+  `Get`/`ScanForward`/`ScanBackward`/`Sample`/`RankOfKey`/
+  `ScanFromRank`/`Count`; `STORE_PROTOCOL_VERSION` 4). Writes replicate
+  as logical ops fanned out to every serving replica (not byte diffs —
+  storage performs the mutation itself), reusing a new shared
+  `ReplicaResolver` (extracted from `RemoteStore`) for replica
+  selection/stale-marking/total-loss halt. Each board is two
+  collections (`rank`, `by_player`). Compute-side, `LbCache` replaces
+  the old fully-resident tree: pinned top/bottom windows (refreshed on
+  invalidation) plus a bounded LRU for point/around-player/friend
+  lookups, sized per board via a `register_lb_class` resolver callback
+  invoked on first access (the set of actual leaderboards isn't fixed,
+  so this can't be a static table). `IndexKind` gained
+  `attach_collection_store`, called by `node::run` once `ClusterState`
+  exists — lets a solution's `register_lb_class` call (which runs
+  before `node::run`) still end up with a working storage client. Same
+  client-facing wire contract throughout (`Request::LbExecute`/
+  `LbQuery` unchanged) — `integration_lb_boards.rs` now runs against a
+  real 2-node storage-backed cluster instead of a compute-only one, and
+  a new `integration_lb_cache_eviction.rs` proves the cache actually
+  stays bounded on an oversized board. 20x stress clean on the standing
+  wound-wait/collation suites. Removes lb from the "tk/lb B+Tree-file
+  datum-grade durability" Storage Tier Part C remainder item below (rk
+  and tk are unaffected, still pending).
+
+As of this entry: 11 crates, 516 tests passing, `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -- -D warnings` clean. All
 committed and pushed to `main`.
 
@@ -836,7 +866,8 @@ resume once the type system is designed.
   above. Remaining Part C: incremental catch-up of a returned replica
   (v1 does a full driver resync), rack/zone-aware placement, read
   load-balancing across replicas, changing a type's N on already-written
-  data, log compaction, tk/lb B+Tree-file datum-grade durability, group
+  data, log compaction, tk B+Tree-file datum-grade durability (lb's half
+  of this is done — see "lb storage-backed cache" above), group
   commit, copy/insert deltas, chunk-aware wire, hot-value LRU.
 - **Sub-project 5 — Deployment & cluster tests.** Done — see "Done"
   above (spawned-process cluster harness + six real-socket scenarios).
