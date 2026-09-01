@@ -94,6 +94,18 @@ pub trait IndexKind: Send + Sync {
     target: DatumId,
     stored: Option<Vec<u8>>,
   ) -> Result<Box<dyn ResidentIndex>, String>;
+
+  /// Injects the storage-tier collection client, for kinds whose
+  /// resident structure is storage-backed (lb; later rk/tk). Called
+  /// once, after `ClusterState` exists and before any client traffic —
+  /// see `node::run`. Kinds with no storage-backed state (sk) keep the
+  /// default no-op.
+  fn attach_collection_store(
+    &self,
+    store: std::sync::Arc<dyn crate::collection_store::CollectionStore>,
+  ) {
+    let _ = store;
+  }
 }
 
 #[derive(Default)]
@@ -117,6 +129,16 @@ impl IndexKindRegistry {
       .get(kind)
       .map(|k| k.as_ref())
       .ok_or_else(|| format!("no index kind registered for {kind:?}"))
+  }
+
+  /// Calls `attach_collection_store` on every registered kind.
+  pub fn attach_collection_store(
+    &self,
+    store: std::sync::Arc<dyn crate::collection_store::CollectionStore>,
+  ) {
+    for kind in self.kinds.values() {
+      kind.attach_collection_store(std::sync::Arc::clone(&store));
+    }
   }
 }
 
@@ -232,5 +254,71 @@ mod tests {
     let outcome = resident.apply(b"reject");
     assert_eq!(outcome.violation, Some("rejected".to_string()));
     assert!(matches!(outcome.write_through, WriteThrough::None));
+  }
+
+  struct RecordingKind {
+    attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  }
+
+  impl IndexKind for RecordingKind {
+    fn open(
+      &self,
+      _target: DatumId,
+      stored: Option<Vec<u8>>,
+    ) -> Result<Box<dyn ResidentIndex>, String> {
+      Ok(Box::new(AppendResident {
+        bytes: stored.unwrap_or_default(),
+      }))
+    }
+    fn attach_collection_store(
+      &self,
+      _store: std::sync::Arc<dyn crate::collection_store::CollectionStore>,
+    ) {
+      self
+        .attached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  struct NoopCollectionStore;
+  impl crate::collection_store::CollectionStore for NoopCollectionStore {
+    fn create(&self, _: DatumId, _: u32, _: u32, _: u16) {}
+    fn insert(&self, _: DatumId, _: Vec<u8>, _: Vec<u8>, _: u16) {}
+    fn remove(&self, _: DatumId, _: Vec<u8>, _: u16) {}
+    fn get(&self, _: DatumId, _: Vec<u8>, _: u16) -> Option<Vec<u8>> {
+      None
+    }
+    fn scan_forward(&self, _: DatumId, _: u32, _: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+      vec![]
+    }
+    fn scan_backward(&self, _: DatumId, _: u32, _: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+      vec![]
+    }
+    fn sample(&self, _: DatumId, _: u32, _: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+      vec![]
+    }
+    fn rank_of_key(&self, _: DatumId, _: Vec<u8>, _: u16) -> Option<u64> {
+      None
+    }
+    fn scan_from_rank(&self, _: DatumId, _: u64, _: u32, _: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+      vec![]
+    }
+    fn count(&self, _: DatumId, _: u16) -> u64 {
+      0
+    }
+  }
+
+  #[test]
+  fn attach_collection_store_reaches_every_registered_kind() {
+    let attached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registry = IndexKindRegistry::new();
+    registry.register(
+      "recording",
+      Box::new(RecordingKind {
+        attached: std::sync::Arc::clone(&attached),
+      }),
+    );
+    registry.attach_collection_store(std::sync::Arc::new(NoopCollectionStore));
+    assert!(attached.load(std::sync::atomic::Ordering::SeqCst));
   }
 }

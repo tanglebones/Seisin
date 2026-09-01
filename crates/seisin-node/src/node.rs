@@ -162,6 +162,9 @@ pub fn run(config: NodeConfig, ops: OpRegistry, index_kinds: IndexKindRegistry) 
   } else {
     Arc::new(RemoteStore::new(Arc::clone(&cluster)))
   };
+  index_kinds.attach_collection_store(Arc::new(
+    crate::collection_store::RemoteCollectionStore::new(Arc::clone(&cluster)),
+  ));
   let pool = Arc::new(WorkerPool::spawn(
     store,
     self_thread_count,
