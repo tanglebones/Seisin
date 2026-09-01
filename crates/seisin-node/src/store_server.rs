@@ -8,7 +8,9 @@
 //! own id and log identity (for `Identify`) and a self-halt heartbeat
 //! (before serving anything, refuse if gossip contact has gone stale).
 
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +21,7 @@ use seisin_protocol::store_wire::{
   decode_store_request, encode_store_response, store_call, StoreRequest, StoreResponse,
 };
 use seisin_protocol::{read_frame, write_frame};
+use seisin_storage::btree::BPlusTree;
 use seisin_storage::datum_log::{DatumLog, PatchOutcome};
 
 use crate::heartbeat::Heartbeat;
@@ -34,6 +37,57 @@ pub struct StoreNode {
   /// timeout.
   pub self_halt_threshold: Duration,
   pub transfers: Arc<TransferManager>,
+  /// Where this storage node's own collection files live — same
+  /// directory the log lives under.
+  pub data_dir: PathBuf,
+  /// Resident collection files, opened lazily on first request and
+  /// kept open for the process's lifetime.
+  pub collections: Mutex<HashMap<DatumId, BPlusTree>>,
+}
+
+const COLLECTION_PAGE_SIZE: u32 = 4096;
+
+fn collection_file_name(collection_id: DatumId) -> String {
+  let hex: String = collection_id
+    .as_bytes()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
+  format!("collection_{hex}.btree")
+}
+
+/// Opens (or creates, if `key_size`/`value_size` are given and the file
+/// doesn't exist yet) `collection_id`'s tree, inserting it into
+/// `node.collections` if it wasn't already resident. `create` is `None`
+/// for every request except `CollectionCreate` — a request against a
+/// collection that was never created and isn't found on disk is an
+/// error, not a silent auto-create, except for `CollectionCreate`
+/// itself (the one idempotent "make it exist" entry point).
+fn with_collection<T>(
+  node: &StoreNode,
+  collection_id: DatumId,
+  create: Option<(u32, u32)>,
+  f: impl FnOnce(&mut BPlusTree) -> Result<T, String>,
+) -> Result<T, String> {
+  let mut collections = node.collections.lock().unwrap();
+  if let std::collections::hash_map::Entry::Vacant(entry) = collections.entry(collection_id) {
+    let path = node.data_dir.join(collection_file_name(collection_id));
+    let tree = if path.exists() {
+      BPlusTree::open(&path)
+    } else {
+      match create {
+        Some((key_size, value_size)) => {
+          std::fs::create_dir_all(&node.data_dir)
+            .map_err(|e| format!("failed to create data dir {:?}: {e}", node.data_dir))?;
+          BPlusTree::create(&path, key_size, value_size, COLLECTION_PAGE_SIZE)
+        }
+        None => return Err(format!("collection {collection_id:?} does not exist")),
+      }
+    }
+    .map_err(|e| format!("failed to open collection file {path:?}: {e}"))?;
+    entry.insert(tree);
+  }
+  f(collections.get_mut(&collection_id).unwrap())
 }
 
 pub fn serve_store(listener: TcpListener, node: Arc<StoreNode>) {
@@ -160,6 +214,111 @@ fn handle_connection(mut stream: TcpStream, node: Arc<StoreNode>) {
         }
         StoreResponse::Ack
       }
+      StoreRequest::CollectionCreate {
+        collection_id,
+        key_size,
+        value_size,
+      } => match with_collection(&node, collection_id, Some((key_size, value_size)), |_| {
+        Ok(())
+      }) {
+        Ok(()) => StoreResponse::Ack,
+        Err(message) => StoreResponse::Error { message },
+      },
+      StoreRequest::CollectionInsert {
+        collection_id,
+        key,
+        value,
+      } => match with_collection(&node, collection_id, None, |tree| {
+        tree.insert(&key, &value).map_err(|e| e.to_string())
+      }) {
+        Ok(()) => StoreResponse::Ack,
+        Err(message) => StoreResponse::Error { message },
+      },
+      StoreRequest::CollectionRemove { collection_id, key } => {
+        match with_collection(&node, collection_id, None, |tree| {
+          tree.remove(&key).map_err(|e| e.to_string())
+        }) {
+          Ok(_) => StoreResponse::Ack,
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
+      // PERF: BPlusTree has no direct point-get, so this scans the whole
+      // tree and finds the key linearly — fine for now (by_player
+      // collections are small, one entry per player on one board); a
+      // proper BPlusTree::get via rank_of_key + a single-entry
+      // scan_from_rank would make this O(log n) if it ever matters.
+      StoreRequest::CollectionGet { collection_id, key } => {
+        match with_collection(&node, collection_id, None, |tree| {
+          let len = tree.len();
+          tree
+            .scan_from_rank(0, len)
+            .map_err(|e| e.to_string())
+            .map(|entries| entries.into_iter().find(|(k, _)| k == &key).map(|(_, v)| v))
+        }) {
+          Ok(value) => StoreResponse::CollectionEntry { value },
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
+      StoreRequest::CollectionScanForward {
+        collection_id,
+        limit,
+      } => {
+        match with_collection(&node, collection_id, None, |tree| {
+          tree
+            .scan_backward_bounded(limit as usize)
+            .map_err(|e| e.to_string())
+        }) {
+          Ok(entries) => StoreResponse::CollectionEntries { entries },
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
+      StoreRequest::CollectionScanBackward {
+        collection_id,
+        limit,
+      } => {
+        match with_collection(&node, collection_id, None, |tree| {
+          tree
+            .scan_forward_bounded(limit as usize)
+            .map_err(|e| e.to_string())
+        }) {
+          Ok(entries) => StoreResponse::CollectionEntries { entries },
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
+      StoreRequest::CollectionSample { collection_id, k } => {
+        match with_collection(&node, collection_id, None, |tree| {
+          tree.sample_by_rank(k as usize).map_err(|e| e.to_string())
+        }) {
+          Ok(entries) => StoreResponse::CollectionEntries { entries },
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
+      StoreRequest::CollectionRankOfKey { collection_id, key } => {
+        match with_collection(&node, collection_id, None, |tree| {
+          tree.rank_of_key(&key).map_err(|e| e.to_string())
+        }) {
+          Ok(rank) => StoreResponse::CollectionRank { rank },
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
+      StoreRequest::CollectionScanFromRank {
+        collection_id,
+        rank,
+        limit,
+      } => match with_collection(&node, collection_id, None, |tree| {
+        tree
+          .scan_from_rank(rank, limit as usize)
+          .map_err(|e| e.to_string())
+      }) {
+        Ok(entries) => StoreResponse::CollectionEntries { entries },
+        Err(message) => StoreResponse::Error { message },
+      },
+      StoreRequest::CollectionCount { collection_id } => {
+        match with_collection(&node, collection_id, None, |tree| Ok(tree.len() as u64)) {
+          Ok(total) => StoreResponse::CollectionCount { total },
+          Err(message) => StoreResponse::Error { message },
+        }
+      }
     };
     if write_frame(&mut stream, &encode_store_response(&response)).is_err() {
       return;
@@ -234,6 +393,8 @@ mod tests {
       heartbeat: Arc::new(Heartbeat::new()),
       self_halt_threshold: Duration::from_secs(3600),
       transfers: Arc::new(TransferManager::default()),
+      data_dir: dir.path().to_path_buf(),
+      collections: Mutex::new(HashMap::new()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -286,6 +447,8 @@ mod tests {
       heartbeat: Arc::new(Heartbeat::new()),
       self_halt_threshold: Duration::from_millis(0),
       transfers: Arc::new(TransferManager::default()),
+      data_dir: dir.path().to_path_buf(),
+      collections: Mutex::new(HashMap::new()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -391,6 +554,110 @@ mod tests {
     );
     for id in &ids {
       assert_eq!(get(&src_addr, *id), None);
+    }
+  }
+
+  #[test]
+  fn collection_create_insert_scan_and_rank_round_trip_over_the_wire() {
+    let (addr, _node, _dir) = store_node(NodeId(1));
+    let collection_id = DatumId::new();
+
+    assert_eq!(
+      store_call(
+        &addr,
+        &StoreRequest::CollectionCreate {
+          collection_id,
+          key_size: 4,
+          value_size: 4,
+        },
+      )
+      .unwrap(),
+      StoreResponse::Ack
+    );
+
+    for i in 0u32..5 {
+      // Big-endian: byte order == numeric order, so scans come out sorted by i.
+      let bytes = i.to_be_bytes().to_vec();
+      assert_eq!(
+        store_call(
+          &addr,
+          &StoreRequest::CollectionInsert {
+            collection_id,
+            key: bytes.clone(),
+            value: bytes,
+          },
+        )
+        .unwrap(),
+        StoreResponse::Ack
+      );
+    }
+
+    match store_call(&addr, &StoreRequest::CollectionCount { collection_id }).unwrap() {
+      StoreResponse::CollectionCount { total } => assert_eq!(total, 5),
+      other => panic!("expected CollectionCount, got {other:?}"),
+    }
+
+    match store_call(
+      &addr,
+      &StoreRequest::CollectionScanForward {
+        collection_id,
+        limit: 2,
+      },
+    )
+    .unwrap()
+    {
+      StoreResponse::CollectionEntries { entries } => {
+        let keys: Vec<u32> = entries
+          .iter()
+          .map(|(k, _)| u32::from_be_bytes(k.clone().try_into().unwrap()))
+          .collect();
+        assert_eq!(keys, vec![4, 3]); // best-first: 4 is the highest key
+      }
+      other => panic!("expected CollectionEntries, got {other:?}"),
+    }
+
+    match store_call(
+      &addr,
+      &StoreRequest::CollectionRankOfKey {
+        collection_id,
+        key: 2u32.to_be_bytes().to_vec(),
+      },
+    )
+    .unwrap()
+    {
+      StoreResponse::CollectionRank { rank } => assert_eq!(rank, Some(2)), // ascending rank: 0,1,2,3,4
+      other => panic!("expected CollectionRank, got {other:?}"),
+    }
+
+    match store_call(
+      &addr,
+      &StoreRequest::CollectionGet {
+        collection_id,
+        key: 2u32.to_be_bytes().to_vec(),
+      },
+    )
+    .unwrap()
+    {
+      StoreResponse::CollectionEntry { value } => {
+        assert_eq!(value, Some(2u32.to_be_bytes().to_vec()))
+      }
+      other => panic!("expected CollectionEntry, got {other:?}"),
+    }
+
+    assert_eq!(
+      store_call(
+        &addr,
+        &StoreRequest::CollectionRemove {
+          collection_id,
+          key: 2u32.to_be_bytes().to_vec(),
+        },
+      )
+      .unwrap(),
+      StoreResponse::Ack
+    );
+    match store_call(&addr, &StoreRequest::CollectionCount { collection_id }).unwrap() {
+      StoreResponse::CollectionCount { total } => assert_eq!(total, 4),
+      other => panic!("expected CollectionCount, got {other:?}"),
     }
   }
 

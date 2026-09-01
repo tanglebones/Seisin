@@ -55,6 +55,8 @@ fn start_storage(node_id: NodeId) -> Storage {
     heartbeat: Arc::new(Heartbeat::new()),
     self_halt_threshold: Duration::from_secs(3600),
     transfers: Arc::new(TransferManager::default()),
+    data_dir: dir.path().to_path_buf(),
+    collections: Mutex::new(HashMap::new()),
   });
   let listener = TcpListener::bind("127.0.0.1:0").unwrap();
   let store_addr = listener.local_addr().unwrap().to_string();

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -85,6 +85,8 @@ pub fn run(config: NodeConfig, ops: OpRegistry, index_kinds: IndexKindRegistry) 
       heartbeat,
       self_halt_threshold: std::time::Duration::from_millis(config.self_halt_threshold_millis()),
       transfers: Arc::new(TransferManager::default()),
+      data_dir: std::path::PathBuf::from(&config.data_dir),
+      collections: Mutex::new(HashMap::new()),
     });
     serve_store(listener, store_node);
     return Ok(());
