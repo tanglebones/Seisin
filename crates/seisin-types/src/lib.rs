@@ -3,6 +3,7 @@ pub mod encoding;
 pub mod field;
 pub mod fk;
 pub mod lb;
+pub mod lb_cache;
 pub mod lb_kind;
 pub mod partition;
 pub mod rk_index;
