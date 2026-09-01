@@ -12,6 +12,7 @@ pub mod node;
 pub mod peer_link;
 pub mod pool;
 pub mod remote_store;
+pub mod replica_resolver;
 pub mod server;
 pub mod store_server;
 pub mod transfer;

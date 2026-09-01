@@ -28,9 +28,10 @@ use seisin_protocol::{read_frame, write_frame};
 use seisin_storage::delta::diff;
 
 use crate::gossip_state::ClusterState;
+use crate::replica_resolver::ReplicaResolver;
 
 pub struct RemoteStore {
-  cluster: Arc<ClusterState>,
+  resolver: ReplicaResolver,
 }
 
 thread_local! {
@@ -39,40 +40,9 @@ thread_local! {
 
 impl RemoteStore {
   pub fn new(cluster: Arc<ClusterState>) -> Self {
-    Self { cluster }
-  }
-
-  /// The datum's replica set restricted to nodes that can actually serve
-  /// it right now — in the ring, alive, and not stale — in rank order
-  /// (rank 0, the primary, first).
-  fn serving_replicas(&self, id: DatumId, n: u16) -> Vec<NodeId> {
-    let replicas = self
-      .cluster
-      .storage_ring
-      .read()
-      .unwrap()
-      .replicas(id, n as usize);
-    let alive = self.cluster.storage_alive.read().unwrap();
-    let stale = self.cluster.storage_stale.read().unwrap();
-    replicas
-      .into_iter()
-      .filter(|node| alive.contains(node) && !stale.contains(node))
-      .collect()
-  }
-
-  /// Excludes `node` from future serving until a driver re-replication
-  /// re-admits it — used when a call to it fails mid-operation.
-  fn mark_stale(&self, node: NodeId) {
-    self.cluster.storage_stale.write().unwrap().insert(node);
-  }
-
-  /// Engages the coordinated whole-cluster halt for a datum whose every
-  /// replica is gone, then fail-stops this worker.
-  fn halt_total_loss(&self, id: DatumId) -> ! {
-    let reason =
-      format!("cluster halted: every replica of datum {id:?} is unreachable — total shard loss");
-    self.cluster.halt.halt(reason.clone());
-    panic!("{reason}");
+    Self {
+      resolver: ReplicaResolver::new(cluster),
+    }
   }
 
   /// One request/response round trip on this thread's connection to
@@ -81,7 +51,8 @@ impl RemoteStore {
   /// bring the whole cluster down for a single-replica hiccup).
   fn try_call(&self, node: NodeId, request: &StoreRequest) -> Result<StoreResponse, String> {
     let address = self
-      .cluster
+      .resolver
+      .cluster()
       .store_addresses
       .read()
       .unwrap()
@@ -163,9 +134,9 @@ impl RemoteStore {
   /// Writes to every serving replica (≥1 required), marking any that
   /// fails stale; total failure fail-stops.
   fn write_all(&self, id: DatumId, content: Vec<u8>, previous: Option<&[u8]>, n: u16) {
-    let targets = self.serving_replicas(id, n);
+    let targets = self.resolver.serving_replicas(id, n);
     if targets.is_empty() {
-      self.halt_total_loss(id);
+      self.resolver.halt_total_loss(id);
     }
     let delta = previous.and_then(|prev| {
       let d = diff(prev, &content);
@@ -175,20 +146,20 @@ impl RemoteStore {
     for node in targets {
       match self.write_one(node, id, &content, delta.as_ref(), n) {
         Ok(()) => acked += 1,
-        Err(_) => self.mark_stale(node),
+        Err(_) => self.resolver.mark_stale(node),
       }
     }
     if acked == 0 {
-      self.halt_total_loss(id);
+      self.resolver.halt_total_loss(id);
     }
   }
 }
 
 impl Store for RemoteStore {
   fn get_replicated(&self, id: DatumId, n: u16) -> Option<Vec<u8>> {
-    let targets = self.serving_replicas(id, n);
+    let targets = self.resolver.serving_replicas(id, n);
     if targets.is_empty() {
-      self.halt_total_loss(id);
+      self.resolver.halt_total_loss(id);
     }
     let mut reached_any = false;
     for node in targets {
@@ -199,15 +170,15 @@ impl Store for RemoteStore {
           // A serving replica that answers a Get with a non-Value is
           // broken — exclude it and fail over.
           let _ = other;
-          self.mark_stale(node);
+          self.resolver.mark_stale(node);
         }
-        Err(_) => self.mark_stale(node),
+        Err(_) => self.resolver.mark_stale(node),
       }
     }
     if reached_any {
       None // every reachable replica agrees the datum is absent
     } else {
-      self.halt_total_loss(id) // no replica was reachable — total loss
+      self.resolver.halt_total_loss(id) // no replica was reachable — total loss
     }
   }
 
@@ -216,19 +187,19 @@ impl Store for RemoteStore {
   }
 
   fn delete_replicated(&self, id: DatumId, n: u16) {
-    let targets = self.serving_replicas(id, n);
+    let targets = self.resolver.serving_replicas(id, n);
     if targets.is_empty() {
-      self.halt_total_loss(id);
+      self.resolver.halt_total_loss(id);
     }
     let mut acked = 0;
     for node in targets {
       match self.try_call(node, &StoreRequest::Delete { id }) {
         Ok(StoreResponse::Ack) => acked += 1,
-        Ok(_) | Err(_) => self.mark_stale(node),
+        Ok(_) | Err(_) => self.resolver.mark_stale(node),
       }
     }
     if acked == 0 {
-      self.halt_total_loss(id);
+      self.resolver.halt_total_loss(id);
     }
   }
 
@@ -268,6 +239,8 @@ mod tests {
       heartbeat: Arc::new(crate::heartbeat::Heartbeat::new()),
       self_halt_threshold: std::time::Duration::from_secs(3600),
       transfers: Arc::new(crate::transfer::TransferManager::default()),
+      data_dir: dir.path().to_path_buf(),
+      collections: Mutex::new(HashMap::new()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
