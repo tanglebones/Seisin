@@ -18,10 +18,12 @@ use crate::{read_frame, write_frame};
 
 // Bumped to 2 for the migration surface (Storage Tier Part C-1), then to
 // 3 when writes gained a replication factor and `IdList` became `(id, n)`
-// pairs (Storage Tier Part C-2). The keep-the-old-decoder n±1 policy
-// binds from the first deployed release; there have been none, so older
-// decoders are dropped rather than preserved.
-pub const STORE_PROTOCOL_VERSION: u8 = 3;
+// pairs (Storage Tier Part C-2), then to 4 for the ordered-collection
+// primitive (lb storage-backed cache design) — new request/response
+// kinds, no change to existing ones. The keep-the-old-decoder n±1
+// policy binds from the first deployed release; there have been none,
+// so older decoders are dropped rather than preserved.
+pub const STORE_PROTOCOL_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreRequest {
@@ -71,6 +73,55 @@ pub enum StoreRequest {
   },
   /// Return this node's (node_id, log_id).
   Identify,
+  /// Creates the (collection_id) ordered collection if it doesn't
+  /// already exist — idempotent, so replica catch-up and repeat calls
+  /// are both safe. `key_size`/`value_size` are fixed for the
+  /// collection's lifetime, matching `BPlusTree::create`.
+  CollectionCreate {
+    collection_id: DatumId,
+    key_size: u32,
+    value_size: u32,
+  },
+  CollectionInsert {
+    collection_id: DatumId,
+    key: Vec<u8>,
+    value: Vec<u8>,
+  },
+  CollectionRemove {
+    collection_id: DatumId,
+    key: Vec<u8>,
+  },
+  CollectionGet {
+    collection_id: DatumId,
+    key: Vec<u8>,
+  },
+  /// Best-first bounded scan (ascending key order, from the end) —
+  /// mirrors `BPlusTree::scan_backward_bounded`.
+  CollectionScanForward {
+    collection_id: DatumId,
+    limit: u32,
+  },
+  /// Worst-first bounded scan — mirrors `BPlusTree::scan_forward_bounded`.
+  CollectionScanBackward {
+    collection_id: DatumId,
+    limit: u32,
+  },
+  CollectionSample {
+    collection_id: DatumId,
+    k: u32,
+  },
+  CollectionRankOfKey {
+    collection_id: DatumId,
+    key: Vec<u8>,
+  },
+  CollectionScanFromRank {
+    collection_id: DatumId,
+    rank: u64,
+    limit: u32,
+  },
+  CollectionCount {
+    collection_id: DatumId,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +154,18 @@ pub enum StoreResponse {
   Error {
     message: String,
   },
+  CollectionEntry {
+    value: Option<Vec<u8>>,
+  },
+  CollectionEntries {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+  },
+  CollectionRank {
+    rank: Option<u64>,
+  },
+  CollectionCount {
+    total: u64,
+  },
 }
 
 const REQ_PUT: u8 = 1;
@@ -115,6 +178,16 @@ const REQ_TRANSFER_STATUS: u8 = 7;
 const REQ_FINISH_TRANSFER: u8 = 8;
 const REQ_RETIRE: u8 = 9;
 const REQ_IDENTIFY: u8 = 10;
+const REQ_COLLECTION_CREATE: u8 = 11;
+const REQ_COLLECTION_INSERT: u8 = 12;
+const REQ_COLLECTION_REMOVE: u8 = 13;
+const REQ_COLLECTION_GET: u8 = 14;
+const REQ_COLLECTION_SCAN_FORWARD: u8 = 15;
+const REQ_COLLECTION_SCAN_BACKWARD: u8 = 16;
+const REQ_COLLECTION_SAMPLE: u8 = 17;
+const REQ_COLLECTION_RANK_OF_KEY: u8 = 18;
+const REQ_COLLECTION_SCAN_FROM_RANK: u8 = 19;
+const REQ_COLLECTION_COUNT: u8 = 20;
 
 const RESP_ACK: u8 = 1;
 const RESP_NEED_FULL: u8 = 2;
@@ -123,6 +196,10 @@ const RESP_ID_LIST: u8 = 4;
 const RESP_TRANSFER_PROGRESS: u8 = 5;
 const RESP_IDENTITY: u8 = 6;
 const RESP_ERROR: u8 = 7;
+const RESP_COLLECTION_ENTRY: u8 = 8;
+const RESP_COLLECTION_ENTRIES: u8 = 9;
+const RESP_COLLECTION_RANK: u8 = 10;
+const RESP_COLLECTION_COUNT: u8 = 11;
 
 const ID_LEN: usize = 16;
 
@@ -268,6 +345,76 @@ pub fn encode_store_request(req: &StoreRequest) -> Vec<u8> {
     StoreRequest::Identify => {
       buf.push(REQ_IDENTIFY);
     }
+    StoreRequest::CollectionCreate {
+      collection_id,
+      key_size,
+      value_size,
+    } => {
+      buf.push(REQ_COLLECTION_CREATE);
+      put_id(&mut buf, *collection_id);
+      buf.extend_from_slice(&key_size.to_le_bytes());
+      buf.extend_from_slice(&value_size.to_le_bytes());
+    }
+    StoreRequest::CollectionInsert {
+      collection_id,
+      key,
+      value,
+    } => {
+      buf.push(REQ_COLLECTION_INSERT);
+      put_id(&mut buf, *collection_id);
+      put_bytes(&mut buf, key);
+      put_bytes(&mut buf, value);
+    }
+    StoreRequest::CollectionRemove { collection_id, key } => {
+      buf.push(REQ_COLLECTION_REMOVE);
+      put_id(&mut buf, *collection_id);
+      put_bytes(&mut buf, key);
+    }
+    StoreRequest::CollectionGet { collection_id, key } => {
+      buf.push(REQ_COLLECTION_GET);
+      put_id(&mut buf, *collection_id);
+      put_bytes(&mut buf, key);
+    }
+    StoreRequest::CollectionScanForward {
+      collection_id,
+      limit,
+    } => {
+      buf.push(REQ_COLLECTION_SCAN_FORWARD);
+      put_id(&mut buf, *collection_id);
+      buf.extend_from_slice(&limit.to_le_bytes());
+    }
+    StoreRequest::CollectionScanBackward {
+      collection_id,
+      limit,
+    } => {
+      buf.push(REQ_COLLECTION_SCAN_BACKWARD);
+      put_id(&mut buf, *collection_id);
+      buf.extend_from_slice(&limit.to_le_bytes());
+    }
+    StoreRequest::CollectionSample { collection_id, k } => {
+      buf.push(REQ_COLLECTION_SAMPLE);
+      put_id(&mut buf, *collection_id);
+      buf.extend_from_slice(&k.to_le_bytes());
+    }
+    StoreRequest::CollectionRankOfKey { collection_id, key } => {
+      buf.push(REQ_COLLECTION_RANK_OF_KEY);
+      put_id(&mut buf, *collection_id);
+      put_bytes(&mut buf, key);
+    }
+    StoreRequest::CollectionScanFromRank {
+      collection_id,
+      rank,
+      limit,
+    } => {
+      buf.push(REQ_COLLECTION_SCAN_FROM_RANK);
+      put_id(&mut buf, *collection_id);
+      buf.extend_from_slice(&rank.to_le_bytes());
+      buf.extend_from_slice(&limit.to_le_bytes());
+    }
+    StoreRequest::CollectionCount { collection_id } => {
+      buf.push(REQ_COLLECTION_COUNT);
+      put_id(&mut buf, *collection_id);
+    }
   }
   buf
 }
@@ -357,6 +504,86 @@ pub fn decode_store_request(buf: &[u8]) -> Result<StoreRequest> {
       expect_end(buf, offset, "identify")?;
       Ok(StoreRequest::Identify)
     }
+    REQ_COLLECTION_CREATE => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let key_size = take_u32(buf, &mut offset)?;
+      let value_size = take_u32(buf, &mut offset)?;
+      expect_end(buf, offset, "collection create")?;
+      Ok(StoreRequest::CollectionCreate {
+        collection_id,
+        key_size,
+        value_size,
+      })
+    }
+    REQ_COLLECTION_INSERT => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let key = take_bytes(buf, &mut offset)?;
+      let value = take_bytes(buf, &mut offset)?;
+      expect_end(buf, offset, "collection insert")?;
+      Ok(StoreRequest::CollectionInsert {
+        collection_id,
+        key,
+        value,
+      })
+    }
+    REQ_COLLECTION_REMOVE => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let key = take_bytes(buf, &mut offset)?;
+      expect_end(buf, offset, "collection remove")?;
+      Ok(StoreRequest::CollectionRemove { collection_id, key })
+    }
+    REQ_COLLECTION_GET => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let key = take_bytes(buf, &mut offset)?;
+      expect_end(buf, offset, "collection get")?;
+      Ok(StoreRequest::CollectionGet { collection_id, key })
+    }
+    REQ_COLLECTION_SCAN_FORWARD => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let limit = take_u32(buf, &mut offset)?;
+      expect_end(buf, offset, "collection scan forward")?;
+      Ok(StoreRequest::CollectionScanForward {
+        collection_id,
+        limit,
+      })
+    }
+    REQ_COLLECTION_SCAN_BACKWARD => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let limit = take_u32(buf, &mut offset)?;
+      expect_end(buf, offset, "collection scan backward")?;
+      Ok(StoreRequest::CollectionScanBackward {
+        collection_id,
+        limit,
+      })
+    }
+    REQ_COLLECTION_SAMPLE => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let k = take_u32(buf, &mut offset)?;
+      expect_end(buf, offset, "collection sample")?;
+      Ok(StoreRequest::CollectionSample { collection_id, k })
+    }
+    REQ_COLLECTION_RANK_OF_KEY => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let key = take_bytes(buf, &mut offset)?;
+      expect_end(buf, offset, "collection rank of key")?;
+      Ok(StoreRequest::CollectionRankOfKey { collection_id, key })
+    }
+    REQ_COLLECTION_SCAN_FROM_RANK => {
+      let collection_id = take_id(buf, &mut offset)?;
+      let rank = take_u64(buf, &mut offset)?;
+      let limit = take_u32(buf, &mut offset)?;
+      expect_end(buf, offset, "collection scan from rank")?;
+      Ok(StoreRequest::CollectionScanFromRank {
+        collection_id,
+        rank,
+        limit,
+      })
+    }
+    REQ_COLLECTION_COUNT => {
+      let collection_id = take_id(buf, &mut offset)?;
+      expect_end(buf, offset, "collection count")?;
+      Ok(StoreRequest::CollectionCount { collection_id })
+    }
     tag => bail!("unknown store request tag: {tag}"),
   }
 }
@@ -410,6 +637,38 @@ pub fn encode_store_response(resp: &StoreResponse) -> Vec<u8> {
     StoreResponse::Error { message } => {
       buf.push(RESP_ERROR);
       buf.extend_from_slice(message.as_bytes());
+    }
+    StoreResponse::CollectionEntry { value } => {
+      buf.push(RESP_COLLECTION_ENTRY);
+      match value {
+        None => buf.push(0),
+        Some(v) => {
+          buf.push(1);
+          put_bytes(&mut buf, v);
+        }
+      }
+    }
+    StoreResponse::CollectionEntries { entries } => {
+      buf.push(RESP_COLLECTION_ENTRIES);
+      buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+      for (key, value) in entries {
+        put_bytes(&mut buf, key);
+        put_bytes(&mut buf, value);
+      }
+    }
+    StoreResponse::CollectionRank { rank } => {
+      buf.push(RESP_COLLECTION_RANK);
+      match rank {
+        None => buf.push(0),
+        Some(r) => {
+          buf.push(1);
+          buf.extend_from_slice(&r.to_le_bytes());
+        }
+      }
+    }
+    StoreResponse::CollectionCount { total } => {
+      buf.push(RESP_COLLECTION_COUNT);
+      buf.extend_from_slice(&total.to_le_bytes());
     }
   }
   buf
@@ -474,6 +733,50 @@ pub fn decode_store_response(buf: &[u8]) -> Result<StoreResponse> {
       let message =
         String::from_utf8(buf[offset..].to_vec()).context("store error message not utf8")?;
       Ok(StoreResponse::Error { message })
+    }
+    RESP_COLLECTION_ENTRY => {
+      if buf.len() < offset + 1 {
+        bail!("collection entry response missing its presence flag");
+      }
+      let tag = buf[offset];
+      offset += 1;
+      let value = match tag {
+        0 => None,
+        1 => Some(take_bytes(buf, &mut offset)?),
+        flag => bail!("unknown collection entry flag: {flag}"),
+      };
+      expect_end(buf, offset, "collection entry")?;
+      Ok(StoreResponse::CollectionEntry { value })
+    }
+    RESP_COLLECTION_ENTRIES => {
+      let count = take_u32(buf, &mut offset)? as usize;
+      let mut entries = Vec::with_capacity(count);
+      for _ in 0..count {
+        let key = take_bytes(buf, &mut offset)?;
+        let value = take_bytes(buf, &mut offset)?;
+        entries.push((key, value));
+      }
+      expect_end(buf, offset, "collection entries")?;
+      Ok(StoreResponse::CollectionEntries { entries })
+    }
+    RESP_COLLECTION_RANK => {
+      if buf.len() < offset + 1 {
+        bail!("collection rank response missing its presence flag");
+      }
+      let tag = buf[offset];
+      offset += 1;
+      let rank = match tag {
+        0 => None,
+        1 => Some(take_u64(buf, &mut offset)?),
+        flag => bail!("unknown collection rank flag: {flag}"),
+      };
+      expect_end(buf, offset, "collection rank")?;
+      Ok(StoreResponse::CollectionRank { rank })
+    }
+    RESP_COLLECTION_COUNT => {
+      let total = take_u64(buf, &mut offset)?;
+      expect_end(buf, offset, "collection count")?;
+      Ok(StoreResponse::CollectionCount { total })
     }
     tag => bail!("unknown store response tag: {tag}"),
   }
@@ -588,6 +891,77 @@ mod tests {
         decode_store_response(&encode_store_response(&resp)).unwrap(),
         resp
       );
+    }
+  }
+
+  #[test]
+  fn collection_requests_round_trip() {
+    let id = DatumId::new();
+    let cases = vec![
+      StoreRequest::CollectionCreate {
+        collection_id: id,
+        key_size: 24,
+        value_size: 34,
+      },
+      StoreRequest::CollectionInsert {
+        collection_id: id,
+        key: vec![1, 2, 3],
+        value: vec![4, 5],
+      },
+      StoreRequest::CollectionRemove {
+        collection_id: id,
+        key: vec![1, 2, 3],
+      },
+      StoreRequest::CollectionGet {
+        collection_id: id,
+        key: vec![9],
+      },
+      StoreRequest::CollectionScanForward {
+        collection_id: id,
+        limit: 10,
+      },
+      StoreRequest::CollectionScanBackward {
+        collection_id: id,
+        limit: 5,
+      },
+      StoreRequest::CollectionSample {
+        collection_id: id,
+        k: 3,
+      },
+      StoreRequest::CollectionRankOfKey {
+        collection_id: id,
+        key: vec![7, 7],
+      },
+      StoreRequest::CollectionScanFromRank {
+        collection_id: id,
+        rank: 42,
+        limit: 6,
+      },
+      StoreRequest::CollectionCount { collection_id: id },
+    ];
+    for req in cases {
+      let encoded = encode_store_request(&req);
+      assert_eq!(decode_store_request(&encoded).unwrap(), req);
+    }
+  }
+
+  #[test]
+  fn collection_responses_round_trip() {
+    let cases = vec![
+      StoreResponse::CollectionEntry { value: None },
+      StoreResponse::CollectionEntry {
+        value: Some(vec![1, 2, 3]),
+      },
+      StoreResponse::CollectionEntries {
+        entries: vec![(vec![1], vec![2]), (vec![3], vec![4])],
+      },
+      StoreResponse::CollectionRank { rank: None },
+      StoreResponse::CollectionRank { rank: Some(9) },
+      StoreResponse::CollectionCount { total: 123 },
+    ];
+    for resp in cases {
+      let encoded = encode_store_response(&resp);
+      assert_eq!(decode_store_response(&encoded).unwrap(), resp);
     }
   }
 
