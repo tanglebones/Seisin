@@ -60,8 +60,12 @@ disagree.
 - `seisin-client` — blocking wire client used by tests and drivers.
 
 Load-bearing design decisions (rationale lives in the specs):
-- Storage is content-agnostic: it stores bytes and structure-blind byte
-  deltas; all typing/semantics live compute-side.
+- Storage is content-aware: storage is like a database and schema aware
+  as far as the contents of a datum are used to index it, and storage
+  maintains indexes as first-class citizens.
+- Encode/Decode of datums is shared across compute and storage as data
+  needs to go on the wire and into storage; though storage may choose
+  to use a different format for its own on disk use.
 - Indexes (sk/rk/partition) are rebuildable derived state — no WAL; tk
   decomposed fields and lb boards are currently index-grade too
   (datum-grade durability for them is a deferred part).
@@ -72,7 +76,9 @@ Load-bearing design decisions (rationale lives in the specs):
   programs.
 - Wire compatibility: n±1 keep-old-decoder policy binds from the first
   deployed release; pre-first-release breaking changes are allowed and
-  taken (bump the protocol version, drop the old decoder, note it).
+  taken (bump the protocol version, drop the old decoder, note it). For
+  now ignore this until we have a working version to be backward
+  compatible with!
 
 ## House workflow (differs from or sharpens GUIDELINES.md)
 
@@ -81,7 +87,7 @@ Load-bearing design decisions (rationale lives in the specs):
   `docs/superpowers/plans/` → execute **inline in the session, never
   via subagents** → update PROGRESS.md → commit + push.
 - Commit per task, directly on `main`, trailer
-  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+  `Co-Authored-By: Claude <noreply@anthropic.com>`.
 - Gates per task: `cargo fmt --all --check` and
   `cargo clippy --workspace --all-targets -- -D warnings` clean, full
   `cargo test --workspace` green.

@@ -4,6 +4,7 @@
 //! `Store` trait boundary is what later lets a networked storage tier
 //! slot in without touching `Cache` or the worker.
 
+// todo: use AHashMap
 use std::collections::HashMap;
 use std::sync::Mutex;
 

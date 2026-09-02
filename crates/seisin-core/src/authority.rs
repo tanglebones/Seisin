@@ -32,6 +32,12 @@ pub enum AuthorityIdx {
 /// Wire size of an encoded `AuthorityIdx`: 1 tag byte + 8-byte node id + 4-byte thread id.
 pub const ENCODED_LEN: usize = 13;
 
+
+// todo thoughts:
+// - can we move native vs foreign into the high bit of thread count?
+// - can we encode native to one byte and foreign to two 12 bytes (thread + node id)? (e.g. enum variants if that makes sense)
+// - can we make thread 2 bytes (15 bits, with the high bit indicating foreign)?
+// - can we make node 4 bytes (32 bits), as we're never going to have more than 2^32 nodes?
 const TAG_NATIVE: u8 = 0;
 const TAG_FOREIGN: u8 = 1;
 
